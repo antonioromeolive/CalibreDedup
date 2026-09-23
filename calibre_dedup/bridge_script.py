@@ -101,6 +101,11 @@ def main(plan_path):
                     msg = f"moved to target (id {new_id})"
                     if changed:
                         msg += f"; filled {', '.join(changed)}"
+                elif action["op"] == "update":
+                    changed = fill_metadata(src, sid, action.get("set") or {})
+                    msg = f"updated metadata in source"
+                    if changed:
+                        msg += f"; filled {', '.join(changed)}"
                 elif action["op"] == "trash":
                     tid = action.get("target_id") or moved.get(action.get("target_src_id"))
                     if tid is None or tid not in tgt.all_book_ids():

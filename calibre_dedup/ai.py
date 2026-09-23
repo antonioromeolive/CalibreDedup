@@ -271,13 +271,14 @@ class AICache:
             self._data = {}
 
     @staticmethod
-    def key(file_path: str, part: str, model: str) -> str:
+    def key(file_path: str, part: str, model: str | None = None) -> str:
         try:
             st = Path(file_path).stat()
             stamp = f"{st.st_size}:{int(st.st_mtime)}"
         except OSError:
             stamp = "?"
-        return hashlib.sha1(f"{file_path}|{stamp}|{part}|{model}".encode()).hexdigest()
+        token = f"{file_path}|{stamp}|{part}"
+        return hashlib.sha1(token.encode()).hexdigest()
 
     def get(self, key: str) -> dict | None:
         return self._data.get(key)

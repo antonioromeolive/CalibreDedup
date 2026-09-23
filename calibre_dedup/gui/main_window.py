@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
@@ -513,17 +514,13 @@ class MainWindow(QMainWindow):
     def _update_analysis_recap(self):
         if not self.plan:
             return
-        labels = {
-            Action.LEAVE: "leave in source",
-            Action.MOVE: "move to target",
-            Action.TRASH: "trash duplicate",
-        }
-        parts = []
-        for action in (Action.LEAVE, Action.MOVE, Action.TRASH):
-            items = [it for it in self.plan.items if it.action is action]
-            selected = sum(1 for it in items if it.selected)
-            parts.append(f"{selected}/{len(items)} {labels[action]}")
-        self.status_label.setText("Analysis complete: " + " · ".join(parts))
+        move = self.plan.count(Action.MOVE)
+        trash = self.plan.count(Action.TRASH)
+        leave = self.plan.count(Action.LEAVE)
+        total = move + trash + leave
+        self.status_label.setText(
+            f"Analysis complete: {move} move, {trash} trash, {leave} leave (total {total})"
+        )
 
     def _toggle_selected_rows(self):
         items = [i for i in self._selected_items() if i.action is not Action.LEAVE]
@@ -605,11 +602,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(msg)
 
     def _analysis_done(self, plan: Plan):
+        log.debug("Analysis result received on GUI thread")
         restored = self.store.apply(plan)
+        log.debug("Applied saved selections: restored=%d", restored)
         self.plan = plan
         self.model.set_plan(plan)
+        log.debug("Plan model populated: items=%d", len(plan.items))
         self._finish()
+        log.debug("Worker marked finished")
         self._update_analysis_recap()
+        log.debug("Analysis recap updated")
         log.info("Analysis complete: %d move, %d trash, %d leave",
                  plan.count(Action.MOVE), plan.count(Action.TRASH), plan.count(Action.LEAVE))
         if restored:
@@ -669,13 +671,18 @@ class MainWindow(QMainWindow):
     # --- worker plumbing ----------------------------------------------------------------
     def _start(self, worker: QThread):
         self.worker = worker
+        worker.finished.connect(lambda w=worker: self._worker_finished(w))
         self._set_busy(True)
         worker.start()
 
     def _finish(self):
-        self.worker = None
         self._set_busy(False)
         self.status_label.setText("")
+
+    def _worker_finished(self, worker: QThread):
+        if self.worker is worker:
+            self.worker = None
+        worker.deleteLater()
 
     def _worker_failed(self, message: str):
         if isinstance(self.worker, ExecuteWorker) and not self._done_count:
@@ -698,12 +705,16 @@ class MainWindow(QMainWindow):
             log.info("Plan exported to %s", path)
 
     def closeEvent(self, event):
+        log.info("Close requested; worker running=%s", self.worker is not None and self.worker.isRunning())
         if self.worker is not None and self.worker.isRunning():
             if QMessageBox.question(self, "Quit", "An operation is running. Stop it and quit?") != QMessageBox.Yes:
                 event.ignore()
                 return
             self.worker.cancel.set()
             self.worker.wait(60_000)
+        elif QMessageBox.question(self, "Quit", "Close Calibre Duplicate Remover?") != QMessageBox.Yes:
+            event.ignore()
+            return
         self._sync_settings()
         event.accept()
 
@@ -714,13 +725,25 @@ def run_gui() -> int:
                                        backupCount=3, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    requested_level = os.environ.get("CALIBRE_DEDUP_LOG_LEVEL", "").upper()
+    level = getattr(logging, requested_level, logging.DEBUG if "--debug" in sys.argv[1:] else logging.INFO)
+    root.setLevel(level)
     root.addHandler(handler)
     root.addHandler(file_handler)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    log.info("Logging configured at %s", logging.getLevelName(level))
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Calibre Duplicate Remover")
+
+    def _excepthook(exc_type, exc, tb):
+        log.critical("Unhandled exception", exc_info=(exc_type, exc, tb))
+        msg = f"Calibre Duplicate Remover hit an unexpected error:\n\n{exc_type.__name__}: {exc}"
+        if QApplication.instance() is not None:
+            QMessageBox.critical(None, "Unexpected error", msg)
+
+    sys.excepthook = _excepthook
+
     window = MainWindow(Settings.load(), handler)
     window.show()
     return app.exec()

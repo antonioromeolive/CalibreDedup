@@ -65,10 +65,19 @@ def blocked(plan: Plan) -> dict[int, str]:
 
 
 def actionable(plan: Plan) -> list[PlanItem]:
-    """Items that execution will process, in plan order."""
+    """Items that execution will process, in plan order.
+
+    A book left in source may still be updated with AI metadata when it was
+    enriched but not moved/trash-ed. Those updates must be allowed without
+    treating normal leave decisions as executable actions.
+    """
     stuck = blocked(plan)
-    return [i for i in plan.items
-            if i.selected and i.action is not Action.LEAVE and i.source.id not in stuck]
+    return [
+        i for i in plan.items
+        if i.selected and i.source.id not in stuck and (
+            i.action is not Action.LEAVE or (i.ai_used and bool(i.identity.ai_fields))
+        )
+    ]
 
 
 # --- remembering choices --------------------------------------------------------

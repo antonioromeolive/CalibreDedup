@@ -1,5 +1,6 @@
 import pytest
 
+from calibre_dedup.ai import AICache
 from calibre_dedup.executor import _keep_failed_in_source, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
 from calibre_dedup.selection import SelectionStore, actionable, blocked, override, revert
@@ -44,6 +45,28 @@ def test_failed_execution_keeps_book_in_source():
     assert not item.selected
     assert not item.manual
     assert "kept in source after execution failure" in item.reason
+
+
+def test_ai_cache_is_model_independent():
+    assert AICache.key("C:/books/book.epub", "start", "llama3") == AICache.key("C:/books/book.epub", "start", "gpt-4o")
+
+
+def test_leave_items_with_ai_metadata_are_updated_in_source():
+    plan = make_plan()
+    item = plan.items[3]
+    item.action = Action.LEAVE
+    item.ai_used = True
+    item.identity = Identity(title="New title", authors=["Alice Example"], ai_fields={"title", "authors"})
+    item.selected = True
+
+    actions = plan_actions(plan, update_metadata=True)
+    assert item in actionable(plan)
+    assert actions[-1] == {
+        "op": "update",
+        "src_id": item.source.id,
+        "title": item.source.title,
+        "set": {"title": "New title", "authors": ["Alice Example"]},
+    }
 
 
 def test_unchecking_a_move_blocks_its_duplicates():

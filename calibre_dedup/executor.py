@@ -90,6 +90,13 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
             else:
                 a["target_id"] = item.match.id
             actions.append(a)
+        elif item.action is Action.LEAVE and update_metadata and item.ai_used and item.identity.ai_fields:
+            actions.append({
+                "op": "update",
+                "src_id": item.source.id,
+                "title": item.source.title,
+                "set": _ai_values(item),
+            })
     return actions
 
 

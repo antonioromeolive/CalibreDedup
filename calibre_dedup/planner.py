@@ -132,10 +132,16 @@ class AIResolver:
         if not picked:
             return None, "no readable file"
         path = picked[1]
+        cached = self.cache.get(AICache.key(path, part))
+        if cached is not None:
+            return AIMetadata(**cached), f"AI {part} pages (cached)"
+
         providers = [self.provider] + ([self.vision] if self.vision else [])
         for p in providers:
-            cached = self.cache.get(AICache.key(path, part, self._model_id(p)))
+            key = AICache.key(path, part, self._model_id(p))
+            cached = self.cache.get(key)
             if cached is not None:
+                self.cache.put(AICache.key(path, part), cached)
                 return AIMetadata(**cached), f"AI {part} pages (cached)"
 
         excerpt = self.extractor.excerpt(book.formats, part)
@@ -147,7 +153,9 @@ class AIResolver:
             return None, f"no text in {part} pages ({excerpt.source})"
         log.info("AI reading %s of %s (%s)", part, book.label(), excerpt.source)
         meta = extract_metadata(provider, excerpt.text, images)
-        self.cache.put(AICache.key(path, part, self._model_id(provider)), meta.to_dict())
+        self.cache.put(AICache.key(path, part), meta.to_dict())
+        for p in providers:
+            self.cache.put(AICache.key(path, part, self._model_id(p)), meta.to_dict())
         return meta, f"AI read {excerpt.source}"
 
 
