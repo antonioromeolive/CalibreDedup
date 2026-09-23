@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import traceback
+from datetime import datetime
 
 from calibre.db.copy_to_library import copy_one_book
 from calibre.library import db as open_db
@@ -54,6 +55,12 @@ def fill_metadata(db, book_id, values):
     if values.get("publisher") and is_unknown(db.field_for("publisher", book_id)):
         db.set_field("publisher", {book_id: values["publisher"]})
         changed.append("publisher")
+    if values.get("year"):
+        pubdate = db.field_for("pubdate", book_id)
+        current_year = getattr(pubdate, "year", None)
+        if current_year is None or current_year < 1400:
+            db.set_field("pubdate", {book_id: datetime(int(values["year"]), 1, 1)})
+            changed.append("year")
     if values.get("isbn"):
         ids = dict(db.field_for("identifiers", book_id) or {})
         if "isbn" not in ids:

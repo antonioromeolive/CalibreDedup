@@ -11,9 +11,9 @@ from PySide6.QtWidgets import (
 
 from ..ai import AIError, make_provider
 from ..calibre_env import find_calibre_dir
-from ..config import AZURE, OLLAMA, ProviderProfile, Settings, get_secret, set_secret
+from ..config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, Settings, get_secret, set_secret
 
-KINDS = [(OLLAMA, "Ollama"), (AZURE, "Azure OpenAI")]
+KINDS = [(OLLAMA, "Ollama"), (AZURE, "Azure OpenAI"), (OPENAI, "OpenAI"), (ANTHROPIC, "Anthropic")]
 
 
 class SettingsDialog(QDialog):
@@ -173,24 +173,33 @@ class SettingsDialog(QDialog):
 
     def _kind_changed(self):
         azure = self.f_kind.currentData() == AZURE
-        self.l_url.setText("Endpoint" if azure else "Server URL")
+        local = self.f_kind.currentData() == OLLAMA
+        fixed_api = self.f_kind.currentData() in (OPENAI, ANTHROPIC)
+        self.l_url.setText("Endpoint" if azure or fixed_api else "Server URL")
         self.l_model.setText("Deployment" if azure else "Model")
-        for widget in (self.f_key, self.f_version):
-            widget.setEnabled(azure)
-        self.f_ctx.setEnabled(not azure)
-        self.b_models.setEnabled(not azure)
+        self.f_url.setEnabled(not fixed_api)
+        self.f_key.setEnabled(not local)
+        self.f_version.setEnabled(azure)
+        self.f_ctx.setEnabled(local)
+        self.b_models.setEnabled(local)
         if not self._loading and self._current is not None:
             if azure and "11434" in self.f_url.text():
                 self.f_url.setText("https://<resource>.openai.azure.com")
-            elif not azure and "azure" in self.f_url.text():
+            elif local and "azure" in self.f_url.text():
                 self.f_url.setText("http://localhost:11434")
+            elif self.f_kind.currentData() == OPENAI:
+                self.f_url.setText("https://api.openai.com")
+            elif self.f_kind.currentData() == ANTHROPIC:
+                self.f_url.setText("https://api.anthropic.com")
         self.hint.setText(
             "Azure: enter the resource endpoint and the deployment name. API version is e.g. "
             "2024-10-21, or 'v1' for the new v1 API (the deployment field then holds the model). "
             "Uncheck 'Send temperature' for reasoning models (o-series, gpt-5)."
-            if azure else
-            "Ollama: the server URL (default http://localhost:11434). 'Refresh models' lists installed "
+            if azure else ("Ollama: the server URL (default http://localhost:11434). 'Refresh models' lists installed "
             "models. A larger context size lets the model read more text but uses more memory."
+            if local else ("OpenAI: enter a model name and API key. The endpoint is fixed to api.openai.com."
+            if self.f_kind.currentData() == OPENAI else
+            "Anthropic: enter a model name and API key. The endpoint is fixed to api.anthropic.com."))
         )
 
     def _profile_from_form(self) -> ProviderProfile:

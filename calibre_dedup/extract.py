@@ -47,6 +47,7 @@ class TextExtractor:
         self.text_chars = text_chars
         self.render_images = render_images
         self._converted: dict[str, str] = {}  # path -> full text (ebook-convert cache)
+        self._conversion_failed: set[str] = set()
         self._tmp = tempfile.TemporaryDirectory(prefix="cdr_")
 
     def close(self) -> None:
@@ -113,9 +114,15 @@ class TextExtractor:
 
     # --- other formats ---------------------------------------------------------
     def _convert(self, path: str) -> str:
+        if path in self._conversion_failed:
+            return ""
         if path not in self._converted:
             out = Path(self._tmp.name) / f"c{len(self._converted)}.txt"
-            self._run("ebook-convert", [path, str(out)], timeout=600)
+            try:
+                self._run("ebook-convert", [path, str(out)], timeout=600)
+            except Exception:
+                self._conversion_failed.add(path)
+                raise
             self._converted[path] = _clean(out.read_text(encoding="utf-8", errors="replace"))
             out.unlink(missing_ok=True)
         return self._converted[path]

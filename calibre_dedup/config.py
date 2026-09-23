@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 APP_NAME = "CalibreDuplicateRemover"
 OLLAMA = "ollama"
 AZURE = "azure"
+OPENAI = "openai"
+ANTHROPIC = "anthropic"
 
 
 DATA_DIR_NAME = ".CalibreDedup"

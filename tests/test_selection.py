@@ -1,6 +1,6 @@
 import pytest
 
-from calibre_dedup.executor import plan_actions
+from calibre_dedup.executor import _keep_failed_in_source, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
 from calibre_dedup.selection import SelectionStore, actionable, blocked, override, revert
 
@@ -24,6 +24,26 @@ def make_plan():
 def test_defaults_check_move_and_trash_only():
     plan = make_plan()
     assert [i.source.id for i in actionable(plan)] == [1, 2]
+
+
+def test_ai_year_is_included_in_move_metadata():
+    plan = make_plan()
+    item = plan.items[0]
+    item.identity = Identity(year=1990, ai_fields={"year"})
+
+    assert plan_actions(plan, update_metadata=True)[0]["set"] == {"year": 1990}
+
+
+def test_failed_execution_keeps_book_in_source():
+    plan = make_plan()
+    item = plan.items[0]
+
+    _keep_failed_in_source(item)
+
+    assert item.action is Action.LEAVE
+    assert not item.selected
+    assert not item.manual
+    assert "kept in source after execution failure" in item.reason
 
 
 def test_unchecking_a_move_blocks_its_duplicates():

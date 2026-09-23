@@ -56,7 +56,7 @@ def _is_checked(value) -> bool:
 
 
 class PlanModel(QAbstractTableModel):
-    HEADERS = ["", "ID", "Title", "Authors", "Action", "Reason", "Match in target", "Add formats", "AI", "Result"]
+    HEADERS = ["✓", "ID", "Title", "Authors", "Action", "Reason", "Match in target", "Add formats", "AI", "Result"]
     COL_CHECK, COL_ID, COL_ACTION, COL_REASON, COL_RESULT = 0, 1, 4, 5, 9
     selection_changed = Signal()
 
@@ -308,6 +308,20 @@ class MainWindow(QMainWindow):
         # actions
         self.analyze_btn = QPushButton("1. Analyze (dry run)")
         self.execute_btn = QPushButton("2. Execute checked")
+        self.analyze_btn.setStyleSheet(
+            "QPushButton { background: #1769aa; color: white; font-weight: bold; "
+            "padding: 6px 12px; border: 1px solid #125a91; border-radius: 3px; }"
+            "QPushButton:hover { background: #2186c4; }"
+            "QPushButton:pressed { background: #0f4f7f; }"
+            "QPushButton:disabled { background: #7f8c96; color: #d9dee2; border-color: #6b757d; }"
+        )
+        self.execute_btn.setStyleSheet(
+            "QPushButton { background: #218739; color: white; font-weight: bold; "
+            "padding: 6px 12px; border: 1px solid #196b2d; border-radius: 3px; }"
+            "QPushButton:hover { background: #2ea043; }"
+            "QPushButton:pressed { background: #176b2c; }"
+            "QPushButton:disabled { background: #7f8c96; color: #d9dee2; border-color: #6b757d; }"
+        )
         self.stop_btn = QPushButton("Stop")
         self.export_btn = QPushButton("Export CSV…")
         self.analyze_btn.clicked.connect(self._analyze)
@@ -354,9 +368,12 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(clear)
 
         # bulk selection
-        self.check_btn = QPushButton("Check visible")
-        self.uncheck_btn = QPushButton("Uncheck visible")
-        self.invert_btn = QPushButton("Invert visible")
+        self.check_btn = QPushButton("Check shown rows")
+        self.uncheck_btn = QPushButton("Uncheck shown rows")
+        self.invert_btn = QPushButton("Invert shown rows")
+        self.check_btn.setToolTip("Check rows currently shown after filtering")
+        self.uncheck_btn.setToolTip("Uncheck rows currently shown after filtering")
+        self.invert_btn.setToolTip("Invert checks for rows currently shown after filtering")
         self.check_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), True))
         self.uncheck_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), False))
         self.invert_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), None))
@@ -384,6 +401,7 @@ class MainWindow(QMainWindow):
         self.model.italic_font.setItalic(True)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
+        header.sectionClicked.connect(self._header_clicked)
         for col, width in enumerate([34, 50, 260, 180, 150, 420, 260, 80, 80, 300]):
             self.table.setColumnWidth(col, width)
         self.log_view = QPlainTextEdit()
@@ -474,14 +492,38 @@ class MainWindow(QMainWindow):
         return [self.model.items[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
                 for r in range(self.proxy.rowCount())]
 
+    def _header_clicked(self, section: int):
+        if section != PlanModel.COL_CHECK or self._busy or self.model.locked:
+            return
+        items = [it for it in self.model.items if it.action is not Action.LEAVE]
+        if items:
+            self.model.set_checked(items, not all(it.selected for it in items))
+
     def _selected_items(self) -> list[PlanItem]:
         rows = self.table.selectionModel().selectedRows()
         return [self.model.items[self.proxy.mapToSource(i).row()] for i in rows]
 
     def _selection_changed(self):
         self._update_summary()
+        if self.plan is not None and not self._busy:
+            self._update_analysis_recap()
         if self.plan is not None and not self.model.locked:
             self.store.save(self.plan)
+
+    def _update_analysis_recap(self):
+        if not self.plan:
+            return
+        labels = {
+            Action.LEAVE: "leave in source",
+            Action.MOVE: "move to target",
+            Action.TRASH: "trash duplicate",
+        }
+        parts = []
+        for action in (Action.LEAVE, Action.MOVE, Action.TRASH):
+            items = [it for it in self.plan.items if it.action is action]
+            selected = sum(1 for it in items if it.selected)
+            parts.append(f"{selected}/{len(items)} {labels[action]}")
+        self.status_label.setText("Analysis complete: " + " · ".join(parts))
 
     def _toggle_selected_rows(self):
         items = [i for i in self._selected_items() if i.action is not Action.LEAVE]
@@ -558,6 +600,8 @@ class MainWindow(QMainWindow):
     def _on_progress(self, done: int, total: int, msg: str):
         self.progress.setMaximum(max(total, 1))
         self.progress.setValue(done)
+        if msg.startswith("Analyzing ") and total:
+            msg = f"Book {min(done + 1, total)} of {total}: {msg}"
         self.status_label.setText(msg)
 
     def _analysis_done(self, plan: Plan):
@@ -565,6 +609,7 @@ class MainWindow(QMainWindow):
         self.plan = plan
         self.model.set_plan(plan)
         self._finish()
+        self._update_analysis_recap()
         log.info("Analysis complete: %d move, %d trash, %d leave",
                  plan.count(Action.MOVE), plan.count(Action.TRASH), plan.count(Action.LEAVE))
         if restored:

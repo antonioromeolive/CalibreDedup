@@ -5,14 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
 
-from .config import AZURE, OLLAMA, ProviderProfile, config_dir
+from .config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, config_dir
 
 log = logging.getLogger(__name__)
 
@@ -108,11 +110,81 @@ class AzureOpenAIProvider(Provider):
         return choices[0].get("message", {}).get("content") or ""
 
 
+class OpenAIProvider(Provider):
+    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+        p = self.profile
+        if not p.model:
+            raise AIError("OpenAI profile needs a model name")
+        key = p.api_key
+        if not key:
+            raise AIError(f"No API key set for profile {p.name!r}")
+        content: list | str = user
+        if images:
+            content = [{"type": "text", "text": user}] + [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}} for img in images
+            ]
+        body: dict = {
+            "model": p.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+        }
+        if p.temperature is not None:
+            body["temperature"] = p.temperature
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions", json=body,
+                              timeout=p.timeout, headers={"Authorization": f"Bearer {key}"})
+        except requests.RequestException as e:
+            raise AIError(f"OpenAI request failed: {e}") from e
+        if r.status_code != 200:
+            raise AIError(f"OpenAI error {r.status_code}: {r.text[:500]}")
+        choices = r.json().get("choices") or [{}]
+        return choices[0].get("message", {}).get("content") or ""
+
+
+class AnthropicProvider(Provider):
+    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+        p = self.profile
+        if not p.model:
+            raise AIError("Anthropic profile needs a model name")
+        key = p.api_key
+        if not key:
+            raise AIError(f"No API key set for profile {p.name!r}")
+        content: list | str = user
+        if images:
+            content = [{"type": "text", "text": user}] + [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img}}
+                for img in images
+            ]
+        body: dict = {
+            "model": p.model,
+            "max_tokens": 2048,
+            "system": system,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if p.temperature is not None:
+            body["temperature"] = p.temperature
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages", json=body, timeout=p.timeout,
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            )
+        except requests.RequestException as e:
+            raise AIError(f"Anthropic request failed: {e}") from e
+        if r.status_code != 200:
+            raise AIError(f"Anthropic error {r.status_code}: {r.text[:500]}")
+        blocks = r.json().get("content") or []
+        return "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+
+
 def make_provider(profile: ProviderProfile) -> Provider:
     if profile.kind == OLLAMA:
         return OllamaProvider(profile)
     if profile.kind == AZURE:
         return AzureOpenAIProvider(profile)
+    if profile.kind == OPENAI:
+        return OpenAIProvider(profile)
+    if profile.kind == ANTHROPIC:
+        return AnthropicProvider(profile)
     raise AIError(f"Unknown provider type {profile.kind!r}")
 
 
@@ -216,9 +288,26 @@ class AICache:
 
     def save(self) -> None:
         with self._lock:
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._data), encoding="utf-8")
-            tmp.replace(self.path)
+            tmp_name = ""
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.path.parent,
+                    prefix=f"{self.path.stem}_", suffix=".tmp", delete=False,
+                ) as tmp:
+                    tmp_name = tmp.name
+                    json.dump(self._data, tmp)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(tmp_name, self.path)
+            except OSError as e:
+                log.warning("Could not save AI cache %s: %s", self.path, e)
+            finally:
+                if tmp_name:
+                    try:
+                        Path(tmp_name).unlink()
+                    except OSError:
+                        pass
 
 
 def extract_metadata(provider: Provider, text: str, images: list[str] | None = None) -> AIMetadata:
