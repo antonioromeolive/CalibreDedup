@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calibre-dedup"
+version = "0.1.0"
+description = "Move books between Calibre libraries, sending duplicates to a trash library."
+authors = [{name = "Antonio Romeo", email = "antonioromeo@ilve.it"}]
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6-Essentials>=6.6",
+    "requests>=2.31",
+    "keyring>=24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+calibre-dedup = "calibre_dedup.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["calibre_dedup*"]
+
+[tool.setuptools.package-data]
+calibre_dedup = ["bridge_script.py"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"  # keep the project folder free of generated data
