@@ -85,7 +85,11 @@ Uses AI to identify books when the metadata isn't enough.
 after normalization. Normalization ignores case, accents, punctuation and a
 leading "The/A/An". It also strips edition statements such as "(2nd Edition)"
 from titles, and treats "Tolkien, J.R.R." and "J. R. R. Tolkien" as the same
-author. Subtitles count unless *Ignore subtitles* is on.
+author. A series, collection or imprint in brackets at the end of a title is
+ignored too: "Il grande freddo (eLit)" is compared with "Il grande freddo".
+Brackets that tell books apart are kept: a volume ("(Vol. 3)", "(Libro 2)",
+"(II)", any number), a different content ("(Serie completa)", "(Antologia)",
+"(versione ridotta)") or a language ("(Em Portuguese Do Brasil)"). Subtitles count unless *Ignore subtitles* is on.
 
 With *Similar author matching* (Settings → Analysis, on by default), authors
 are compared more loosely, like the "similar" algorithm of Calibre's Find
@@ -257,6 +261,58 @@ only images are switched off for the rest of the run; the Text AI keeps going.
   version `v1` uses the new `/openai/v1` API, where the deployment field holds
   the model name. For reasoning models (o-series, gpt-5), untick *Send
   temperature*.
+
+**Advanced parameters.** Each profile can add parameters of your choice to
+every request, for options the form doesn't have. The model must accept them;
+the app doesn't know every model's options.
+
+| Provider | Example | Effect |
+|---|---|---|
+| Ollama | `think` = `false` | No "thinking" before answering. With thinking models (qwen3.x) this is much faster (seconds instead of minutes) and avoids empty replies from a model that thinks until its context is full. |
+| OpenAI, Azure | `reasoning_effort` = `none` or `low` | Less reasoning. Reasoning models only: others refuse the parameter. |
+| Anthropic | — | Nothing needed: thinking is off unless requested. |
+
+* A value is JSON when it parses as JSON (`false`, `1024`, `"text"`), otherwise
+  plain text (`none`, `low`).
+* A dot puts a parameter inside an object: `options.num_predict` = `1024`
+  (Ollama).
+* Not accepted: fields the form already has (model, temperature, context size)
+  and fields the app sets itself (`messages`, `stream`, `format`,
+  `response_format`, and for Anthropic `system` and `max_tokens`). The
+  settings can't be saved with an invalid or refused parameter.
+* The log shows the parameters sent with each call (`extra=think=false`).
+
+**Test connection** sends one real metadata request with all the profile's
+settings, advanced parameters included, on a made-up copyright page (with a
+translator, an original title and a later edition as traps). It reports:
+a parameter refused by the server, an empty or cut-off reply (and why), a slow
+answer, whether the model still "thought", and each value read, right (✓) or
+wrong (✗). Ollama silently ignores parameter names it doesn't know: a
+misspelled `thinking` = `false` has no effect, and the test shows the model
+still thinking. With *Supports images*, it also checks that the model sees a
+test image. The report is coloured: green for values read right, red for
+problems, orange for notes worth checking (a slow answer; with advanced
+parameters, the reminder that a model may ignore or refuse a parameter it
+doesn't support).
+
+**When the request is refused** (the server answers with an error), the test
+finds the cause by asking the server again, so it works with any provider
+whatever its error format: once without advanced parameters (if that fails
+too, the parameters aren't the cause: check the model, key and URL), then with
+each parameter alone. Each is marked accepted (✓) or refused (✗, with the
+server's message); if all are accepted alone, it's the combination. A timeout
+or connection failure is not a refusal and starts no search.
+
+Whatever fails, the report shows the actual error as the server or the
+network gave it: the server's error message, the page a wrong URL returns, the
+model's reply when it isn't valid JSON, and the model's answer when it doesn't
+see the test image.
+
+The test page is built into the program (`TEST_EXCERPT` in `ai.py`), not taken
+from your books, so the model can't answer from memory. Its correct values:
+*Il guardiano del faro*, by Elena Marchetti (the translator Paolo Bianchi is
+not an author), Edizioni Lanterna, third edition (2021; the first was 2019),
+ISBN 978-88-7000-123-4.
 
 API keys are stored in the Windows Credential Manager through `keyring`. You
 can also set the `CDR_API_KEY` environment variable.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -11,8 +12,9 @@ import re
 import struct
 import tempfile
 import threading
+import time
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import requests
@@ -23,7 +25,9 @@ log = logging.getLogger(__name__)
 
 
 class AIError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # HTTP status when the server answered with an error, else None
 
 
 def _solid_png_b64(width: int, height: int, rgb: tuple[int, int, int]) -> str:
@@ -37,14 +41,83 @@ def _solid_png_b64(width: int, height: int, rgb: tuple[int, int, int]) -> str:
     return base64.b64encode(png).decode()
 
 
+# --- advanced parameters -----------------------------------------------------
+# Request fields the app sets itself, or that have their own field in the profile
+# (model, temperature, context size): never taken from the advanced parameters.
+_RESERVED_ROOTS = {"model", "messages", "stream", "temperature"}
+_RESERVED = {
+    OLLAMA: {"format", "options.num_ctx", "options.temperature", "options"},
+    AZURE: {"response_format"},
+    OPENAI: {"response_format"},
+    ANTHROPIC: {"system", "max_tokens"},
+}
+_NAME = re.compile(r"[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*")
+
+
+def extra_params(profile: ProviderProfile) -> tuple[dict, list[str]]:
+    """The profile's advanced parameters as {dotted name: value}, and the problems
+    found. A value is JSON when it parses as JSON (false, 8192, "text", {...}),
+    else plain text (none, low)."""
+    params: dict = {}
+    problems: list[str] = []
+    reserved = _RESERVED.get(profile.kind, set())
+    for pair in profile.extra_params:
+        name, text = (list(pair) + ["", ""])[:2]
+        name, text = name.strip(), text.strip()
+        if not name and not text:
+            continue
+        if not _NAME.fullmatch(name):
+            problems.append(f"{name or '(empty name)'!s}: not a valid parameter name")
+            continue
+        low = name.lower()
+        if low.split(".")[0] in _RESERVED_ROOTS or low in reserved:
+            problems.append(f"{name}: set by the app or by a field of this profile; not accepted here")
+            continue
+        if low in {n.lower() for n in params}:
+            problems.append(f"{name}: given twice")
+            continue
+        if not text:
+            problems.append(f"{name}: no value")
+            continue
+        try:
+            params[name] = json.loads(text)
+        except ValueError:
+            params[name] = text
+    return params, problems
+
+
+def _with_extra(body: dict, params: dict) -> dict:
+    """`body` with the parameters added; a dotted name goes inside an object ("options.num_predict")."""
+    body = json.loads(json.dumps(body))
+    for name, value in params.items():
+        *path, leaf = name.split(".")
+        node = body
+        for part in path:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise AIError(f"Advanced parameter {name}: {part} is not an object in the request")
+        node[leaf] = value
+    return body
+
+
 # --- providers ---------------------------------------------------------------
 class Provider:
     def __init__(self, profile: ProviderProfile):
         self.profile = profile
+        self.last_info: dict = {}  # details of the last reply (finish reason, thinking…), for the tests
+
+    def _prepare(self, body: dict) -> dict:
+        """Add the profile's advanced parameters; refuse to send if any is invalid."""
+        params, problems = extra_params(self.profile)
+        if problems:
+            raise AIError("Invalid advanced parameters: " + "; ".join(problems))
+        return _with_extra(body, params) if params else body
 
     def _log_call(self, user: str, images: list[str] | None) -> None:
-        log.info("AI call started: provider=%s model=%s text_chars=%d images=%d",
-                 self.profile.kind, self.profile.model or "(default)", len(user), len(images or []))
+        params, _ = extra_params(self.profile)
+        extra = " extra=" + ",".join(f"{k}={json.dumps(v)}" for k, v in params.items()) if params else ""
+        log.info("AI call started: provider=%s model=%s text_chars=%d images=%d%s",
+                 self.profile.kind, self.profile.model or "(default)", len(user), len(images or []), extra)
 
     def _log_response(self, response: str) -> str:
         log.info("AI response: provider=%s model=%s\n%s",
@@ -54,20 +127,36 @@ class Provider:
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         raise NotImplementedError
 
+    def _json(self, r: requests.Response) -> dict:
+        """The reply as a JSON object; else an error that shows what the server sent
+        (e.g. an HTML page from a wrong URL)."""
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            raise AIError(f"The server's reply is not what a {self.profile.kind} API sends (wrong URL?): "
+                          f"{r.text[:500]!r}")
+        return data
+
+    def _openai_content(self, data: dict) -> str:
+        """Reply text of an OpenAI-style chat completion (OpenAI, Azure)."""
+        choice = (data.get("choices") or [{}])[0]
+        usage = data.get("usage") or {}
+        self.last_info = {"finish": choice.get("finish_reason"), "output_tokens": usage.get("completion_tokens"),
+                          "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")}
+        return choice.get("message", {}).get("content") or ""
+
     def list_models(self) -> list[str]:
         return []
 
-    def test(self) -> str:
-        reply = self.chat("Reply with a JSON object.", 'Return {"ok": true}.')
-        return f"OK: {reply[:200]}"
-
-    def test_images(self) -> bool:
+    def test_images(self) -> tuple[bool, str]:
         """Send a plain red image and check the model names its colour: a model that
-        can't read images either fails or can't know it."""
+        can't read images either fails or can't know it. Returns (seen, reply)."""
         reply = self.chat("Reply with a JSON object.",
                           'What is the colour of the attached image? Return {"colour": "<one word>"}.',
                           [_solid_png_b64(64, 64, (220, 20, 20))])
-        return "red" in reply.lower()
+        return "red" in reply.lower(), reply
 
 
 class OllamaProvider(Provider):
@@ -91,12 +180,16 @@ class OllamaProvider(Provider):
             "options": options,
         }
         try:
-            r = requests.post(self._url("/api/chat"), json=body, timeout=p.timeout)
+            r = requests.post(self._url("/api/chat"), json=self._prepare(body), timeout=p.timeout)
         except requests.RequestException as e:
             raise AIError(f"Ollama request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"Ollama error {r.status_code}: {r.text[:500]}")
-        return self._log_response(r.json().get("message", {}).get("content", ""))
+            raise AIError(f"Ollama error {r.status_code}: {r.text[:500]}", status=r.status_code)
+        data = self._json(r)
+        message = data.get("message", {})
+        self.last_info = {"finish": data.get("done_reason"), "thinking_chars": len(message.get("thinking") or ""),
+                          "output_tokens": data.get("eval_count")}
+        return self._log_response(message.get("content", ""))
 
     def list_models(self) -> list[str]:
         try:
@@ -104,7 +197,7 @@ class OllamaProvider(Provider):
             r.raise_for_status()
         except requests.RequestException as e:
             raise AIError(f"Cannot reach Ollama at {self.profile.base_url}: {e}") from e
-        return sorted(m["name"] for m in r.json().get("models", []))
+        return sorted(m["name"] for m in self._json(r).get("models", []))
 
 
 class AzureOpenAIProvider(Provider):
@@ -134,13 +227,12 @@ class AzureOpenAIProvider(Provider):
         else:
             url = f"{endpoint}/openai/deployments/{p.model}/chat/completions?api-version={p.api_version}"
         try:
-            r = requests.post(url, json=body, timeout=p.timeout, headers={"api-key": key})
+            r = requests.post(url, json=self._prepare(body), timeout=p.timeout, headers={"api-key": key})
         except requests.RequestException as e:
             raise AIError(f"Azure OpenAI request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"Azure OpenAI error {r.status_code}: {r.text[:500]}")
-        choices = r.json().get("choices") or [{}]
-        return self._log_response(choices[0].get("message", {}).get("content") or "")
+            raise AIError(f"Azure OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code)
+        return self._log_response(self._openai_content(self._json(r)))
 
 
 class OpenAIProvider(Provider):
@@ -165,14 +257,13 @@ class OpenAIProvider(Provider):
         if p.temperature is not None:
             body["temperature"] = p.temperature
         try:
-            r = requests.post("https://api.openai.com/v1/chat/completions", json=body,
+            r = requests.post("https://api.openai.com/v1/chat/completions", json=self._prepare(body),
                               timeout=p.timeout, headers={"Authorization": f"Bearer {key}"})
         except requests.RequestException as e:
             raise AIError(f"OpenAI request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"OpenAI error {r.status_code}: {r.text[:500]}")
-        choices = r.json().get("choices") or [{}]
-        return self._log_response(choices[0].get("message", {}).get("content") or "")
+            raise AIError(f"OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code)
+        return self._log_response(self._openai_content(self._json(r)))
 
 
 class AnthropicProvider(Provider):
@@ -200,14 +291,17 @@ class AnthropicProvider(Provider):
             body["temperature"] = p.temperature
         try:
             r = requests.post(
-                "https://api.anthropic.com/v1/messages", json=body, timeout=p.timeout,
+                "https://api.anthropic.com/v1/messages", json=self._prepare(body), timeout=p.timeout,
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
             )
         except requests.RequestException as e:
             raise AIError(f"Anthropic request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"Anthropic error {r.status_code}: {r.text[:500]}")
-        blocks = r.json().get("content") or []
+            raise AIError(f"Anthropic error {r.status_code}: {r.text[:500]}", status=r.status_code)
+        data = self._json(r)
+        blocks = data.get("content") or []
+        self.last_info = {"finish": data.get("stop_reason"),
+                          "output_tokens": (data.get("usage") or {}).get("output_tokens")}
         return self._log_response("\n".join(block.get("text", "") for block in blocks if block.get("type") == "text"))
 
 
@@ -363,6 +457,188 @@ def extract_metadata(provider: Provider, text: str, images: list[str] | None = N
     else:
         user = f"Excerpt:\n\n{text}"
     return AIMetadata.from_json(provider.chat(SYSTEM_PROMPT, user, images or None))
+
+
+# --- connection test -----------------------------------------------------------
+# A made-up front matter (so the model can't answer from memory), with the traps
+# seen in real books: a translator, an original title, a first and a later edition.
+TEST_EXCERPT = """ELENA MARCHETTI
+
+IL GUARDIANO DEL FARO
+
+Romanzo
+
+Titolo originale dell'opera: Der Leuchtturmwächter
+Traduzione di Paolo Bianchi
+
+Edizioni Lanterna
+
+© 2019 Edizioni Lanterna S.r.l., Torino
+Prima edizione: marzo 2019
+Terza edizione: ottobre 2021
+ISBN 978-88-7000-123-4
+
+Tutti i diritti riservati.
+
+CAPITOLO PRIMO
+
+La nebbia arrivò all'alba, come ogni giorno da quando Tommaso era tornato sull'isola."""
+TEST_EXPECTED = {
+    "title": ("Il guardiano del faro", lambda m: bool(m.title) and "guardiano del faro" in m.title.casefold()),
+    "authors": ("Elena Marchetti (not the translator)",
+                lambda m: any("marchetti" in a.casefold() for a in m.authors)
+                and not any("bianchi" in a.casefold() for a in m.authors)),
+    "publisher": ("Edizioni Lanterna", lambda m: bool(m.publisher) and "lanterna" in m.publisher.casefold()),
+    "edition": ("3 (this copy is the third edition)", lambda m: m.edition_number == 3),
+    "year": ("2021", lambda m: m.year == 2021),
+    "isbn": ("978-88-7000-123-4",
+             lambda m: any(re.sub(r"[^0-9]", "", i) == "9788870001234" for i in m.isbn)),
+}
+
+
+# Report line levels: the dialog colours them (good green, problem red, note orange).
+INFO, GOOD, PROBLEM, NOTE = "info", "good", "problem", "note"
+ReportLine = tuple[str, str]
+
+
+def report_text(lines: list[ReportLine]) -> str:
+    """The report as plain text (tests, logs)."""
+    return "\n".join(text for _, text in lines)
+
+
+def _probe(provider: Provider, pairs: list[list[str]]) -> AIError | None:
+    """Send a short request with only these advanced parameters: the error, or None if accepted."""
+    probe = copy.copy(provider)
+    probe.profile = replace(provider.profile, extra_params=pairs)
+    try:
+        probe.chat("Reply with a JSON object.", 'Return {"ok": true}.')
+    except AIError as e:
+        return e
+    except Exception as e:  # never lose the actual error
+        return AIError(f"unexpected {type(e).__name__}: {e}")
+    return None
+
+
+def _find_refused(provider: Provider, params: dict, first_error: str = "") -> list[ReportLine]:
+    """Which advanced parameters the server refuses, found by asking it again:
+    without them, then with each one alone. Needs no knowledge of the server's
+    error format, so it works with any provider."""
+    def short(e: AIError) -> str:
+        return str(e)[:600]
+
+    lines: list[ReportLine] = [(INFO, f"Looking for the refused parameter ({len(params) + 1} short requests):")]
+    error = _probe(provider, [])
+    if error is not None:
+        if error.status is None:
+            return lines + [(NOTE, f"Inconclusive: no answer without parameters ({short(error)}).")]
+        same = str(error) == first_error  # already shown above: don't repeat it
+        return lines + [(PROBLEM, "It fails even without advanced parameters, so they are not the cause: "
+                                  "check the model, key and URL." + ("" if same else f" ({short(error)})"))]
+    lines.append((GOOD, "✓ without advanced parameters: accepted"))
+    refused = unknown = 0
+    for pair in ([n, v] for n, v in ((list(x) + ["", ""])[:2] for x in provider.profile.extra_params)
+                 if n.strip() in params):
+        error = _probe(provider, [pair])
+        if error is None:
+            lines.append((GOOD, f"✓ {pair[0]} = {pair[1]}: accepted"))
+        elif error.status is None:
+            unknown += 1
+            lines.append((NOTE, f"? {pair[0]} = {pair[1]}: no answer ({short(error)})"))
+        else:
+            refused += 1
+            lines.append((PROBLEM, f"✗ {pair[0]} = {pair[1]}: refused. {short(error)}"))
+    if refused:
+        lines.append((PROBLEM, "Remove or correct the refused parameters (✗)."))
+    elif not unknown:
+        lines.append((PROBLEM, "Each parameter is accepted alone, but not all together."))
+    return lines
+
+
+def connection_test(provider: Provider) -> tuple[bool, list[ReportLine]]:
+    """Send one real metadata request with the profile's settings and advanced
+    parameters, and report what went wrong: parameters refused, empty reply,
+    no JSON, answer cut short, slow answer, wrong values. Returns (ok, report
+    lines as (level, text))."""
+    lines: list[ReportLine] = []
+    params, problems = extra_params(provider.profile)
+    if params:
+        lines.append((INFO, "Advanced parameters sent: "
+                       + ", ".join(f"{k} = {json.dumps(v)}" for k, v in params.items())))
+    else:
+        lines.append((INFO, "No advanced parameters."))
+    if problems:
+        return False, lines + [(INFO, ""), (PROBLEM, "Not sent. Fix these parameters first:")] + [
+            (PROBLEM, f"• {p}") for p in problems]
+
+    started = time.monotonic()
+    try:
+        raw = provider.chat(SYSTEM_PROMPT, f"Excerpt:\n\n{TEST_EXCERPT}")
+    except AIError as e:
+        lines += [(INFO, ""), (PROBLEM, f"FAILED: {e}")]
+        if params and e.status is not None:  # the server answered with an error: maybe a parameter
+            lines += [(INFO, "")] + _find_refused(provider, params, str(e))
+        return False, lines
+    except Exception as e:  # anything else: still show the actual error
+        return False, lines + [(INFO, ""), (PROBLEM, f"FAILED (unexpected {type(e).__name__}): {e}")]
+    secs = time.monotonic() - started
+    info = provider.last_info
+    ok = True
+    lines.append((INFO, f"Answer in {secs:.1f} s" + (f" · finish: {info['finish']}" if info.get("finish") else "")
+                  + (f" · output tokens: {info['output_tokens']}" if info.get("output_tokens") else "")))
+    if info.get("thinking_chars"):
+        lines.append((INFO, f"The model thought before answering ({info['thinking_chars']:,} characters)."))
+    if info.get("reasoning_tokens"):
+        lines.append((INFO, f"The model reasoned before answering ({info['reasoning_tokens']:,} tokens)."))
+
+    if not raw.strip():
+        ok = False
+        lines += [(INFO, ""), (PROBLEM, "PROBLEM: empty reply.")]
+        if info.get("finish") in ("length", "max_tokens"):
+            lines.append((PROBLEM, "The answer was cut off: the model used all its room (thinking/reasoning?) "
+                                   "before writing it. Switch thinking off (Ollama: think = false; OpenAI: "
+                                   "reasoning_effort = none or low) or raise the context size."))
+    else:
+        try:
+            meta = AIMetadata.from_json(raw)
+        except AIError as e:
+            return False, lines + [(INFO, ""), (PROBLEM, f"PROBLEM: {e}"), (INFO, "The model replied:"),
+                                   (INFO, raw[:800] + ("…" if len(raw) > 800 else ""))]
+        if info.get("finish") in ("length", "max_tokens"):
+            ok = False
+            lines.append((PROBLEM, "PROBLEM: the answer was cut off (finish: length)."))
+        lines += [(INFO, ""), (INFO, "Values read from the test page:")]
+        for field_name, (expected, check) in TEST_EXPECTED.items():
+            good = check(meta)
+            got = getattr(meta, field_name if field_name != "edition" else "edition_number")
+            got = ", ".join(got) if isinstance(got, list) else got
+            lines.append((GOOD if good else PROBLEM,
+                          f"{'✓' if good else '✗'} {field_name}: {got if got not in (None, '') else '—'}"
+                          + ("" if good else f"   (expected {expected})")))
+        wrong = [f for f, (_, check) in TEST_EXPECTED.items() if not check(meta)]
+        if wrong:
+            lines.append((NOTE, f"{len(wrong)} of {len(TEST_EXPECTED)} values differ: the model works, "
+                                "but may misread some books."))
+    if "think" in {k.lower() for k in params} and params.get("think") is False and info.get("thinking_chars"):
+        ok = False
+        lines.append((PROBLEM, "PROBLEM: think = false was sent but the model still thought: this model or "
+                               "Ollama version ignores it."))
+    elif provider.profile.kind == OLLAMA and params and info.get("thinking_chars"):
+        lines.append((NOTE, "The model still thought: if one of the parameters was meant to switch thinking "
+                            "off, it had no effect (Ollama's name is think)."))
+    notes = []
+    if secs > 60:
+        notes.append(f"Slow: {secs:.0f} s for one short page. An analysis makes this call once or "
+                     "twice per undecided book.")
+    if params:
+        notes.append("A model may ignore a parameter it doesn't support, or refuse the request. A refusal "
+                     "shows up here as an error; an ignored parameter doesn't, so check that it had the "
+                     "effect you wanted (e.g. a faster answer).")
+        if provider.profile.kind == OLLAMA:
+            notes.append("Ollama ignores parameter names it doesn't know, without any error: "
+                         "check the spelling.")
+    if notes:
+        lines += [(INFO, "")] + [(NOTE, f"Note: {n}") for n in notes]
+    return ok, lines
 
 
 # --- cover comparison --------------------------------------------------------

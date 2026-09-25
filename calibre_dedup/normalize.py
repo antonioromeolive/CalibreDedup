@@ -92,11 +92,41 @@ def strip_edition(title: str) -> str:
 _UNCLOSED_TAIL_RE = re.compile(r"\s*[\(\[][^\(\)\[\]]*$")
 
 
+# A bracket group closing the title names a series, collection or imprint, e.g.
+# "Il grande freddo (eLit)", "La targa (VINTAGE)": not part of the title. It is
+# kept when it tells books apart: a volume (digits, roman numerals, "vol.",
+# "parte"...), a different content ("Serie completa", "antologia", "ridotta")
+# or a language ("Em Portuguese Do Brasil", "versione inglese").
+_TRAILING_GROUP_RE = re.compile(r"\s*[\(\[]([^\(\)\[\]]*)[\)\]]\s*$")
+_VOLUME_RE = re.compile(
+    r"\d|#|\b(?:vol|volume|volumi|parte|part|libro|book|tomo|tome|band|episodio|episode"
+    r"|complet[ao]|complete|raccolta|antologia|anthology|omnibus|trilogia|trilogy|cofanetto|box|boxset"
+    r"|integrale|unabridged|ridott[ao]|abridged"
+    r"|italian[ao]?|ingles[ei]|english|frances[ei]|french|spagnol[ao]|spanish|espanol|tedesc[ao]|german|deutsch"
+    r"|portoghese|portuguese|portugues)\b", re.I)
+_ROMAN_RE = re.compile(r"[ivxlcdm]+", re.I)
+
+
+def _strip_trailing_groups(title: str) -> str:
+    while True:
+        m = _TRAILING_GROUP_RE.search(title)
+        if not m:
+            return title
+        inside = m.group(1).strip()
+        if _VOLUME_RE.search(inside) or _ROMAN_RE.fullmatch(inside):
+            return title
+        rest = title[:m.start()]
+        if not _tokens(rest):  # never reduce a title to nothing
+            return title
+        title = rest
+
+
 def title_key(title: str, ignore_subtitle: bool = False) -> str:
     title = strip_edition(title)
     cut = _UNCLOSED_TAIL_RE.sub("", title)
     if cut.strip():  # never reduce a title to nothing
         title = cut
+    title = _strip_trailing_groups(title)
     if ignore_subtitle:
         title = re.split(r"\s*[:–—]\s+|\s+-\s+", title, maxsplit=1)[0]
     tokens = _tokens(title)

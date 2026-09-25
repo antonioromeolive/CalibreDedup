@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 import os
 import sys
@@ -33,24 +34,11 @@ from ..selection import (
 )
 from ..session import make_resolver, require_calibre_dir
 from .settings_dialog import SettingsDialog
+from .style import BLUE, GREEN, RED, button_css, set_running
 
 log = logging.getLogger("calibre_dedup")
 
 ACTION_COLORS = {Action.MOVE: "#2e7d32", Action.TRASH: "#c62828", Action.LEAVE: "#8d6e00"}
-
-
-def _button_css(color: str, hover: str, pressed: str, border: str) -> str:
-    """Coloured when usable, grey when not, amber while it is the one working
-    (property running=true: "Analyzing…", "Executing…", "Stopping…")."""
-    return (
-        f"QPushButton {{ background: {color}; color: white; font-weight: bold; "
-        f"padding: 6px 12px; border: 1px solid {border}; border-radius: 3px; }}"
-        f"QPushButton:hover {{ background: {hover}; }}"
-        f"QPushButton:pressed {{ background: {pressed}; }}"
-        "QPushButton:disabled { background: #7f8c96; color: #d9dee2; border-color: #6b757d; }"
-        'QPushButton[running="true"], QPushButton[running="true"]:disabled '
-        "{ background: #e69500; color: white; border-color: #b87600; }"
-    )
 
 
 def _compact(combo: QComboBox, chars: int) -> QComboBox:
@@ -75,16 +63,18 @@ def _elastic(label: QLabel) -> QLabel:
     return label
 
 
-def _set_running(button: QPushButton, running: bool) -> None:
-    if button.property("running") != running:
-        button.setProperty("running", running)
-        button.style().unpolish(button)  # re-evaluate the [running="true"] selector
-        button.style().polish(button)
-
-
 # --- logging into the GUI -----------------------------------------------------
+AI_LOG_COLOR = "#7b1fa2"  # purple: lines from or about the AI in the log panel
+
+
 class _LogSignal(QObject):
-    message = Signal(str)
+    message = Signal(str, bool)  # text, from/about the AI
+
+
+def is_ai_record(record: logging.LogRecord) -> bool:
+    """AI calls and replies, and what the analysis says about them ("AI reading…",
+    "AI error on…", "image AI disabled…", the "AI: text = …" setup line)."""
+    return record.name.endswith(".ai") or record.getMessage().startswith(("AI ", "AI:", "image AI"))
 
 
 class QtLogHandler(logging.Handler):
@@ -94,7 +84,7 @@ class QtLogHandler(logging.Handler):
         self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
 
     def emit(self, record):
-        self.signal.message.emit(self.format(record))
+        self.signal.message.emit(self.format(record), is_ai_record(record))
 
 
 # --- table model ----------------------------------------------------------------
@@ -470,10 +460,10 @@ class MainWindow(QMainWindow):
         self.analyze_btn = QPushButton("1. Analyze (dry run)")
         self.execute_btn = QPushButton("2. Execute checked")
         self.stop_btn = QPushButton("Stop")
-        self.analyze_btn.setStyleSheet(_button_css("#1769aa", "#2186c4", "#0f4f7f", "#125a91"))
-        self.execute_btn.setStyleSheet(_button_css("#218739", "#2ea043", "#176b2c", "#196b2d"))
+        self.analyze_btn.setStyleSheet(button_css(*BLUE))
+        self.execute_btn.setStyleSheet(button_css(*GREEN))
         # Red while something can be stopped, grey otherwise.
-        self.stop_btn.setStyleSheet(_button_css("#c62828", "#d84343", "#8e1c1c", "#a01f1f"))
+        self.stop_btn.setStyleSheet(button_css(*RED))
         self.export_btn = QPushButton("Export CSV…")
         self.analyze_btn.clicked.connect(self._analyze)
         self.execute_btn.clicked.connect(self._execute)
@@ -565,7 +555,7 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
-        log_handler.signal.message.connect(self.log_view.appendPlainText)
+        log_handler.signal.message.connect(self._append_log)
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.table)
         splitter.addWidget(self.log_view)
@@ -675,14 +665,14 @@ class MainWindow(QMainWindow):
         self.analyze_btn.setText(("Finishing…" if finishing else "Analyzing…") if analyzing
                                  else "1. Analyze (dry run)")
         self.analyze_btn.setToolTip("Saving the AI cache; available again in a moment" if finishing else "")
-        _set_running(self.analyze_btn, analyzing)
+        set_running(self.analyze_btn, analyzing)
         if finishing:
             self.progress.setRange(0, 0)  # moving "busy" bar
         elif self.progress.maximum() == 0:
             self.progress.setRange(0, self._progress_max)
             self.progress.setValue(self._progress_max)
         self.stop_btn.setText("Stopping…" if busy and self._stopping else "Stop")
-        _set_running(self.stop_btn, busy and self._stopping)
+        set_running(self.stop_btn, busy and self._stopping)
         self.export_btn.setEnabled(not busy and self.plan is not None)
         self.stop_btn.setEnabled(busy and not self._stopping)
         self.table.setSortingEnabled(not busy)  # no sorting while rows arrive or results come in
@@ -700,7 +690,7 @@ class MainWindow(QMainWindow):
             self.checked_label.setText("")
             self.execute_btn.setText("2. Execute checked")
             self.execute_btn.setEnabled(False)
-            _set_running(self.execute_btn, False)
+            set_running(self.execute_btn, False)
             return
         self.summary.setText(
             f"<b style='color:{ACTION_COLORS[Action.MOVE]}'>{p.count(Action.MOVE)} move</b> · "
@@ -718,7 +708,7 @@ class MainWindow(QMainWindow):
             self.execute_btn.setToolTip("This plan has been executed and the libraries have changed.\n"
                                         "Analyze again (fast: AI answers are cached) to continue with the rest.")
             self.execute_btn.setEnabled(False)
-            _set_running(self.execute_btn, False)
+            set_running(self.execute_btn, False)
             return
         self.execute_btn.setToolTip("")
         todo = actionable(p)
@@ -731,7 +721,7 @@ class MainWindow(QMainWindow):
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
                                  else f"2. Execute checked ({len(todo)})")
-        _set_running(self.execute_btn, executing)
+        set_running(self.execute_btn, executing)
         self.execute_btn.setEnabled(not self._busy and self.worker is None and not self.model.locked and bool(todo))
 
     # --- selection ------------------------------------------------------------------
@@ -896,10 +886,23 @@ class MainWindow(QMainWindow):
             box.setChecked(False)
         self.hide_unique.setChecked(False)
 
+    def _append_log(self, text: str, ai: bool):
+        if ai:  # kept as plain text (the JSON replies' indentation too), only coloured
+            self.log_view.appendHtml(f"<span style='color:{AI_LOG_COLOR}; white-space:pre-wrap'>"
+                                     f"{html.escape(text)}</span>")
+        else:
+            self.log_view.appendHtml(f"<span style='white-space:pre-wrap'>{html.escape(text)}</span>")
+
     def _open_settings(self):
         self._sync_settings()
-        if SettingsDialog(self.settings, self).exec():
-            self._fill_profiles()
+        dialog = SettingsDialog(self.settings, self)
+        try:
+            if dialog.exec():
+                self._fill_profiles()
+        finally:
+            # Delete it now: a closed dialog left alive as a hidden child of the window
+            # crashed the next analysis (Python freed memory Qt still used).
+            dialog.deleteLater()
 
     # --- analyze --------------------------------------------------------------------
     def _analyze(self):
