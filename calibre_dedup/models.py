@@ -20,6 +20,7 @@ class Book:
     library: str
     has_cover: bool = False
     comments: str | None = None
+    asins: set[str] = field(default_factory=set)  # Amazon ids (mobi-asin, amazon*)
 
     def label(self) -> str:
         return f"{self.title} — {' & '.join(self.authors)}"
@@ -36,11 +37,17 @@ class Identity:
     year: int | None = None  # publication year of this edition
     isbns: set[str] = field(default_factory=set)
     ai_fields: set[str] = field(default_factory=set)  # fields filled by AI
+    # What the AI read in the book, kept even when metadata already has a value,
+    # so that two books read by the AI can be compared on what is printed in them.
+    ai_year: int | None = None
+    ai_publisher: str | None = None
+    asins: set[str] = field(default_factory=set)  # from metadata only
 
     def copy(self) -> "Identity":
         return Identity(
             self.title, list(self.authors), self.publisher, self.edition,
-            self.year, set(self.isbns), set(self.ai_fields),
+            self.year, set(self.isbns), set(self.ai_fields), self.ai_year, self.ai_publisher,
+            set(self.asins),
         )
 
     @property
@@ -89,6 +96,10 @@ class Plan:
     target_library: str
     trash_library: str
     items: list[PlanItem] = field(default_factory=list)
+    total_books: int = 0  # books in the source library
+    stopped: bool = False  # analysis was stopped: only some source books have an item
+    stop_reason: str = ""  # why it stopped by itself (e.g. a disk error); empty when the user stopped it
+    same_library: bool = False  # duplicates within one library (source == target)
 
     def count(self, action: Action) -> int:
         return sum(1 for i in self.items if i.action is action)

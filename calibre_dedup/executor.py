@@ -144,11 +144,21 @@ def execute_plan(
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                 errors="replace", creationflags=CREATE_NO_WINDOW,
             )
+            if cancel is not None:
+                # Signal the bridge as soon as Stop is pressed, not when it next prints:
+                # it finishes the current book and skips the rest.
+                def watch_cancel():
+                    while proc.poll() is None:
+                        if cancel.wait(0.5):
+                            try:
+                                Path(str(plan_file) + ".stop").touch()
+                            except OSError:
+                                pass  # the bridge already ended and the temp dir is gone
+                            return
+                threading.Thread(target=watch_cancel, daemon=True).start()
             done = False
             assert proc.stdout is not None
             for line in proc.stdout:
-                if cancel is not None and cancel.is_set():
-                    Path(str(plan_file) + ".stop").touch()
                 if not line.startswith("@@CDR "):
                     if line.strip():
                         log.info("calibre: %s", line.rstrip())
@@ -159,6 +169,7 @@ def execute_plan(
                     item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
                     if msg["ok"]:
                         ok += 1
+                        log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
                     else:
                         failed += 1
                         _keep_failed_in_source(item)
@@ -167,6 +178,11 @@ def execute_plan(
                         on_result(item, msg["ok"], msg["msg"])
                 elif msg["event"] == "stopped":
                     log.warning("Execution stopped by user")
+                elif msg["event"] == "cleanup_start":
+                    log.info("Removing empty source folders…")
+                elif msg["event"] == "cleanup":
+                    log.info("Source folder cleanup: %d removed, %d deferred",
+                             msg["removed"], msg["deferred"])
                 elif msg["event"] == "done":
                     done = True
             proc.wait()

@@ -87,8 +87,16 @@ def strip_edition(title: str) -> str:
     return plain
 
 
+# A bracket opened at the end of a title and never closed: a title cut short,
+# e.g. "Piccole donne crescono (Italia" for "... (Italian Edition)".
+_UNCLOSED_TAIL_RE = re.compile(r"\s*[\(\[][^\(\)\[\]]*$")
+
+
 def title_key(title: str, ignore_subtitle: bool = False) -> str:
     title = strip_edition(title)
+    cut = _UNCLOSED_TAIL_RE.sub("", title)
+    if cut.strip():  # never reduce a title to nothing
+        title = cut
     if ignore_subtitle:
         title = re.split(r"\s*[:–—]\s+|\s+-\s+", title, maxsplit=1)[0]
     tokens = _tokens(title)
@@ -105,6 +113,24 @@ def author_key(name: str) -> tuple[str, ...]:
 
 def authors_key(authors: list[str]) -> frozenset[tuple[str, ...]]:
     return frozenset(k for k in (author_key(a) for a in authors if not is_unknown(a)) if k)
+
+
+# Name parts ignored by "similar" author matching (from the Find Duplicates plugin).
+_IGNORE_AUTHOR_WORDS = {"von", "van", "jr", "sr", "i", "ii", "iii", "second", "third", "md", "phd"}
+
+
+def similar_author_key(name: str) -> tuple[str, ...]:
+    """Looser author key, as the Find Duplicates plugin's "similar" algorithm:
+    initials and suffixes are dropped, so 'Stephen E. King' == 'King, Stephen'."""
+    tokens = author_key(name)
+    kept = tuple(t for t in tokens if len(t) > 1 and t not in _IGNORE_AUTHOR_WORDS)
+    return kept or tokens
+
+
+def similar_authors_keys(authors: list[str]) -> list[tuple[str, ...]]:
+    """One key per author: books sharing any author are compared."""
+    keys = (similar_author_key(a) for a in authors if not is_unknown(a))
+    return list(dict.fromkeys(k for k in keys if k))
 
 
 def publisher_tokens(publisher: str) -> frozenset[str]:

@@ -1,14 +1,17 @@
-"""AI providers (Ollama, Azure OpenAI) and bibliographic metadata extraction."""
+"""AI providers (Ollama, Azure OpenAI, OpenAI, Anthropic), metadata extraction and cover comparison."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
+import struct
 import tempfile
 import threading
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,10 +26,30 @@ class AIError(Exception):
     pass
 
 
+def _solid_png_b64(width: int, height: int, rgb: tuple[int, int, int]) -> str:
+    """A single-colour PNG, base64 encoded."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    rows = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode()
+
+
 # --- providers ---------------------------------------------------------------
 class Provider:
     def __init__(self, profile: ProviderProfile):
         self.profile = profile
+
+    def _log_call(self, user: str, images: list[str] | None) -> None:
+        log.info("AI call started: provider=%s model=%s text_chars=%d images=%d",
+                 self.profile.kind, self.profile.model or "(default)", len(user), len(images or []))
+
+    def _log_response(self, response: str) -> str:
+        log.info("AI response: provider=%s model=%s\n%s",
+                 self.profile.kind, self.profile.model or "(default)", response)
+        return response
 
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         raise NotImplementedError
@@ -38,6 +61,14 @@ class Provider:
         reply = self.chat("Reply with a JSON object.", 'Return {"ok": true}.')
         return f"OK: {reply[:200]}"
 
+    def test_images(self) -> bool:
+        """Send a plain red image and check the model names its colour: a model that
+        can't read images either fails or can't know it."""
+        reply = self.chat("Reply with a JSON object.",
+                          'What is the colour of the attached image? Return {"colour": "<one word>"}.',
+                          [_solid_png_b64(64, 64, (220, 20, 20))])
+        return "red" in reply.lower()
+
 
 class OllamaProvider(Provider):
     def _url(self, path: str) -> str:
@@ -45,6 +76,7 @@ class OllamaProvider(Provider):
 
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         p = self.profile
+        self._log_call(user, images)
         user_msg: dict = {"role": "user", "content": user}
         if images:
             user_msg["images"] = images
@@ -64,7 +96,7 @@ class OllamaProvider(Provider):
             raise AIError(f"Ollama request failed: {e}") from e
         if r.status_code != 200:
             raise AIError(f"Ollama error {r.status_code}: {r.text[:500]}")
-        return r.json().get("message", {}).get("content", "")
+        return self._log_response(r.json().get("message", {}).get("content", ""))
 
     def list_models(self) -> list[str]:
         try:
@@ -78,6 +110,7 @@ class OllamaProvider(Provider):
 class AzureOpenAIProvider(Provider):
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         p = self.profile
+        self._log_call(user, images)
         if not p.base_url or not p.model:
             raise AIError("Azure OpenAI profile needs an endpoint and a deployment name")
         key = p.api_key
@@ -107,12 +140,13 @@ class AzureOpenAIProvider(Provider):
         if r.status_code != 200:
             raise AIError(f"Azure OpenAI error {r.status_code}: {r.text[:500]}")
         choices = r.json().get("choices") or [{}]
-        return choices[0].get("message", {}).get("content") or ""
+        return self._log_response(choices[0].get("message", {}).get("content") or "")
 
 
 class OpenAIProvider(Provider):
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         p = self.profile
+        self._log_call(user, images)
         if not p.model:
             raise AIError("OpenAI profile needs a model name")
         key = p.api_key
@@ -138,12 +172,13 @@ class OpenAIProvider(Provider):
         if r.status_code != 200:
             raise AIError(f"OpenAI error {r.status_code}: {r.text[:500]}")
         choices = r.json().get("choices") or [{}]
-        return choices[0].get("message", {}).get("content") or ""
+        return self._log_response(choices[0].get("message", {}).get("content") or "")
 
 
 class AnthropicProvider(Provider):
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         p = self.profile
+        self._log_call(user, images)
         if not p.model:
             raise AIError("Anthropic profile needs a model name")
         key = p.api_key
@@ -173,7 +208,7 @@ class AnthropicProvider(Provider):
         if r.status_code != 200:
             raise AIError(f"Anthropic error {r.status_code}: {r.text[:500]}")
         blocks = r.json().get("content") or []
-        return "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+        return self._log_response("\n".join(block.get("text", "") for block in blocks if block.get("type") == "text"))
 
 
 def make_provider(profile: ProviderProfile) -> Provider:
@@ -222,6 +257,11 @@ class AIMetadata:
 
     @classmethod
     def from_json(cls, text: str) -> "AIMetadata":
+        if not text.strip():
+            # Some models answer nothing at all, instead of nulls, when the pages
+            # hold no metadata. Taken as "nothing found", so it is cached, not retried.
+            log.info("AI reply is empty: taken as no metadata found")
+            return cls()
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
             raise AIError(f"AI reply is not JSON: {text[:200]!r}")
@@ -280,6 +320,12 @@ class AICache:
         token = f"{file_path}|{stamp}|{part}"
         return hashlib.sha1(token.encode()).hexdigest()
 
+    @classmethod
+    def pair_key(cls, path_a: str, path_b: str, part: str) -> str:
+        """Order-insensitive key for a question about two files."""
+        a, b = sorted((cls.key(path_a, part), cls.key(path_b, part)))
+        return hashlib.sha1(f"{a}|{b}".encode()).hexdigest()
+
     def get(self, key: str) -> dict | None:
         return self._data.get(key)
 
@@ -317,3 +363,36 @@ def extract_metadata(provider: Provider, text: str, images: list[str] | None = N
     else:
         user = f"Excerpt:\n\n{text}"
     return AIMetadata.from_json(provider.chat(SYSTEM_PROMPT, user, images or None))
+
+
+# --- cover comparison --------------------------------------------------------
+COVER_PROMPT = """You compare two book cover images to tell whether they are the cover of the same \
+edition of the same book.
+
+Respond with a single JSON object: {"verdict": "same"|"different"|"unsure", "reason": string}
+
+Rules:
+- "same": the same cover artwork, title and author, and layout. Differences in resolution, cropping, \
+compression, colour balance, borders or small overlays (e.g. a store badge) do not matter.
+- "different": different artwork, title, author, publisher logo or edition statement (e.g. a \
+"2nd edition" banner on one only).
+- "unsure": either image is not a real cover (blank, generic placeholder, text-only generated cover) \
+or you cannot tell.
+"""
+
+COVER_VERDICTS = ("same", "different", "unsure")
+
+
+def compare_covers(provider: Provider, cover_a: str, cover_b: str) -> tuple[str, str]:
+    """Ask a vision model whether two base64 PNG covers are the same. Returns (verdict, reason)."""
+    text = provider.chat(COVER_PROMPT, "Cover 1 and cover 2 are attached.", [cover_a, cover_b])
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise AIError(f"AI reply is not JSON: {text[:200]!r}")
+    try:
+        data = json.loads(m.group())
+    except ValueError as e:
+        raise AIError(f"AI reply is not valid JSON: {e}") from e
+    verdict = str(data.get("verdict", "")).strip().lower()
+    reason = data.get("reason")
+    return (verdict if verdict in COVER_VERDICTS else "unsure"), (reason if isinstance(reason, str) else "")

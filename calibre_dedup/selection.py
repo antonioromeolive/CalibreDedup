@@ -12,30 +12,55 @@ from .models import Action, Plan, PlanItem
 
 log = logging.getLogger(__name__)
 
-ACTION_LABELS = {Action.MOVE: "Move to target", Action.TRASH: "Trash (duplicate)", Action.LEAVE: "Leave in source"}
+ACTION_LABELS = {Action.MOVE: "Move to target", Action.TRASH: "Trash only", Action.LEAVE: "Leave in source"}
+MERGE = "merge"  # a TRASH item that first merges formats into the kept copy
+MERGE_LABEL = "Merge & Trash"
+# Filter keys and labels, in display order: a duplicate is "merge" or "trash".
+FILTER_LABELS = {Action.MOVE.value: ACTION_LABELS[Action.MOVE], MERGE: MERGE_LABEL,
+                 Action.TRASH.value: ACTION_LABELS[Action.TRASH], Action.LEAVE.value: ACTION_LABELS[Action.LEAVE]}
+
+
+def mergeable_formats(item: PlanItem) -> list[str]:
+    """Formats of the book that its match lacks; PDF is never merged."""
+    if item.match is None:
+        return []
+    return [f for f in item.source.formats if f not in item.match.formats and f != "PDF"]
+
+
+def filter_key(item: PlanItem) -> str:
+    if item.action is Action.TRASH and item.add_formats:
+        return MERGE
+    return item.action.value
+
+
+def action_label(item: PlanItem) -> str:
+    """Merge & Trash: the duplicate's extra formats go to the kept copy, then it
+    goes to trash. Trash only: nothing to merge."""
+    return FILTER_LABELS[filter_key(item)]
 
 
 # --- overrides ------------------------------------------------------------------
-def can_override(item: PlanItem, action: Action) -> bool:
+def can_override(item: PlanItem, action: Action, same_library: bool = False) -> bool:
+    if action is Action.MOVE:
+        return not same_library  # a book can't be moved into the library it is in
     # Trashing needs a target copy to be a duplicate of.
     return action is not Action.TRASH or item.match is not None
 
 
-def override(item: PlanItem, action: Action) -> None:
+def override(item: PlanItem, action: Action, same_library: bool = False) -> None:
     if action is item.planned_action:
         revert(item)
         return
-    if not can_override(item, action):
+    if not can_override(item, action, same_library):
+        if action is Action.MOVE:
+            raise ValueError(f"#{item.source.id} is already in the target library")
         raise ValueError(f"#{item.source.id} has no matching target book to be a duplicate of")
     item.action = action
     item.manual = True
-    item.reason = (f"manual: {ACTION_LABELS[action].lower()} "
+    item.add_formats = mergeable_formats(item) if action is Action.TRASH else []
+    merged = f" {', '.join(item.add_formats)}" if item.add_formats else ""
+    item.reason = (f"manual: {action_label(item).lower()}{merged} "
                    f"(analysis: {item.planned_action.value} — {item.planned_reason})")
-    if action is Action.TRASH:
-        existing = item.match.formats
-        item.add_formats = [f for f in item.source.formats if f not in existing and f != "PDF"]
-    else:
-        item.add_formats = []
     item.selected = action is not Action.LEAVE
 
 
@@ -55,13 +80,16 @@ def blocked(plan: Plan) -> dict[int, str]:
     be trashed if that move actually happens.
     """
     by_id = {i.source.id: i for i in plan.items}
-    out: dict[int, str] = {}
-    for it in plan.items:
-        if it.action is Action.TRASH and it.match_planned and it.match is not None:
-            m = by_id.get(it.match.id)
-            if m is None or m.action is not Action.MOVE or not m.selected:
-                out[it.source.id] = f"blocked: #{it.match.id} (its target copy) is not being moved"
-    return out
+    return {it.source.id: why for it in plan.items if (why := blocked_reason(it, by_id))}
+
+
+def blocked_reason(it: PlanItem, by_id: dict[int, PlanItem]) -> str:
+    """Why `it` can't run ("" if it can); `by_id` maps source book ids to plan items."""
+    if it.action is Action.TRASH and it.match_planned and it.match is not None:
+        m = by_id.get(it.match.id)
+        if m is None or m.action is not Action.MOVE or not m.selected:
+            return f"blocked: #{it.match.id} (its target copy) is not being moved"
+    return ""
 
 
 def actionable(plan: Plan) -> list[PlanItem]:
@@ -98,17 +126,18 @@ class SelectionStore:
         except (OSError, ValueError):
             return {}
 
-    def apply(self, plan: Plan) -> int:
-        """Re-apply saved choices to a fresh plan. Returns how many were restored."""
+    def apply(self, plan: Plan, items: list[PlanItem] | None = None) -> int:
+        """Re-apply saved choices to a fresh plan, or to `items` of it (the books just
+        decided, while the analysis runs). Returns how many were restored."""
         entries = self._read().get(self._key(plan), {})
         restored = 0
-        for item in plan.items:
+        for item in plan.items if items is None else items:
             e = entries.get(item.source.uuid)
             if not e:
                 continue
             if e.get("action"):
                 try:
-                    override(item, Action(e["action"]))
+                    override(item, Action(e["action"]), plan.same_library)
                 except ValueError:
                     continue
             if "selected" in e and item.action is not Action.LEAVE:
@@ -116,7 +145,8 @@ class SelectionStore:
             restored += 1
         return restored
 
-    def save(self, plan: Plan) -> None:
+    def save(self, plan: Plan, partial: bool = False) -> None:
+        """`partial`: the plan doesn't cover every book yet (analysis still running)."""
         entries = {}
         for item in plan.items:
             e = {}
@@ -128,6 +158,11 @@ class SelectionStore:
                 entries[item.source.uuid] = e
         data = self._read()
         key = self._key(plan)
+        if plan.stopped or partial:
+            # Books the analysis didn't (yet) reach keep their saved choices.
+            seen = {item.source.uuid for item in plan.items}
+            old = data.get(key, {})
+            entries = {**{u: e for u, e in old.items() if u not in seen}, **entries}
         if entries:
             data[key] = entries
         else:

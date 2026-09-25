@@ -13,6 +13,7 @@ Creating "<plan.json>.stop" stops execution before the next action.
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 
@@ -41,6 +42,40 @@ def copy_verified(src, book_id, dest):
     if missing:
         raise RuntimeError(f"formats missing after copy: {', '.join(sorted(missing))}")
     return new_id
+
+
+def cleanup_empty_dirs(root, folders, attempts=3):
+    """Remove the removed books' folders (and their author folders) if empty,
+    after all database work is finished. Only these are checked: walking a
+    large library can take many minutes."""
+    removed = 0
+    deferred = set()
+    root = os.path.abspath(root)
+    todo = set()
+    for folder in folders:
+        book_dir = os.path.abspath(os.path.join(root, folder))
+        for d in (book_dir, os.path.dirname(book_dir)):
+            if os.path.dirname(d).startswith(root) and d != root:
+                todo.add(d)
+    for attempt in range(attempts):
+        # Deepest first, so an author folder is tried after its book folders.
+        candidates = sorted((d for d in todo if os.path.isdir(d)), key=lambda d: d.count(os.sep), reverse=True)
+        if not candidates:
+            break
+        deferred.clear()
+        for current in candidates:
+            try:
+                if not os.listdir(current):
+                    os.rmdir(current)
+                    removed += 1
+                todo.discard(current)  # removed, or not empty: other books live there
+            except OSError:
+                deferred.add(current)
+        if not deferred:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (attempt + 1))
+    return removed, len(deferred)
 
 
 def fill_metadata(db, book_id, values):
@@ -80,6 +115,7 @@ def main(plan_path):
     trash = open_db(plan["trash"]).new_api
     permanent = bool(plan.get("permanent"))
     moved = {}  # source id -> new id in target
+    removed_folders = []  # source book folders, relative to the library
     stop_file = plan_path + ".stop"
 
     try:
@@ -123,13 +159,24 @@ def main(plan_path):
                 else:
                     raise RuntimeError(f"unknown op {action['op']!r}")
 
-                src.remove_books([sid], permanent=permanent)
+                removed_folders.append(src.field_for("path", sid))
+                try:
+                    src.remove_books([sid], permanent=permanent)
+                except PermissionError:
+                    # Calibre can remove the database record and files, then fail
+                    # only while deleting an empty folder locked by Windows.
+                    if sid in src.all_book_ids():
+                        raise
+                    msg += "; source record removed, empty folder cleanup deferred"
                 emit(event="result", src_id=sid, ok=True, msg=msg)
             except Exception as e:
                 emit(event="result", src_id=sid, ok=False, msg=str(e), trace=traceback.format_exc())
     finally:
         for db in (src, tgt, trash):
             db.close()
+    emit(event="cleanup_start")
+    removed, deferred = cleanup_empty_dirs(plan["source"], removed_folders)
+    emit(event="cleanup", removed=removed, deferred=deferred)
     emit(event="done")
 
 

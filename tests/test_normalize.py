@@ -1,5 +1,6 @@
 from calibre_dedup.normalize import (
-    authors_key, is_unknown, normalize_isbn, parse_edition_number, same_publisher, title_key,
+    authors_key, is_unknown, normalize_isbn, parse_edition_number, same_publisher,
+    similar_author_key, similar_authors_keys, title_key,
 )
 
 
@@ -8,6 +9,13 @@ def test_title_key_ignores_case_punctuation_articles_and_edition():
     assert title_key("Dune!") == title_key("dune")
     assert title_key("Clean Code: A Handbook") != title_key("Clean Code")
     assert title_key("Clean Code: A Handbook", ignore_subtitle=True) == title_key("Clean Code")
+
+
+def test_title_key_ignores_a_bracket_left_open_by_a_cut_title():
+    assert title_key("Piccole donne crescono (Italia") == title_key("Piccole donne crescono (Italian Edition)")
+    assert title_key("Piccole donne crescono [ediz") == title_key("Piccole donne crescono")
+    assert title_key("Dune (Book 1) (Ace") == title_key("Dune (Book 1)")  # closed brackets are kept
+    assert title_key("(Senza titolo") == title_key("senza titolo")  # never reduced to nothing
 
 
 def test_title_key_accents():
@@ -19,6 +27,14 @@ def test_authors_key_order_and_format_insensitive():
     assert authors_key(["J. R. R. Tolkien"]) == authors_key(["Tolkien, J.R.R."])
     assert authors_key(["A B", "C D"]) == authors_key(["C D", "A B"])
     assert authors_key(["Unknown"]) == frozenset()
+
+
+def test_similar_author_key_ignores_initials_and_suffixes():
+    assert similar_author_key("Stephen E. King") == similar_author_key("King, Stephen")
+    assert similar_author_key("J. R. R. Tolkien") == similar_author_key("Tolkien")
+    assert similar_author_key("Martin Luther King Jr.") == similar_author_key("Martin Luther King")
+    assert similar_author_key("J") == ("j",)  # nothing left: keep the plain key
+    assert similar_authors_keys(["Unknown", "Frank Herbert", "Herbert, F. Frank"]) == [("frank", "herbert")]
 
 
 def test_parse_edition_number():

@@ -26,6 +26,7 @@ class SettingsDialog(QDialog):
         self.keys = {p.name: get_secret(p.name) for p in self.profiles}
         self._current: ProviderProfile | None = None
         self._loading = False
+        self.renamed: dict[str, str] = {}  # old profile name -> new name
 
         tabs = QTabWidget()
         tabs.addTab(self._build_providers_tab(), "AI providers")
@@ -85,7 +86,7 @@ class SettingsDialog(QDialog):
         self.f_ctx = QSpinBox()
         self.f_ctx.setRange(2048, 1_048_576)
         self.f_ctx.setSingleStep(2048)
-        self.f_vision = QCheckBox("Model accepts images (for scanned PDFs)")
+        self.f_vision = QCheckBox("Supports images (can be the Image AI: covers, scanned PDFs)")
         test = QPushButton("Test connection")
         test.clicked.connect(self._test)
 
@@ -124,8 +125,6 @@ class SettingsDialog(QDialog):
         for p in self.profiles:
             self.list.addItem(p.name)
         self.list.blockSignals(False)
-        if hasattr(self, "a_vision"):
-            self._fill_vision_combo()
 
     def _select_profile(self, row: int):
         self._store_current()
@@ -166,6 +165,7 @@ class SettingsDialog(QDialog):
         p.vision = self.f_vision.isChecked()
         if old_name != p.name:
             self.keys[old_name] = ""  # clears the key stored under the old name
+            self.renamed[old_name] = p.name
         self.keys[p.name] = self.f_key.text()
         row = self.profiles.index(p)
         if self.list.item(row) is not None:
@@ -227,7 +227,12 @@ class SettingsDialog(QDialog):
         set_secret(p.name, self.keys.get(p.name, ""))
         self.setCursor(Qt.WaitCursor)
         try:
-            msg = make_provider(p).test()
+            provider = make_provider(p)
+            msg = provider.test()
+            if p.vision:
+                msg += ("\n\nImages: OK" if provider.test_images() else
+                        "\n\nImages: FAILED. The model did not see the test image; "
+                        "untick 'Supports images' for this profile.")
             QMessageBox.information(self, "Test connection", msg)
         except AIError as e:
             QMessageBox.warning(self, "Test connection", str(e))
@@ -276,9 +281,6 @@ class SettingsDialog(QDialog):
         s = self.settings
         w = QWidget()
         form = QFormLayout(w)
-        self.a_use_ai = QCheckBox("Use AI when metadata is not enough")
-        self.a_use_ai.setChecked(s.use_ai)
-        self.a_vision = QComboBox()
         self.a_pdf_pages = QSpinBox()
         self.a_pdf_pages.setRange(1, 50)
         self.a_pdf_pages.setValue(s.pdf_pages)
@@ -288,6 +290,15 @@ class SettingsDialog(QDialog):
         self.a_chars.setValue(s.text_chars)
         self.a_subtitle = QCheckBox("Ignore subtitles when comparing titles")
         self.a_subtitle.setChecked(s.ignore_subtitle)
+        self.a_similar = QCheckBox("Similar author matching (ignore initials; one shared author is enough)")
+        self.a_similar.setChecked(s.similar_matching)
+        self.a_cover = QCheckBox("Compare covers when metadata can't decide (needs an Image AI)")
+        self.a_cover.setChecked(s.cover_check)
+        self.a_years = QCheckBox("Re-check year differences by reading both books (AI)")
+        self.a_years.setToolTip("Calibre's publication date is often the original publication, not this "
+                                "edition's.\nWhen only the years differ, the AI reads the year printed in "
+                                "both books and that decides.")
+        self.a_years.setChecked(s.recheck_years)
         self.a_update = QCheckBox("Write AI-found title/authors/publisher/ISBN to moved books (only empty fields)")
         self.a_update.setChecked(s.update_metadata)
         self.a_permanent = QCheckBox("Delete permanently from source (else: Calibre's recycle bin)")
@@ -299,29 +310,28 @@ class SettingsDialog(QDialog):
         crow.addWidget(self.a_calibre, 1)
         crow.addWidget(browse)
 
-        form.addRow(self.a_use_ai)
-        form.addRow("Vision profile (scanned PDFs)", self.a_vision)
         form.addRow("PDF pages to read (start/end)", self.a_pdf_pages)
         form.addRow("Characters to read (other formats)", self.a_chars)
         form.addRow(self.a_subtitle)
+        form.addRow(self.a_similar)
+        form.addRow(self.a_cover)
+        form.addRow(self.a_years)
         form.addRow(self.a_update)
         form.addRow(self.a_permanent)
         form.addRow("Calibre program folder", crow)
-        self._fill_vision_combo()
         return w
-
-    def _fill_vision_combo(self):
-        current = self.a_vision.currentData() if self.a_vision.count() else self.settings.vision_profile
-        self.a_vision.clear()
-        self.a_vision.addItem("None (skip scanned PDFs)", "")
-        for p in self.profiles:
-            self.a_vision.addItem(p.name, p.name)
-        self.a_vision.setCurrentIndex(max(0, self.a_vision.findData(current)))
 
     def _browse_calibre(self):
         d = QFileDialog.getExistingDirectory(self, "Calibre program folder", self.a_calibre.text())
         if d:
             self.a_calibre.setText(d)
+
+    def _follow_rename(self, name: str) -> str:
+        seen = set()
+        while name in self.renamed and name not in seen:
+            seen.add(name)
+            name = self.renamed[name]
+        return name
 
     # --- save -----------------------------------------------------------------
     def accept(self):
@@ -332,14 +342,18 @@ class SettingsDialog(QDialog):
             return
         s = self.settings
         s.profiles = self.profiles
-        if s.active_profile not in names:
-            s.active_profile = names[0] if names else ""
-        s.use_ai = self.a_use_ai.isChecked()
-        vision = self.a_vision.currentData()
-        s.vision_profile = vision if vision in names else ""
+        s.text_profile = self._follow_rename(s.text_profile)
+        if s.text_profile and s.text_profile not in names:
+            s.text_profile = names[0] if names else ""
+        s.image_profile = self._follow_rename(s.image_profile)
+        if s.image_profile not in names:
+            s.image_profile = ""
         s.pdf_pages = self.a_pdf_pages.value()
         s.text_chars = self.a_chars.value()
         s.ignore_subtitle = self.a_subtitle.isChecked()
+        s.similar_matching = self.a_similar.isChecked()
+        s.cover_check = self.a_cover.isChecked()
+        s.recheck_years = self.a_years.isChecked()
         s.update_metadata = self.a_update.isChecked()
         s.delete_permanently = self.a_permanent.isChecked()
         s.calibre_dir = self.a_calibre.text().strip()
