@@ -307,15 +307,20 @@ class PlanFilter(QSortFilterProxyModel):
             return False
         if self.failed_only and not it.status.startswith("FAILED"):
             return False
-        # Same library: books with no duplicate are usually most of the list. Books
-        # whose title/authors couldn't be read stay visible: they need attention.
-        if (self.hide_unique and model.plan is not None and model.plan.same_library
-                and it.action is Action.LEAVE and it.match is None and it.identity.has_title_authors):
+        # Same library: books with no duplicate are usually most of the list.
+        if self.hide_unique and model.plan is not None and model.plan.same_library and has_no_duplicate(it):
             return False
         if self.terms:
             hay = strip_accents(" ".join(str(x) for x in model.values(it)[1:7])).casefold()
             return all(t in hay for t in self.terms)
         return True
+
+
+def has_no_duplicate(it: PlanItem) -> bool:
+    """Left in place because no other book shares its title and authors, or every
+    one that does is a different edition. The other Leave books need a look:
+    undecided pairs, and books whose title/authors couldn't be read."""
+    return it.action is Action.LEAVE and it.match is None and it.identity.has_title_authors
 
 
 class PlanTable(QTableView):
@@ -765,7 +770,11 @@ class MainWindow(QMainWindow):
         total = move + trash + leave
         head = (f"Analysis stopped after {total} of {self.plan.total_books} books"
                 if self.plan.stopped else "Analysis complete")
-        text = f"{head}: {move} move, {trash} trash, {leave} leave (total {total})"
+        text = f"{head}: {move} move, {trash} trash, {leave} leave"
+        if leave:
+            unique = sum(1 for it in self.plan.items if has_no_duplicate(it))
+            text += f" ({leave - unique} to review, {unique} with no duplicate)"
+        text += f" · total {total}"
         hidden = total - self.proxy.rowCount()
         if hidden:
             text += f" · {hidden} hidden by filters"
