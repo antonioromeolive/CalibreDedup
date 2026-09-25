@@ -65,6 +65,9 @@ class ProviderProfile:
     timeout: int = 300
     num_ctx: int = 16384  # Ollama context window
     vision: bool = False  # model reads images as well as text (covers, scanned PDFs)
+    # Advanced: [name, value] pairs added to every request, e.g. ["think", "false"] for
+    # Ollama. Values are JSON when they parse as JSON, else text. See ai.extra_params().
+    extra_params: list[list[str]] = field(default_factory=list)
 
     @property
     def api_key(self) -> str:

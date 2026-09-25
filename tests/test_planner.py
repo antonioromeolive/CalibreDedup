@@ -318,8 +318,8 @@ def test_image_probe():
             return self.reply
 
     seeing = Fake('{"colour": "Red"}')
-    assert seeing.test_images() and len(seeing.images) == 1
-    assert not Fake('{"colour": "unknown"}').test_images()
+    assert seeing.test_images() == (True, '{"colour": "Red"}') and len(seeing.images) == 1
+    assert Fake('{"colour": "unknown"}').test_images() == (False, '{"colour": "unknown"}')
 
 
 class LibraryResolver(FakeResolver):
@@ -474,8 +474,8 @@ def test_library_vanishing_between_books_stops_the_analysis(libs, monkeypatch):
                            target=[])
     clock = itertools.count(0, 2)  # every check is "a second later"
     monkeypatch.setattr("calibre_dedup.planner.time.monotonic", lambda: next(clock))
-    answers = iter(["", "F:\lib"])  # reachable after the first book, gone after the second
+    answers = iter(["", r"F:\lib"])  # reachable after the first book, gone after the second
     monkeypatch.setattr("calibre_dedup.planner._unreachable", lambda paths: next(answers))
     plan = build_plan(src, tgt, trash)
     assert actions(plan) == [("Dune", Action.MOVE)]  # the second book's decision is dropped
-    assert plan.stopped and plan.stop_reason == "library not reachable: F:\lib"
+    assert plan.stopped and plan.stop_reason == r"library not reachable: F:\lib"

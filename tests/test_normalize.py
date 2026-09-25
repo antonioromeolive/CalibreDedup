@@ -68,3 +68,29 @@ def test_is_unknown():
     assert is_unknown("Sconosciuto")
     assert is_unknown("  ")
     assert not is_unknown("Dune")
+
+
+def test_title_key_ignores_a_series_or_imprint_in_closing_brackets():
+    assert title_key("Rookwood (Everyman)") == title_key("Rookwood")
+    assert title_key("Polyeucte (VINTAGE) (Italian Ed") == title_key("Polyeucte")
+    assert title_key("Fratelli d'Italia (Gli Adelphi) [Oscar]") == title_key("Fratelli d'Italia")
+    assert title_key("Rookwood (Everyman) (2nd Edition)") == title_key("Rookwood")
+    # only at the end: brackets inside the title stay
+    assert title_key("Il (quasi) perfetto delitto") != title_key("Il perfetto delitto")
+
+
+def test_title_key_keeps_brackets_that_tell_volumes_apart():
+    assert title_key("Dune (Book 1)") != title_key("Dune (Book 2)")
+    assert title_key("Il trono di spade (Vol. 3)") != title_key("Il trono di spade")
+    assert title_key("Guerra e pace (Parte prima)") != title_key("Guerra e pace (Parte seconda)")
+    assert title_key("Memorie (II)") != title_key("Memorie (III)")
+    assert title_key("Serie (#4)") != title_key("Serie")
+    assert title_key("Saga (Collana Oro) (Libro 2)") != title_key("Saga (Libro 3)")
+    assert title_key("(Senza titolo)") == "senza titolo"  # never reduced to nothing
+
+
+def test_title_key_keeps_brackets_that_change_content_or_language():
+    assert title_key("Isabel Leicester (Serie Completa)") != title_key("Isabel Leicester")
+    assert title_key("Racconti (Antologia)") != title_key("Racconti")
+    assert title_key("Utilitarianism (Em Portuguese Do Brasil)") != title_key("Utilitarianism")
+    assert title_key("I promessi sposi (versione ridotta)") != title_key("I promessi sposi")

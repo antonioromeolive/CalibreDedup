@@ -1,26 +1,54 @@
 from __future__ import annotations
 
 import copy
+import html
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
-    QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMessageBox,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ..ai import AIError, make_provider
+from ..ai import GOOD, INFO, NOTE, PROBLEM, AIError, connection_test, extra_params, make_provider
 from ..calibre_env import find_calibre_dir
 from ..config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, Settings, get_secret, set_secret
+from .style import GREEN, button_css, set_running
 
 KINDS = [(OLLAMA, "Ollama"), (AZURE, "Azure OpenAI"), (OPENAI, "OpenAI"), (ANTHROPIC, "Anthropic")]
+ADVANCED_HINTS = {
+    OLLAMA: "e.g. think = false (no thinking: much faster). Unknown names are ignored: check with Test connection.",
+    AZURE: "e.g. reasoning_effort = none or low (reasoning models only). Check with Test connection.",
+    OPENAI: "e.g. reasoning_effort = none or low (reasoning models only). Check with Test connection.",
+    ANTHROPIC: "Usually none needed: thinking is off unless requested.",
+}
+REPORT_COLORS = {GOOD: "#2e7d32", PROBLEM: "#c62828", NOTE: "#e65100"}  # green, red, orange
+
+
+def _report_html(lines: list[tuple[str, str]]) -> str:
+    """The connection test report, each line coloured by its level."""
+    out = []
+    for level, text in lines:
+        text = html.escape(text)
+        color = REPORT_COLORS.get(level)
+        out.append(f"<span style='color:{color}'>{text}</span>" if color and text else text)
+    return "<br>".join(out)
+
+
+ADVANCED_RULES = (
+    "Only parameters your model accepts. Names are sent as written.\n"
+    "A value is JSON when it parses as JSON (false, 1024, \"text\", {...}), else text (none, low).\n"
+    "A dot puts a parameter inside an object: options.num_predict.\n"
+    "Not accepted: fields of this form (model, temperature, context size)\n"
+    "and fields the app sets itself (messages, stream, format, response_format…)."
+)
 
 
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(760, 480)
+        self.resize(820, 640)
         self.settings = settings
         self.profiles = copy.deepcopy(settings.profiles)
         self.keys = {p.name: get_secret(p.name) for p in self.profiles}
@@ -40,7 +68,9 @@ class SettingsDialog(QDialog):
 
         self._refresh_list()
         if self.profiles:
-            self.list.setCurrentRow(0)
+            # Open on the Text AI chosen in the main window (the first profile if AI is off).
+            names = [p.name for p in self.profiles]
+            self.list.setCurrentRow(names.index(settings.text_profile) if settings.text_profile in names else 0)
 
     # --- providers tab --------------------------------------------------------
     def _build_providers_tab(self) -> QWidget:
@@ -87,8 +117,36 @@ class SettingsDialog(QDialog):
         self.f_ctx.setRange(2048, 1_048_576)
         self.f_ctx.setSingleStep(2048)
         self.f_vision = QCheckBox("Supports images (can be the Image AI: covers, scanned PDFs)")
-        test = QPushButton("Test connection")
+        self.test_btn = test = QPushButton("Test connection")
+        test.setStyleSheet(button_css(*GREEN))
+        test.setToolTip("Sends one real metadata request with all the settings of this profile,\n"
+                        "advanced parameters included, on a made-up copyright page, and reports\n"
+                        "refused parameters, empty or cut-off replies, slow answers and misread values.\n"
+                        "With 'Supports images', also checks that the model sees a test image.")
         test.clicked.connect(self._test)
+
+        self.f_params = QTableWidget(0, 2)
+        self.f_params.setHorizontalHeaderLabels(["Parameter name", "Value"])
+        self.f_params.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.f_params.verticalHeader().setVisible(False)
+        self.f_params.setMinimumHeight(90)
+        self.f_params.setToolTip(ADVANCED_RULES)
+        p_add, p_rem = QPushButton("Add parameter"), QPushButton("Remove parameter")
+        p_add.clicked.connect(self._add_param)
+        p_rem.clicked.connect(self._remove_param)
+        p_buttons = QHBoxLayout()
+        p_buttons.addWidget(p_add)
+        p_buttons.addWidget(p_rem)
+        p_buttons.addStretch(1)
+        self.params_hint = QLabel()
+        self.params_hint.setWordWrap(True)
+        self.params_hint.setStyleSheet("color: gray")
+        self.params_hint.setToolTip(ADVANCED_RULES)
+        advanced = QGroupBox("Advanced parameters (added to every request; hover for the rules)")
+        a_layout = QVBoxLayout(advanced)
+        a_layout.addWidget(self.f_params)
+        a_layout.addLayout(p_buttons)
+        a_layout.addWidget(self.params_hint)
 
         self.form = QFormLayout()
         self.form.addRow("Name", self.f_name)
@@ -103,7 +161,8 @@ class SettingsDialog(QDialog):
         self.form.addRow("Timeout", self.f_timeout)
         self.form.addRow("Context size", self.f_ctx)
         self.form.addRow("", self.f_vision)
-        self.form.addRow("", test)
+        self.form.addRow(advanced)
+        self.form.addRow(test)  # full width
         self.hint = QLabel()
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: gray")
@@ -146,6 +205,9 @@ class SettingsDialog(QDialog):
         self.f_timeout.setValue(p.timeout)
         self.f_ctx.setValue(p.num_ctx)
         self.f_vision.setChecked(p.vision)
+        self.f_params.setRowCount(0)
+        for name, value in ((list(pair) + ["", ""])[:2] for pair in p.extra_params):
+            self._add_param(name, value)
         self._loading = False
         self._kind_changed()
 
@@ -163,6 +225,12 @@ class SettingsDialog(QDialog):
         p.timeout = self.f_timeout.value()
         p.num_ctx = self.f_ctx.value()
         p.vision = self.f_vision.isChecked()
+        p.extra_params = []
+        for row in range(self.f_params.rowCount()):
+            name, value = (self.f_params.item(row, col).text().strip() if self.f_params.item(row, col) else ""
+                           for col in (0, 1))
+            if name or value:
+                p.extra_params.append([name, value])
         if old_name != p.name:
             self.keys[old_name] = ""  # clears the key stored under the old name
             self.renamed[old_name] = p.name
@@ -191,6 +259,7 @@ class SettingsDialog(QDialog):
                 self.f_url.setText("https://api.openai.com")
             elif self.f_kind.currentData() == ANTHROPIC:
                 self.f_url.setText("https://api.anthropic.com")
+        self.params_hint.setText(ADVANCED_HINTS.get(self.f_kind.currentData(), ""))
         self.hint.setText(
             "Azure: enter the resource endpoint and the deployment name. API version is e.g. "
             "2024-10-21, or 'v1' for the new v1 API (the deployment field then holds the model). "
@@ -226,18 +295,56 @@ class SettingsDialog(QDialog):
             return
         set_secret(p.name, self.keys.get(p.name, ""))
         self.setCursor(Qt.WaitCursor)
+        self.test_btn.setText("Testing…")
+        self.test_btn.setEnabled(False)
+        set_running(self.test_btn, True)
+        QApplication.processEvents()  # show it before the (blocking) request starts
+        ok, report = False, []
         try:
             provider = make_provider(p)
-            msg = provider.test()
-            if p.vision:
-                msg += ("\n\nImages: OK" if provider.test_images() else
-                        "\n\nImages: FAILED. The model did not see the test image; "
-                        "untick 'Supports images' for this profile.")
-            QMessageBox.information(self, "Test connection", msg)
-        except AIError as e:
-            QMessageBox.warning(self, "Test connection", str(e))
+            ok, report = connection_test(provider)
+            if ok and p.vision:
+                report.append((INFO, ""))
+                try:
+                    seen, reply = provider.test_images()
+                except Exception as e:  # keep the text report, show the actual error
+                    seen, reply = False, ""
+                    report.append((PROBLEM, f"✗ Images: FAILED: {e}"))
+                if seen:
+                    report.append((GOOD, "✓ Images: the model sees them."))
+                elif reply or not report[-1][1].startswith("✗ Images"):
+                    report += [(PROBLEM, "✗ Images: the model did not see the test image (a red square); "
+                                         "untick 'Supports images' for this profile."),
+                               (INFO, f"The model replied: {reply[:500] or '(nothing)'}")]
+                ok = ok and seen
+        except Exception as e:  # e.g. an unknown provider type: still show the actual error
+            ok = False
+            report.append((PROBLEM, f"FAILED: {e}" if isinstance(e, AIError)
+                           else f"FAILED (unexpected {type(e).__name__}): {e}"))
         finally:
             self.unsetCursor()
+            self.test_btn.setText("Test connection")
+            self.test_btn.setEnabled(True)
+            set_running(self.test_btn, False)
+        box = QMessageBox(QMessageBox.Information if ok else QMessageBox.Warning,
+                          f"Test connection: {p.name}", _report_html(report), parent=self)
+        box.setTextFormat(Qt.RichText)
+        box.exec()
+        box.deleteLater()  # don't leave closed windows alive (see MainWindow._open_settings)
+
+    def _add_param(self, name: str = "", value: str = ""):
+        row = self.f_params.rowCount()
+        self.f_params.insertRow(row)
+        self.f_params.setItem(row, 0, QTableWidgetItem(name if isinstance(name, str) else ""))
+        self.f_params.setItem(row, 1, QTableWidgetItem(value))
+        if not self._loading:
+            self.f_params.setCurrentCell(row, 0)
+            self.f_params.editItem(self.f_params.item(row, 0))
+
+    def _remove_param(self):
+        rows = sorted({i.row() for i in self.f_params.selectedIndexes()}, reverse=True)
+        for row in rows or ([self.f_params.currentRow()] if self.f_params.currentRow() >= 0 else []):
+            self.f_params.removeRow(row)
 
     def _add_profile(self):
         self._store_current()
@@ -340,6 +447,13 @@ class SettingsDialog(QDialog):
         if len(set(names)) != len(names):
             QMessageBox.warning(self, "Settings", "Profile names must be unique.")
             return
+        for row, p in enumerate(self.profiles):
+            _, problems = extra_params(p)
+            if problems:
+                self.list.setCurrentRow(row)
+                QMessageBox.warning(self, "Settings", f"Advanced parameters of {p.name!r}:\n\n"
+                                    + "\n".join(f"• {x}" for x in problems))
+                return
         s = self.settings
         s.profiles = self.profiles
         s.text_profile = self._follow_rename(s.text_profile)
