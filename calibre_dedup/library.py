@@ -48,10 +48,15 @@ def read_books(library: str | Path) -> list[Book]:
         ))
 
         isbns: dict[int, set[str]] = defaultdict(set)
-        for book, val in conn.execute("SELECT book, val FROM identifiers WHERE type = 'isbn'"):
-            isbn = normalize_isbn(val)
-            if isbn:
-                isbns[book].add(isbn)
+        asins: dict[int, set[str]] = defaultdict(set)
+        for book, kind, val in conn.execute("SELECT book, type, val FROM identifiers"):
+            kind = (kind or "").lower()
+            if kind == "isbn":
+                isbn = normalize_isbn(val)
+                if isbn:
+                    isbns[book].add(isbn)
+            elif (kind == "mobi-asin" or kind.startswith("amazon")) and val and val.strip():
+                asins[book].add(val.strip().upper())
 
         columns = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
         optional = []
@@ -87,6 +92,7 @@ def read_books(library: str | Path) -> list[Book]:
             publisher=None if is_unknown(publisher) else publisher,
             pub_year=_year(pubdate),
             isbns=isbns.get(bid, set()),
+            asins=asins.get(bid, set()),
             formats=formats.get(bid, {}),
             has_cover=bool(metadata.get("has_cover", 0)),
             comments=metadata.get("comments") or None,

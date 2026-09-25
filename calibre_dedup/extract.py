@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import posixpath
 import re
@@ -30,6 +31,7 @@ log = logging.getLogger(__name__)
 # Preferred formats for extraction, best first.
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
 MIN_TEXT = 200  # below this a PDF is considered scanned (image only)
+MIN_EPUB_TEXT = 2000  # below this an EPUB is taken as images only (no text fingerprint)
 
 
 @dataclass
@@ -207,3 +209,53 @@ def _epub_text(path: str, part: str, chars: int) -> str:
     if part == "end":
         collected.reverse()
     return _slice("\n\n".join(collected), part, chars)
+
+
+def epub_text_digest(path: str) -> str | None:
+    """SHA-1 of an EPUB's (X)HTML documents, by name: the same for copies of one
+    file whose metadata or cover alone were changed. None if unreadable, or if
+    the book is mostly images (comics, scans): their pages are just <img> tags,
+    which can be identical in two different volumes."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = sorted(n for n in z.namelist() if n.lower().endswith((".html", ".xhtml", ".htm")))
+            h = hashlib.sha1()
+            text_chars = 0
+            for name in names:
+                data = z.read(name)
+                h.update(name.encode() + b"\0" + data + b"\0")
+                text_chars += _visible_chars(data)
+    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError) as e:
+        log.debug("Cannot hash %s: %s", path, e)
+        return None
+    if text_chars < MIN_EPUB_TEXT:
+        log.debug("Not hashing %s: only %d characters of text", path, text_chars)
+        return None
+    return h.hexdigest()
+
+
+_NOT_TEXT = re.compile(rb"<(head|style|script)\b.*?</\1\s*>|<[^>]*>|&[#\w]+;|\s+", re.S | re.I)
+
+
+def _visible_chars(markup: bytes) -> int:
+    """Rough count of readable characters (bytes) in an HTML document: fast, and
+    exact enough to tell a text page from an image page."""
+    return len(_NOT_TEXT.sub(b"", markup))
+
+
+def cover_png(path: str | Path, max_side: int = 512) -> str | None:
+    """Return a cover image as a base64 PNG no larger than `max_side`, or None if unreadable."""
+    # Imported here so the extractor stays usable without Qt.
+    from PySide6.QtCore import QBuffer, QIODevice, Qt
+    from PySide6.QtGui import QImage
+
+    image = QImage(str(path))
+    if image.isNull():
+        return None
+    if max(image.width(), image.height()) > max_side:
+        image = image.scaled(max_side, max_side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    if not image.save(buf, "PNG"):
+        return None
+    return base64.b64encode(bytes(buf.data())).decode()

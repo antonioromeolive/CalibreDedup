@@ -64,7 +64,7 @@ class ProviderProfile:
     temperature: float | None = 0.0  # None = don't send (needed for some reasoning models)
     timeout: int = 300
     num_ctx: int = 16384  # Ollama context window
-    vision: bool = False  # model accepts images (used for scanned PDFs)
+    vision: bool = False  # model reads images as well as text (covers, scanned PDFs)
 
     @property
     def api_key(self) -> str:
@@ -80,22 +80,36 @@ class Settings:
     profiles: list[ProviderProfile] = field(default_factory=lambda: [
         ProviderProfile(name="Ollama (local)", kind=OLLAMA, model="llama3.1:8b"),
     ])
-    active_profile: str = "Ollama (local)"
-    use_ai: bool = True
-    vision_profile: str = ""  # profile used for scanned PDFs; "" disables
+    text_profile: str = "Ollama (local)"  # reads book text for missing metadata; "" = AI off
+    image_profile: str = ""  # reads text and images (covers, scanned PDFs); "" = none
     pdf_pages: int = 6  # pages read from the start/end of a PDF
     text_chars: int = 12000  # characters read from the start/end of other formats
     ignore_subtitle: bool = False
+    similar_matching: bool = True  # authors match loosely and one shared author is enough
+    cover_check: bool = True  # the image AI compares covers when metadata can't decide
+    recheck_years: bool = True  # AI reads both books when only the metadata years differ
     update_metadata: bool = True  # write AI-found title/authors/publisher to moved books
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""
     source_library: str = ""
     target_library: str = ""
     trash_library: str = ""
+    window_geometry: str = ""  # main window size/position (Qt saveGeometry, base64)
 
     def profile(self, name: str | None = None) -> ProviderProfile | None:
-        name = self.active_profile if name is None else name
+        name = self.text_profile if name is None else name
         return next((p for p in self.profiles if p.name == name), None)
+
+    @property
+    def use_ai(self) -> bool:
+        return bool(self.text_profile)
+
+    def image_ai(self) -> ProviderProfile | None:
+        """The profile for images: only with AI on, and only if it supports images."""
+        if not self.text_profile or not self.image_profile:
+            return None
+        p = self.profile(self.image_profile)
+        return p if p is not None and p.vision else None
 
     # --- persistence -------------------------------------------------------
     @classmethod
@@ -115,6 +129,9 @@ class Settings:
             settings.profiles = [
                 ProviderProfile(**{k: v for k, v in p.items() if k in pknown}) for p in data["profiles"]
             ]
+        if "text_profile" not in data:  # settings saved before text/image profiles
+            settings.text_profile = data.get("active_profile", settings.text_profile) if data.get("use_ai", True) else ""
+            settings.image_profile = data.get("vision_profile", "")
         return settings
 
     def save(self, path: Path | None = None) -> None:

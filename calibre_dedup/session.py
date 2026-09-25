@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from .ai import AICache, make_provider
 from .calibre_env import find_calibre_dir
-from .config import Settings
+from .config import ProviderProfile, Settings
 from .extract import TextExtractor
 from .planner import AIResolver
+
+log = logging.getLogger(__name__)
 
 
 def require_calibre_dir(settings: Settings) -> Path:
@@ -18,19 +21,32 @@ def require_calibre_dir(settings: Settings) -> Path:
     return d
 
 
+def _describe(p: ProviderProfile) -> str:
+    return f"{p.name} ({p.model or 'no model'})"
+
+
 def make_resolver(settings: Settings) -> AIResolver | None:
-    """Return an AI resolver, or None if AI is disabled. Caller must close() its extractor."""
+    """Return an AI resolver, or None if AI is off. Caller must close() its extractor."""
     if not settings.use_ai:
+        log.info("AI: off (metadata only)")
         return None
     profile = settings.profile()
     if profile is None:
-        raise RuntimeError(f"AI profile {settings.active_profile!r} not found. Configure it in Settings.")
-    vision_profile = settings.profile(settings.vision_profile) if settings.vision_profile else None
+        raise RuntimeError(f"Text AI profile {settings.text_profile!r} not found. Configure it in Settings.")
+    image = settings.image_ai()
+    if settings.image_profile and image is None:
+        log.warning("Image AI %r ignored: profile not found or not marked 'Supports images'",
+                    settings.image_profile)
+    if image is None:
+        log.info("AI: text = %s · images = none (cover check and scanned PDFs skipped)", _describe(profile))
+    else:
+        log.info("AI: text = %s · images = %s · cover check %s", _describe(profile), _describe(image),
+                 "on" if settings.cover_check else "off")
     extractor = TextExtractor(
         require_calibre_dir(settings), settings.pdf_pages, settings.text_chars,
-        render_images=vision_profile is not None,
+        render_images=image is not None,
     )
     return AIResolver(
         make_provider(profile), extractor, AICache(),
-        make_provider(vision_profile) if vision_profile else None,
+        make_provider(image) if image else None,
     )
