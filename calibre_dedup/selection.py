@@ -43,23 +43,27 @@ def action_label(item: PlanItem) -> str:
 def can_override(item: PlanItem, action: Action, same_library: bool = False) -> bool:
     if action is Action.MOVE:
         return not same_library  # a book can't be moved into the library it is in
-    # Trashing needs a target copy to be a duplicate of.
-    return action is not Action.TRASH or item.match is not None
+    # Trash is always possible: without a match the book just leaves the source
+    # for the trash library (no target copy is checked or merged into).
+    return True
 
 
-def override(item: PlanItem, action: Action, same_library: bool = False) -> None:
-    if action is item.planned_action:
+def override(item: PlanItem, action: Action, same_library: bool = False, merge: bool = True) -> None:
+    """`merge` (Trash only): add the book's extra formats to its match first. False:
+    trash it as it is ("Trash only"), whatever formats the match lacks."""
+    merge = merge and action is Action.TRASH and bool(mergeable_formats(item))
+    if action is item.planned_action and (action is not Action.TRASH or merge == bool(item.planned_add_formats)):
         revert(item)
         return
     if not can_override(item, action, same_library):
         if action is Action.MOVE:
             raise ValueError(f"#{item.source.id} is already in the target library")
-        raise ValueError(f"#{item.source.id} has no matching target book to be a duplicate of")
     item.action = action
     item.manual = True
-    item.add_formats = mergeable_formats(item) if action is Action.TRASH else []
+    item.add_formats = mergeable_formats(item) if merge else []
     merged = f" {', '.join(item.add_formats)}" if item.add_formats else ""
-    item.reason = (f"manual: {action_label(item).lower()}{merged} "
+    no_copy = ", no copy in the target" if action is Action.TRASH and item.match is None else ""
+    item.reason = (f"manual: {action_label(item).lower()}{merged}{no_copy} "
                    f"(analysis: {item.planned_action.value} — {item.planned_reason})")
     item.selected = action is not Action.LEAVE
 
@@ -137,7 +141,7 @@ class SelectionStore:
                 continue
             if e.get("action"):
                 try:
-                    override(item, Action(e["action"]), plan.same_library)
+                    override(item, Action(e["action"]), plan.same_library, e.get("merge", True))
                 except ValueError:
                     continue
             if "selected" in e and item.action is not Action.LEAVE:
@@ -152,6 +156,8 @@ class SelectionStore:
             e = {}
             if item.manual:
                 e["action"] = item.action.value
+                if item.action is Action.TRASH and not item.add_formats:
+                    e["merge"] = False
             if item.action is not Action.LEAVE and not item.selected:
                 e["selected"] = False
             if e and item.source.uuid:

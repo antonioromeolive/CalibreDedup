@@ -28,6 +28,8 @@ from .calibre_env import CREATE_NO_WINDOW, tool
 
 log = logging.getLogger(__name__)
 
+# Formats whose own cover can be read, best first.
+EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
 # Preferred formats for extraction, best first.
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
 MIN_TEXT = 200  # below this a PDF is considered scanned (image only)
@@ -50,6 +52,7 @@ class TextExtractor:
         self.render_images = render_images
         self._converted: dict[str, str] = {}  # path -> full text (ebook-convert cache)
         self._conversion_failed: set[str] = set()
+        self._covers: dict[str, bytes | None] = {}  # path -> cover inside the file
         self._tmp = tempfile.TemporaryDirectory(prefix="cdr_")
 
     def close(self) -> None:
@@ -84,6 +87,35 @@ class TextExtractor:
         except Exception as e:  # corrupt, DRM, unsupported...
             log.warning("Cannot extract text from %s: %s", path, e)
             return Excerpt(source=f"{fmt} extraction failed: {e}")
+
+    def embedded_cover(self, formats: dict[str, str]) -> tuple[str, bytes] | None:
+        """The cover image stored inside the book's file (not Calibre's cover.jpg,
+        which "Download metadata" may have replaced): (file path, image bytes).
+        EPUB is read directly; MOBI, AZW3 and FB2 with Calibre's ebook-meta."""
+        for fmt in EMBEDDED_COVER_FORMATS:
+            path = formats.get(fmt)
+            if not path or not Path(path).is_file():
+                continue
+            if path not in self._covers:
+                try:
+                    # ebook-meta also finds covers only shown on a title page (slower: a process)
+                    self._covers[path] = ((fmt in ("EPUB", "KEPUB") and _epub_cover(path))
+                                          or self._ebook_meta_cover(path))
+                except Exception as e:  # corrupt, DRM, unsupported...
+                    log.warning("Cannot read the cover inside %s: %s", path, e)
+                    self._covers[path] = None
+            if self._covers[path]:
+                return path, self._covers[path]
+        return None
+
+    def _ebook_meta_cover(self, path: str) -> bytes | None:
+        out = Path(self._tmp.name) / f"cover{len(self._covers)}.img"
+        self._run("ebook-meta", [path, f"--get-cover={out}"])
+        if not out.is_file():
+            return None
+        data = out.read_bytes()
+        out.unlink(missing_ok=True)
+        return data or None
 
     # --- PDF -------------------------------------------------------------------
     def _pdf_pages(self, path: str) -> int:
@@ -211,6 +243,30 @@ def _epub_text(path: str, part: str, chars: int) -> str:
     return _slice("\n\n".join(collected), part, chars)
 
 
+def _epub_cover(path: str) -> bytes | None:
+    """The cover image named in an EPUB's package: EPUB 3 "cover-image", else
+    EPUB 2 <meta name="cover">, else an image whose id or name says "cover"."""
+    with zipfile.ZipFile(path) as z:
+        container = ElementTree.fromstring(z.read("META-INF/container.xml"))
+        opf_path = next(el.get("full-path") for el in container.iter() if el.tag.endswith("rootfile"))
+        opf = ElementTree.fromstring(z.read(opf_path))
+        items = [el for el in opf.iter() if el.tag.endswith("}item")]
+        images = [el for el in items if (el.get("media-type") or "").startswith("image/")]
+        meta_id = next((el.get("content") for el in opf.iter()
+                        if el.tag.endswith("}meta") and el.get("name") == "cover"), None)
+        # (An element without children is false: test each against None.)
+        for found in ((el for el in images if "cover-image" in (el.get("properties") or "").split()),
+                      (el for el in images if el.get("id") == meta_id),
+                      (el for el in images if "cover" in f"{el.get('id')} {el.get('href')}".lower())):
+            cover = next(found, None)
+            if cover is not None:
+                break
+        else:
+            return None
+        name = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path), unquote(cover.get("href", ""))))
+        return z.read(name) if name in z.namelist() else None
+
+
 def epub_text_digest(path: str) -> str | None:
     """SHA-1 of an EPUB's (X)HTML documents, by name: the same for copies of one
     file whose metadata or cover alone were changed. None if unreadable, or if
@@ -243,13 +299,14 @@ def _visible_chars(markup: bytes) -> int:
     return len(_NOT_TEXT.sub(b"", markup))
 
 
-def cover_png(path: str | Path, max_side: int = 512) -> str | None:
-    """Return a cover image as a base64 PNG no larger than `max_side`, or None if unreadable."""
+def cover_png(path: str | Path | bytes, max_side: int = 512) -> str | None:
+    """Return a cover image (a file, or the image's bytes) as a base64 PNG no
+    larger than `max_side`, or None if unreadable."""
     # Imported here so the extractor stays usable without Qt.
     from PySide6.QtCore import QBuffer, QIODevice, Qt
     from PySide6.QtGui import QImage
 
-    image = QImage(str(path))
+    image = QImage.fromData(path) if isinstance(path, bytes) else QImage(str(path))
     if image.isNull():
         return None
     if max(image.width(), image.height()) > max_side:

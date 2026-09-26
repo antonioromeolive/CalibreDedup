@@ -46,6 +46,16 @@ def read_books(library: str | Path) -> list[Book]:
         publishers = dict(conn.execute(
             "SELECT l.book, p.name FROM books_publishers_link l JOIN publishers p ON p.id = l.publisher"
         ))
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        series = dict(conn.execute(
+            "SELECT l.book, s.name FROM books_series_link l JOIN series s ON s.id = l.series"
+        )) if {"books_series_link", "series"} <= tables else {}
+        tags: dict[int, set[str]] = defaultdict(set)
+        if {"books_tags_link", "tags"} <= tables:
+            for book, name in conn.execute(
+                "SELECT l.book, t.name FROM books_tags_link l JOIN tags t ON t.id = l.tag"
+            ):
+                tags[book].add(name)
 
         isbns: dict[int, set[str]] = defaultdict(set)
         asins: dict[int, set[str]] = defaultdict(set)
@@ -64,6 +74,8 @@ def read_books(library: str | Path) -> list[Book]:
             optional.append("has_cover")
         if "comments" in columns:
             optional.append("comments")
+        if "series_index" in columns:
+            optional.append("series_index")
         rows = conn.execute(
             "SELECT id, title, pubdate, path, uuid" +
             (", " + ", ".join(optional) if optional else "") +
@@ -93,6 +105,9 @@ def read_books(library: str | Path) -> list[Book]:
             pub_year=_year(pubdate),
             isbns=isbns.get(bid, set()),
             asins=asins.get(bid, set()),
+            series=series.get(bid) or None,
+            series_index=metadata.get("series_index") if series.get(bid) else None,
+            tags=tags.get(bid, set()),
             formats=formats.get(bid, {}),
             has_cover=bool(metadata.get("has_cover", 0)),
             comments=metadata.get("comments") or None,

@@ -3,7 +3,7 @@ import pytest
 from calibre_dedup.ai import AICache
 from calibre_dedup.executor import _keep_failed_in_source, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
-from calibre_dedup.selection import SelectionStore, actionable, blocked, can_override, override, revert
+from calibre_dedup.selection import SelectionStore, action_label, actionable, blocked, can_override, override, revert
 
 
 def book(bid, formats=("EPUB",)):
@@ -77,15 +77,19 @@ def test_unchecking_a_move_blocks_its_duplicates():
     assert plan_actions(plan, update_metadata=False) == []
 
 
-def test_force_trash_computes_formats_and_needs_a_match():
+def test_force_trash_computes_formats_and_works_without_a_match():
     plan = make_plan()
     item = plan.items[2]
     override(item, Action.TRASH)
     assert item.action is Action.TRASH and item.manual and item.selected
     assert item.add_formats == ["EPUB", "MOBI"]  # PDF never added, target already has PDF
-    assert item.reason.startswith("manual:")
-    with pytest.raises(ValueError):
-        override(plan.items[3], Action.TRASH)
+    assert item.reason.startswith("manual:") and "no copy in the target" not in item.reason
+    lone = plan.items[3]  # no match: it just goes to the trash library
+    assert lone.match is None
+    override(lone, Action.TRASH)
+    assert lone.action is Action.TRASH and lone.add_formats == [] and "no copy in the target" in lone.reason
+    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == lone.source.id)
+    assert action["op"] == "trash" and action["no_target"] and "target_id" not in action
 
 
 def test_force_move_and_revert():
@@ -214,3 +218,33 @@ def test_blocked_reason_for_one_item():
     assert blocked_reason(plan.items[1], by_id) == ""
     plan.items[0].selected = False  # the move its duplicate depends on
     assert blocked_reason(plan.items[1], by_id).startswith("blocked: #1")
+
+
+def test_trash_only_is_possible_even_with_formats_to_merge():
+    plan = make_plan()
+    item = plan.items[2]  # has EPUB and MOBI that its match lacks
+    override(item, Action.TRASH, merge=False)
+    assert item.action is Action.TRASH and item.add_formats == [] and action_label(item) == "Trash only"
+    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == item.source.id)
+    assert action["add_formats"] == [] and action["target_id"] == 100
+    override(item, Action.TRASH)  # and back to Merge & Trash
+    assert item.add_formats == ["EPUB", "MOBI"]
+
+
+def test_a_planned_merge_can_become_trash_only_and_back():
+    target = book(100, ("PDF",))
+    item = PlanItem(book(3, ("EPUB", "PDF")), Action.TRASH, "dup", Identity(), match=target, add_formats=["EPUB"])
+    override(item, Action.TRASH, merge=False)
+    assert item.manual and item.add_formats == []
+    override(item, Action.TRASH, merge=True)  # the analysis' own decision again
+    assert not item.manual and item.add_formats == ["EPUB"]
+
+
+def test_trash_only_is_remembered(tmp_path):
+    store = SelectionStore(tmp_path / "sel.json")
+    plan = make_plan()
+    override(plan.items[2], Action.TRASH, merge=False)
+    store.save(plan)
+    fresh = make_plan()
+    store.apply(fresh)
+    assert fresh.items[2].action is Action.TRASH and fresh.items[2].add_formats == []

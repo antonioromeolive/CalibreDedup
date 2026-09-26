@@ -53,3 +53,51 @@ def test_image_ai_needs_text_ai_and_image_support():
     assert s.image_ai() is None
     s.image_profile, s.text_profile = "G", ""  # AI off means images off too
     assert s.image_ai() is None
+
+
+def test_review_settings_start_as_a_copy_then_are_separate(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    dedup = config.Settings.load()
+    dedup.trash_library, dedup.source_library = "D:/Trash", "D:/Inbox"
+    dedup.save()
+    review = config.load_review_settings()
+    assert (review.trash_library, review.source_library) == ("D:/Trash", "D:/Inbox")
+    review.trash_library = "E:/ReviewTrash"
+    review.save()  # to its own file
+    dedup.source_library = "D:/Other"
+    dedup.save()
+    assert config.Settings.load().trash_library == "D:/Trash"
+    again = config.load_review_settings()  # not copied again
+    assert (again.trash_library, again.source_library) == ("E:/ReviewTrash", "D:/Inbox")
+
+
+def test_review_cache_starts_as_a_copy_then_is_separate(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    from calibre_dedup.review import review_cache
+    shared = AICache()
+    shared.put("old", {"title": "x"})
+    shared.save()
+    cache = review_cache()
+    assert cache.get("old") == {"title": "x"}
+    cache.put("new", {"title": "y"})
+    cache.save()
+    assert AICache().get("new") is None
+    assert review_cache().get("new") == {"title": "y"}
+
+
+def test_clearing_the_review_cache_does_not_bring_back_the_shared_answers(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    from calibre_dedup.review import REVIEW_CACHE_FILE, review_cache
+    shared = AICache()
+    shared.put("old", {"title": "x"})
+    shared.save()
+    review = review_cache()  # first start: a copy
+    review.put("mine", {"title": "y"})
+    review.save()
+    path = config.config_dir() / REVIEW_CACHE_FILE
+    assert AICache.size(path)[0] == 2
+    assert AICache.clear(path) == 2
+    assert review_cache().get("old") is None and AICache.size(path) == (0, 2)  # emptied, not copied again
+    assert AICache().get("old") == {"title": "x"}  # the other program's cache is untouched
