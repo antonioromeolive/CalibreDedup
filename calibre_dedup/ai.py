@@ -25,9 +25,31 @@ log = logging.getLogger(__name__)
 
 
 class AIError(Exception):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, filtered: bool = False):
         super().__init__(message)
         self.status = status  # HTTP status when the server answered with an error, else None
+        # The provider's content filter refused this request (e.g. a violent novel's
+        # pages): about this book, not a sign that the AI is down.
+        self.filtered = filtered
+
+
+def _filter_error(provider: str, r: requests.Response) -> AIError | None:
+    """The error for a request refused by the content filter (Azure: 400 with code
+    content_filter), naming the categories that triggered it; None for other errors."""
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return None
+    inner = err.get("innererror") if isinstance(err.get("innererror"), dict) else {}
+    if err.get("code") != "content_filter" and inner.get("code") != "ResponsibleAIPolicyViolation":
+        return None
+    results = inner.get("content_filter_result") or {}
+    hits = [name for name, v in results.items() if isinstance(v, dict) and (v.get("filtered") or v.get("detected"))]
+    return AIError(f"{provider} content filter refused the request"
+                   + (f" ({', '.join(hits)})" if hits else ""), status=r.status_code, filtered=True)
 
 
 def _solid_png_b64(width: int, height: int, rgb: tuple[int, int, int]) -> str:
@@ -145,6 +167,8 @@ class Provider:
         usage = data.get("usage") or {}
         self.last_info = {"finish": choice.get("finish_reason"), "output_tokens": usage.get("completion_tokens"),
                           "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")}
+        if choice.get("finish_reason") == "content_filter":  # the reply was filtered: not "nothing found"
+            raise AIError(f"{self.profile.kind} content filter withheld the reply", filtered=True)
         return choice.get("message", {}).get("content") or ""
 
     def list_models(self) -> list[str]:
@@ -200,6 +224,19 @@ class OllamaProvider(Provider):
         return sorted(m["name"] for m in self._json(r).get("models", []))
 
 
+def azure_endpoint(base_url: str, api_version: str) -> tuple[str, bool]:
+    """The resource endpoint, and whether to use the v1 API. The portal shows the
+    endpoint as ".../openai/v1" (or ".../openai/"): that path is dropped here, since
+    the app adds it, and ".../openai/v1" means the v1 API whatever the API version says."""
+    endpoint = base_url.strip().rstrip("/")
+    v1 = api_version.strip().lower() == "v1"
+    m = re.search(r"/openai(/v1)?$", endpoint, re.I)
+    if m:
+        endpoint = endpoint[:m.start()]
+        v1 = v1 or bool(m.group(1))
+    return endpoint, v1
+
+
 class AzureOpenAIProvider(Provider):
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
         p = self.profile
@@ -209,7 +246,7 @@ class AzureOpenAIProvider(Provider):
         key = p.api_key
         if not key:
             raise AIError(f"No API key set for profile {p.name!r}")
-        endpoint = p.base_url.rstrip("/")
+        endpoint, v1 = azure_endpoint(p.base_url, p.api_version)
         content: list | str = user
         if images:
             content = [{"type": "text", "text": user}] + [
@@ -221,7 +258,7 @@ class AzureOpenAIProvider(Provider):
         }
         if p.temperature is not None:
             body["temperature"] = p.temperature
-        if p.api_version.strip().lower() == "v1":
+        if v1:
             url = f"{endpoint}/openai/v1/chat/completions"
             body["model"] = p.model
         else:
@@ -231,7 +268,8 @@ class AzureOpenAIProvider(Provider):
         except requests.RequestException as e:
             raise AIError(f"Azure OpenAI request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"Azure OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code)
+            raise (_filter_error("Azure OpenAI", r)
+                   or AIError(f"Azure OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code))
         return self._log_response(self._openai_content(self._json(r)))
 
 
@@ -262,7 +300,8 @@ class OpenAIProvider(Provider):
         except requests.RequestException as e:
             raise AIError(f"OpenAI request failed: {e}") from e
         if r.status_code != 200:
-            raise AIError(f"OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code)
+            raise (_filter_error("OpenAI", r)
+                   or AIError(f"OpenAI error {r.status_code}: {r.text[:500]}", status=r.status_code))
         return self._log_response(self._openai_content(self._json(r)))
 
 
@@ -302,6 +341,8 @@ class AnthropicProvider(Provider):
         blocks = data.get("content") or []
         self.last_info = {"finish": data.get("stop_reason"),
                           "output_tokens": (data.get("usage") or {}).get("output_tokens")}
+        if data.get("stop_reason") == "refusal":
+            raise AIError("Anthropic refused the request", filtered=True)
         return self._log_response("\n".join(block.get("text", "") for block in blocks if block.get("type") == "text"))
 
 
@@ -403,6 +444,25 @@ class AICache:
             self._data: dict = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self._data = {}
+
+    @staticmethod
+    def size(path: Path) -> tuple[int, int]:
+        """(answers, bytes) in a cache file; (0, 0) if there is none."""
+        try:
+            return len(json.loads(path.read_text(encoding="utf-8"))), path.stat().st_size
+        except (OSError, ValueError, TypeError):
+            return 0, 0
+
+    @staticmethod
+    def clear(path: Path) -> int:
+        """Forget every answer: the file is emptied, not deleted (a missing review
+        cache would be copied again from the shared one). Returns how many were
+        removed. Only while no analysis is running: a running one writes its copy back."""
+        removed = AICache.size(path)[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        log.info("AI cache %s cleared: %d answers removed", path, removed)
+        return removed
 
     @staticmethod
     def key(file_path: str, part: str, model: str | None = None) -> str:
@@ -672,3 +732,108 @@ def compare_covers(provider: Provider, cover_a: str, cover_b: str) -> tuple[str,
     verdict = str(data.get("verdict", "")).strip().lower()
     reason = data.get("reason")
     return (verdict if verdict in COVER_VERDICTS else "unsure"), (reason if isinstance(reason, str) else "")
+
+
+# --- author names --------------------------------------------------------------
+AUTHOR_PROMPT = """You decide whether two author names, taken from e-book metadata, name the same person.
+
+Respond with a single JSON object: {"verdict": "same"|"different"|"unsure", "reason": string}
+
+Rules:
+- "same": the same person written differently: a typo or a missing/extra letter ("Wilson Tucke" / \
+"Wilson Tucker"), another name order ("Asimov Isaac"), initials, accents, a transliteration \
+("Dostoevskij" / "Dostoyevsky"), or a well-known pen name of that person.
+- "different": different people, even if they share a surname or a first name ("James Herbert" / \
+"Frank Herbert").
+- "unsure": you cannot tell.
+A list of names separated by "&" names several authors: "same" if at least one person is on both lists.
+When the title is given, both names are the author of two copies of a book with that title: a name \
+matching the other with initials or a typo is then "same". Judge the names only: do not guess who \
+else a short name might be.
+"""
+
+
+def compare_authors(provider: Provider, names_a: str, names_b: str, title: str | None = None) -> tuple[str, str]:
+    """Ask the text AI whether two author names are the same person; `title`: the
+    title both books have, as context. Returns (verdict, reason)."""
+    user = (f"Name 1: {json.dumps(names_a, ensure_ascii=False)}\n"
+            f"Name 2: {json.dumps(names_b, ensure_ascii=False)}")
+    if title:
+        user += f"\nBoth books are titled: {json.dumps(title, ensure_ascii=False)}"
+    text = provider.chat(AUTHOR_PROMPT, user)
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise AIError(f"AI reply is not JSON: {text[:200]!r}")
+    try:
+        data = json.loads(m.group())
+    except ValueError as e:
+        raise AIError(f"AI reply is not valid JSON: {e}") from e
+    verdict = str(data.get("verdict", "")).strip().lower()
+    reason = data.get("reason")
+    return (verdict if verdict in COVER_VERDICTS else "unsure"), (reason if isinstance(reason, str) else "")
+
+
+# --- metadata review -----------------------------------------------------------
+REVIEW_PROMPT = """You are a librarian identifying an e-book from its first pages and, when attached, \
+its cover. The text may be in any language.
+
+Respond with a single JSON object with exactly these keys:
+{"title": string|null, "authors": [string], "publisher": string|null, "year": integer|null,
+ "series": string|null, "series_index": number|null}
+
+Rules:
+- Use only information shown in the pages or on the cover. Never guess. Use null or [] when not found.
+- "title": the book's title as printed, with normal capitalisation (not ALL CAPS). Without the series \
+name or number, unless they are part of the title itself.
+- "authors": the authors' names as printed, in "First Last" order. Exclude translators, editors of \
+forewords, illustrators and cover artists.
+- "publisher": the publishing house of THIS edition (not the printer or distributor).
+- "year": the publication year of THIS edition (not the original first publication, if both are shown).
+- "series": the series or numbered collection the book belongs to, e.g. a saga ("Foundation") or a \
+publisher's numbered collection ("Urania"). null if none is shown.
+- "series_index": the book's number in that series (e.g. 3, or 1234 for "Urania n. 1234"). null if \
+not shown.
+"""
+
+
+@dataclass
+class ReviewMetadata:
+    """What the AI read in a book's first pages and on its cover."""
+    title: str | None = None
+    authors: list[str] = field(default_factory=list)
+    publisher: str | None = None
+    year: int | None = None
+    series: str | None = None
+    series_index: float | None = None
+
+    @classmethod
+    def from_json(cls, text: str) -> "ReviewMetadata":
+        base = AIMetadata.from_json(text)  # same parsing and checks for the shared fields
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group()) if m else {}
+        series = data.get("series")
+        series = series.strip() if isinstance(series, str) and series.strip().lower() not in ("", "null", "none") \
+            else None
+        try:
+            index = float(str(data.get("series_index")).replace(",", ".")) if series else None
+        except (TypeError, ValueError):
+            index = None
+        return cls(title=base.title, authors=base.authors, publisher=base.publisher, year=base.year,
+                   series=series, series_index=index if index is None or 0 <= index < 100_000 else None)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+def read_book_metadata(provider: Provider, text: str, images: list[str] | None = None,
+                       has_cover: bool = False) -> ReviewMetadata:
+    """Ask for title, authors, publisher, year and series. With `has_cover`, the
+    first image is the cover; the other images are pages of a scanned book."""
+    parts = []
+    if has_cover:
+        parts.append("The first attached image is the book's cover.")
+    pages = len(images or []) - int(has_cover)
+    if pages > 0:
+        parts.append(f"The other {pages} attached images are its first pages.")
+    parts.append(f"Text of the first pages:\n\n{text}" if text.strip() else "No text could be extracted.")
+    return ReviewMetadata.from_json(provider.chat(REVIEW_PROMPT, "\n".join(parts), images or None))

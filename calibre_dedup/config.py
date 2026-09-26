@@ -23,6 +23,8 @@ ANTHROPIC = "anthropic"
 
 
 DATA_DIR_NAME = ".CalibreDedup"
+SETTINGS_FILE = "settings.json"  # the duplicate remover
+REVIEW_SETTINGS_FILE = "review_settings.json"  # calibre-review: its own copy, see load_review_settings
 
 
 def config_dir() -> Path:
@@ -91,13 +93,23 @@ class Settings:
     similar_matching: bool = True  # authors match loosely and one shared author is enough
     cover_check: bool = True  # the image AI compares covers when metadata can't decide
     recheck_years: bool = True  # AI reads both books when only the metadata years differ
+    same_series: bool = False  # same author + series + number (not 1) = same book, whatever the title
+    always_cover: bool = False  # compare covers even when the metadata says different; same cover wins
+    author_variants: bool = True  # same title, author written differently ("Tucke"/"Tucker"; AI if on)
+    similar_titles: bool = True  # same author, one title inside the other ("1 Dune" / "Dune"): needs proof
     update_metadata: bool = True  # write AI-found title/authors/publisher to moved books
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""
     source_library: str = ""
     target_library: str = ""
-    trash_library: str = ""
+    trash_library: str = ""  # where removed books go
     window_geometry: str = ""  # main window size/position (Qt saveGeometry, base64)
+    dismissed_warnings: list[str] = field(default_factory=list)  # pre-flight warnings not to show again
+    # calibre-review (python -m calibre_dedup.review)
+    review_library: str = ""
+    review_fields: list[str] = field(default_factory=lambda: ["title", "authors", "publisher", "year", "series"])
+    review_window_geometry: str = ""
+    review_skip_reviewed: bool = True  # skip books tagged AIReviewed (review.REVIEWED_TAG)
 
     def profile(self, name: str | None = None) -> ProviderProfile | None:
         name = self.text_profile if name is None else name
@@ -117,7 +129,14 @@ class Settings:
     # --- persistence -------------------------------------------------------
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":
-        path = path or config_dir() / "settings.json"
+        """Settings from `path` (default: the duplicate remover's); save() writes them back there."""
+        path = path or config_dir() / SETTINGS_FILE
+        settings = cls._read(path)
+        settings._path = path  # not a field: never saved
+        return settings
+
+    @classmethod
+    def _read(cls, path: Path) -> "Settings":
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -138,8 +157,24 @@ class Settings:
         return settings
 
     def save(self, path: Path | None = None) -> None:
-        path = path or config_dir() / "settings.json"
+        path = path or getattr(self, "_path", None) or config_dir() / SETTINGS_FILE
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+def load_review_settings() -> Settings:
+    """calibre-review's settings, separate from the duplicate remover's so that both can
+    run at the same time. The first time, they start as a copy of the duplicate
+    remover's (AI profiles, trash library, Calibre folder…); after that each program
+    keeps its own. API keys stay shared: they are stored per profile name."""
+    path = config_dir() / REVIEW_SETTINGS_FILE
+    dedup = config_dir() / SETTINGS_FILE
+    if not path.exists() and dedup.is_file():
+        try:
+            shutil.copyfile(dedup, path)
+            log.info("Review settings created from %s", dedup)
+        except OSError as e:
+            log.warning("Could not copy %s to %s: %s", dedup, path, e)
+    return Settings.load(path)
 
 
 # --- secrets ---------------------------------------------------------------

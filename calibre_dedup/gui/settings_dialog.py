@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import html
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -10,10 +11,12 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ..ai import GOOD, INFO, NOTE, PROBLEM, AIError, connection_test, extra_params, make_provider
+from ..ai import GOOD, INFO, NOTE, PROBLEM, AICache, AIError, connection_test, extra_params, make_provider
 from ..calibre_env import find_calibre_dir
-from ..config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, Settings, get_secret, set_secret
-from .style import GREEN, button_css, set_running
+from ..config import (
+    ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, Settings, config_dir, get_secret, set_secret,
+)
+from .style import GREEN, button_css, mark_inactive, set_running
 
 KINDS = [(OLLAMA, "Ollama"), (AZURE, "Azure OpenAI"), (OPENAI, "OpenAI"), (ANTHROPIC, "Anthropic")]
 ADVANCED_HINTS = {
@@ -45,8 +48,15 @@ ADVANCED_RULES = (
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, parent=None):
+    def __init__(self, settings: Settings, parent=None, dedup_options: bool = True,
+                 cache_path: Path | None = None, cache_busy: bool = False):
+        """`dedup_options`: False hides the duplicate-finding options (calibre-review).
+        `cache_path`: this program's AI cache (default: the duplicate remover's), which
+        "Clear AI cache" empties; `cache_busy`: an analysis is running, so it can't."""
         super().__init__(parent)
+        self.dedup_options = dedup_options
+        self.cache_path = cache_path or config_dir() / "ai_cache.json"
+        self.cache_busy = cache_busy
         self.setWindowTitle("Settings")
         self.resize(820, 640)
         self.settings = settings
@@ -58,7 +68,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_providers_tab(), "AI providers")
-        tabs.addTab(self._build_analysis_tab(), "Analysis")
+        tabs.addTab(self._build_analysis_tab(), "Analysis" if dedup_options else "Reading")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -262,7 +272,8 @@ class SettingsDialog(QDialog):
         self.params_hint.setText(ADVANCED_HINTS.get(self.f_kind.currentData(), ""))
         self.hint.setText(
             "Azure: enter the resource endpoint and the deployment name. API version is e.g. "
-            "2024-10-21, or 'v1' for the new v1 API (the deployment field then holds the model). "
+            "2024-10-21, or 'v1' for the new v1 API (the deployment field then holds the model); "
+            "an endpoint ending in /openai/v1, as the portal shows it, also means v1. "
             "Uncheck 'Send temperature' for reasoning models (o-series, gpt-5)."
             if azure else ("Ollama: the server URL (default http://localhost:11434). 'Refresh models' lists installed "
             "models. A larger context size lets the model read more text but uses more memory."
@@ -401,11 +412,56 @@ class SettingsDialog(QDialog):
         self.a_similar.setChecked(s.similar_matching)
         self.a_cover = QCheckBox("Compare covers when metadata can't decide (needs an Image AI)")
         self.a_cover.setChecked(s.cover_check)
+        self.a_always_cover = QCheckBox("Always compare covers: the same cover means the same book, even when "
+                                        "year, publisher or edition differ")
+        self.a_always_cover.setToolTip(
+            "Covers are also compared when the metadata says the books are different (e.g. only the\n"
+            "years differ, 2011 vs 1986). The same cover makes a duplicate, proposed as Trash only (no\n"
+            "formats are copied into the other book). Because Calibre's cover can be a downloaded\n"
+            "picture, the covers inside the book files must match too. Needs an Image AI; costs more\n"
+            "AI calls. List these books with the 'Decided by cover' filter.")
+        self.a_always_cover.setChecked(s.always_cover)
         self.a_years = QCheckBox("Re-check year differences by reading both books (AI)")
         self.a_years.setToolTip("Calibre's publication date is often the original publication, not this "
                                 "edition's.\nWhen only the years differ, the AI reads the year printed in "
                                 "both books and that decides.")
         self.a_years.setChecked(s.recheck_years)
+        # An option that is on but won't take effect says so, and why; its value is kept.
+        if not s.use_ai:
+            cover_missing = years_missing = "Text AI is None (main window)"
+        else:
+            cover_missing = "" if s.image_ai() else "no Image AI selected (main window)"
+            years_missing = ""
+        self.a_cover_note = self._inactive_note(self.a_cover, cover_missing)
+        self.a_years_note = self._inactive_note(self.a_years, years_missing)
+        self.a_always_cover_note = self._inactive_note(self.a_always_cover, cover_missing)
+        self.a_author_variants = QCheckBox("Same title, author written differently (e.g. \"Wilson Tucke\" / "
+                                           "\"Wilson Tucker\")")
+        self.a_author_variants.setToolTip(
+            "When no book has the same title and authors: books with the same title whose authors are\n"
+            "the same person written differently. One letter apart in a name is enough; otherwise the\n"
+            "Text AI is asked (typos, transliterations, pen names; answers are cached). Those books are\n"
+            "then compared as usual (ISBN, edition and publisher, EPUB text, cover).")
+        self.a_author_variants.setChecked(s.author_variants)
+        self.a_similar_titles = QCheckBox("Match similar titles by the same author (needs proof: ISBN, same text "
+                                          "or same cover)")
+        self.a_similar_titles.setToolTip(
+            "When no book has the same title: also books by the same author whose title contains the\n"
+            "other's, with only numbers, the author, the series, the publisher or a date around it,\n"
+            "e.g. \"1 Abissi d'acciaio\" or \"(Urania - 0411- Supernormale - J. Hunter Holly)\" and \"Supernormale\".\n"
+            "Titles like these are weaker than the same title: it's a duplicate only with the same ISBN,\n"
+            "identical EPUB text or the same cover. A different cover or edition rules the book out;\n"
+            "otherwise the book is left in the source for you to check.")
+        self.a_similar_titles.setChecked(s.similar_titles)
+        self.a_series = QCheckBox("Same author + same series + same number = same book, even if titles differ")
+        self.a_series.setToolTip(
+            "Only when both books have the same series name and number, and share an author.\n"
+            "Number 1 is ignored: it is Calibre's default when no number was set.\n"
+            "Turn it on only for libraries whose series numbers are reliable (e.g. a collection\n"
+            "like Urania, numbered by issue): a wrong number would send a different book to trash.\n"
+            "While it is on, source books without a series and a number are left untouched:\n"
+            "run the analysis again with it off for those.")
+        self.a_series.setChecked(s.same_series)
         self.a_update = QCheckBox("Write AI-found title/authors/publisher/ISBN to moved books (only empty fields)")
         self.a_update.setChecked(s.update_metadata)
         self.a_permanent = QCheckBox("Delete permanently from source (else: Calibre's recycle bin)")
@@ -422,11 +478,84 @@ class SettingsDialog(QDialog):
         form.addRow(self.a_subtitle)
         form.addRow(self.a_similar)
         form.addRow(self.a_cover)
+        form.addRow(self.a_cover_note)
+        form.addRow(self.a_always_cover)
+        form.addRow(self.a_always_cover_note)
         form.addRow(self.a_years)
+        form.addRow(self.a_years_note)
+        form.addRow(self.a_author_variants)
+        form.addRow(self.a_similar_titles)
+        form.addRow(self.a_series)
         form.addRow(self.a_update)
         form.addRow(self.a_permanent)
         form.addRow("Calibre program folder", crow)
+        self._reset_warnings = False
+        reset = QPushButton(f"Show dismissed warnings again ({len(s.dismissed_warnings)})")
+        reset.setToolTip("Warnings before an analysis that you chose not to see again\n"
+                         "(e.g. cover check on with no Image AI).")
+        reset.setEnabled(bool(s.dismissed_warnings))
+
+        def reset_clicked():
+            self._reset_warnings = True
+            reset.setText("Dismissed warnings will be shown again")
+            reset.setEnabled(False)
+        reset.clicked.connect(reset_clicked)
+        form.addRow(reset)
+        form.addRow(self._clear_cache_row())
+        if not self.dedup_options:
+            # Hidden, not left out: accept() still reads (and keeps) their values.
+            for widget in (self.a_subtitle, self.a_similar, self.a_cover, self.a_cover_note, self.a_always_cover,
+                           self.a_always_cover_note, self.a_years, self.a_years_note, self.a_author_variants,
+                           self.a_similar_titles, self.a_series, self.a_update, reset):
+                form.setRowVisible(widget, False)
+            form.labelForField(self.a_pdf_pages).setText("PDF pages to read (from the start)")
+            form.labelForField(self.a_chars).setText("Characters to read (other formats, from the start)")
+            self.a_permanent.setText("Delete permanently from the reviewed library when trashing "
+                                     "(else: Calibre's recycle bin)")
         return w
+
+    def _clear_cache_row(self) -> QHBoxLayout:
+        """A small button at the bottom right: forget this program's AI answers. Done at
+        once (not on OK), and not while an analysis runs (it would write them back)."""
+        path = self.cache_path
+        answers, size = AICache.size(path)
+        button = QPushButton(f"Clear AI cache… ({answers:,} answers, {size / 1_000_000:.1f} MB)")
+        font = button.font()
+        font.setPointSizeF(font.pointSizeF() * 0.85)
+        button.setFont(font)
+        button.setFlat(True)
+        button.setEnabled(bool(answers) and not self.cache_busy)
+        button.setToolTip("Unavailable while an analysis is running." if self.cache_busy else
+                          f"{path}\nForget every answer the AI gave to this program: the next analysis asks again.")
+
+        def clicked():
+            if QMessageBox.question(
+                    self, "Clear AI cache",
+                    f"Forget all {answers:,} AI answers of this program?\n\n"
+                    "The next analysis asks the AI again for every book it needs, which is slow and, with a "
+                    "cloud AI, costs requests. The other program's cache is not touched.\n\n"
+                    "This happens now, even if you then press Cancel.") != QMessageBox.Yes:
+                return
+            AICache.clear(path)
+            button.setText("AI cache cleared")
+            button.setEnabled(False)
+        button.clicked.connect(clicked)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button)
+        return row
+
+    @staticmethod
+    def _inactive_note(box: QCheckBox, missing: str) -> QLabel:
+        """"inactive: <why>" under an option while it is ticked but can't run."""
+        note = QLabel(f"      inactive: {missing}")
+        mark_inactive(note, True)
+
+        def update(*_):
+            note.setVisible(bool(missing) and box.isChecked())
+        box.toggled.connect(update)
+        update()
+        return note
 
     def _browse_calibre(self):
         d = QFileDialog.getExistingDirectory(self, "Calibre program folder", self.a_calibre.text())
@@ -467,10 +596,16 @@ class SettingsDialog(QDialog):
         s.ignore_subtitle = self.a_subtitle.isChecked()
         s.similar_matching = self.a_similar.isChecked()
         s.cover_check = self.a_cover.isChecked()
+        s.always_cover = self.a_always_cover.isChecked()
         s.recheck_years = self.a_years.isChecked()
+        s.same_series = self.a_series.isChecked()
+        s.similar_titles = self.a_similar_titles.isChecked()
+        s.author_variants = self.a_author_variants.isChecked()
         s.update_metadata = self.a_update.isChecked()
         s.delete_permanently = self.a_permanent.isChecked()
         s.calibre_dir = self.a_calibre.text().strip()
+        if self._reset_warnings:
+            s.dismissed_warnings = []
         for name, key in self.keys.items():
             set_secret(name, key if name in names else "")
         s.save()

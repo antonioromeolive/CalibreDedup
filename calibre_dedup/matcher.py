@@ -5,7 +5,8 @@ it is the same edition from the same publisher:
 
 * a shared ISBN proves it is the same edition and publisher (different ISBNs
   prove nothing, as e-book and print ISBNs of one edition differ); so does a
-  shared Amazon ASIN, which Amazon assigns to one edition;
+  shared Amazon ASIN, which Amazon assigns to one edition; and, with the "same
+  series" option, the same series and number (not Calibre's default 1);
 * otherwise edition (edition number, falling back to publication year) and
   publisher are compared. If either differs, the books are distinct. If either
   is unknown, no decision is possible.
@@ -36,6 +37,9 @@ class Comparison:
     verdict: Verdict
     reason: str
     year_only: bool = False  # distinct only because the metadata years differ
+    # Duplicate by an identifier (ISBN, ASIN, series and number), whatever the
+    # title: enough even for books whose titles only look alike.
+    proof: bool = False
 
 
 def _like_with_like(meta_a, ai_a, meta_b, ai_b) -> tuple:
@@ -72,9 +76,12 @@ def compare_publisher(a: Identity, b: Identity) -> Comparison:
 def compare(src: Identity, tgt: Identity) -> Comparison:
     """Compare two books already known to share title and authors."""
     if src.isbns and tgt.isbns and src.isbns & tgt.isbns:
-        return Comparison(Verdict.DUPLICATE, f"same ISBN ({sorted(src.isbns & tgt.isbns)[0]})")
+        return Comparison(Verdict.DUPLICATE, f"same ISBN ({sorted(src.isbns & tgt.isbns)[0]})", proof=True)
     if src.asins & tgt.asins:
-        return Comparison(Verdict.DUPLICATE, f"same ASIN ({sorted(src.asins & tgt.asins)[0]})")
+        return Comparison(Verdict.DUPLICATE, f"same ASIN ({sorted(src.asins & tgt.asins)[0]})", proof=True)
+    if src.series is not None and src.series == tgt.series:  # only set with the "same series" option
+        return Comparison(Verdict.DUPLICATE, f"same series and number ({src.series[0]} #{src.series[1]:g})",
+                          proof=True)
 
     ed = compare_edition(src, tgt)
     pub = compare_publisher(src, tgt)

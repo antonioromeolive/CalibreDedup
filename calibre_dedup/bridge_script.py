@@ -19,6 +19,7 @@ from datetime import datetime
 
 from calibre.db.copy_to_library import copy_one_book
 from calibre.library import db as open_db
+from calibre.utils.date import as_local_time, local_tz
 
 UNKNOWN = {"", "unknown", "sconosciuto", "inconnu", "unbekannt", "desconocido", "desconhecido", "onbekend"}
 
@@ -105,14 +106,55 @@ def fill_metadata(db, book_id, values):
     return changed
 
 
+def set_metadata(db, book_id, values):
+    """Overwrite fields with the reviewed values (calibre-review). The year keeps
+    the date's month and day. Returns the changed fields, the book's folder and
+    its formats' paths (a new title or author renames them)."""
+    changed = []
+    for name in ("title", "authors", "publisher", "series", "series_index"):
+        if name in values:
+            db.set_field(name, {book_id: values[name]})
+            changed.append(name)
+    if values.get("year"):
+        year = int(values["year"])
+        pubdate = db.field_for("pubdate", book_id)
+        if getattr(pubdate, "year", 0) >= 1400:
+            # In local time, as Calibre shows it: 1 January 1977 00:00 in Italy is stored
+            # as 1976-12-31 23:00 UTC; changing the UTC year would leave it showing 1977.
+            pubdate = as_local_time(pubdate)
+            try:
+                new = pubdate.replace(year=year)
+            except ValueError:  # 29 February
+                new = pubdate.replace(year=year, day=28)
+        else:
+            new = datetime(year, 1, 1, 12, tzinfo=local_tz)  # noon: the same year in every time zone
+        db.set_field("pubdate", {book_id: new})
+        changed.append("year")
+    formats = {fmt: db.format_abspath(book_id, fmt) for fmt in db.formats(book_id)}
+    return changed, db.field_for("path", book_id), formats
+
+
+def add_tag(db, book_ids, tag):
+    """Add `tag` to these books (calibre-review's "reviewed" mark), keeping their other tags."""
+    values = {}
+    for book_id in book_ids:
+        tags = tuple(db.field_for("tags", book_id) or ())
+        if tag.casefold() not in {t.casefold() for t in tags}:
+            values[book_id] = tags + (tag,)
+    if values:
+        db.set_field("tags", values)
+
+
 def main(plan_path):
     with open(plan_path, encoding="utf-8") as f:
         plan = json.load(f)
-    for path in (plan["target"], plan["trash"]):
-        os.makedirs(path, exist_ok=True)
+    # calibre-review has no target library; a trash library only when books go to it
+    for path in (plan.get("target"), plan.get("trash")):
+        if path:
+            os.makedirs(path, exist_ok=True)
     src = open_db(plan["source"]).new_api
-    tgt = open_db(plan["target"]).new_api
-    trash = open_db(plan["trash"]).new_api
+    tgt = open_db(plan["target"]).new_api if plan.get("target") else None
+    trash = open_db(plan["trash"]).new_api if plan.get("trash") else None
     permanent = bool(plan.get("permanent"))
     moved = {}  # source id -> new id in target
     removed_folders = []  # source book folders, relative to the library
@@ -123,6 +165,15 @@ def main(plan_path):
             if os.path.exists(stop_file):
                 emit(event="stopped")
                 break
+            if action["op"] == "tag":  # calibre-review: the reviewed books with nothing to write
+                try:
+                    ids = [i for i in action["src_ids"] if i in src.all_book_ids()]
+                    add_tag(src, ids, action["tag"])
+                    emit(event="tagged", src_ids=ids, ok=True, msg=f"tagged {action['tag']}")
+                except Exception as e:
+                    emit(event="tagged", src_ids=action["src_ids"], ok=False, msg=str(e),
+                         trace=traceback.format_exc())
+                continue
             sid = action["src_id"]
             try:
                 if sid not in src.all_book_ids():
@@ -142,6 +193,18 @@ def main(plan_path):
                     msg = f"updated metadata in source"
                     if changed:
                         msg += f"; filled {', '.join(changed)}"
+                elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes
+                    changed, path, formats = set_metadata(src, sid, action["set"])
+                    if action.get("tag"):  # only once the update is written
+                        add_tag(src, [sid], action["tag"])
+                    msg = f"updated {', '.join(changed) or 'nothing'}" + (f"; tagged {action['tag']}"
+                                                                          if action.get("tag") else "")
+                    emit(event="result", src_id=sid, ok=True, msg=msg, path=path, formats=formats)
+                    continue
+                elif action["op"] == "trash" and action.get("no_target"):
+                    # Forced by the user for a book with no copy in the target.
+                    new_id = copy_verified(src, sid, trash)
+                    msg = f"moved to trash (id {new_id})" + ("; no copy in the target" if tgt is not None else "")
                 elif action["op"] == "trash":
                     tid = action.get("target_id") or moved.get(action.get("target_src_id"))
                     if tid is None or tid not in tgt.all_book_ids():
@@ -173,7 +236,8 @@ def main(plan_path):
                 emit(event="result", src_id=sid, ok=False, msg=str(e), trace=traceback.format_exc())
     finally:
         for db in (src, tgt, trash):
-            db.close()
+            if db is not None:
+                db.close()
     emit(event="cleanup_start")
     removed, deferred = cleanup_empty_dirs(plan["source"], removed_folders)
     emit(event="cleanup", removed=removed, deferred=deferred)

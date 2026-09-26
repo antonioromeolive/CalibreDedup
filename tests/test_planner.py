@@ -13,12 +13,16 @@ from calibre_dedup.planner import build_plan
 
 SCHEMA = """
 CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, pubdate TEXT, path TEXT, uuid TEXT,
-                    has_cover INTEGER DEFAULT 0, comments TEXT);
+                    has_cover INTEGER DEFAULT 0, comments TEXT, series_index REAL DEFAULT 1.0);
+CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE books_series_link (id INTEGER PRIMARY KEY, book INTEGER, series INTEGER);
 CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER);
 CREATE TABLE publishers (id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE books_publishers_link (id INTEGER PRIMARY KEY, book INTEGER, publisher INTEGER);
 CREATE TABLE identifiers (id INTEGER PRIMARY KEY, book INTEGER, type TEXT, val TEXT);
+CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE books_tags_link (id INTEGER PRIMARY KEY, book INTEGER, tag INTEGER);
 CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, name TEXT, uncompressed_size INTEGER);
 """
 
@@ -30,16 +34,22 @@ def make_library(path: Path, books: list[dict]) -> str:
     for i, b in enumerate(books, 1):
         year = b.get("year")
         pubdate = f"{year}-06-15 12:00:00+00:00" if year else "0101-01-01 00:00:00+00:00"
-        conn.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?)", (
+        conn.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?,?)", (
             i, b["title"], pubdate, f"a/b ({i})", f"u{i}",
-            int(b.get("cover", False)), b.get("comments"),
+            int(b.get("cover", False)), b.get("comments"), b.get("series_index", 1.0),
         ))
+        if b.get("series"):
+            sid = conn.execute("INSERT INTO series (name) VALUES (?)", (b["series"],)).lastrowid
+            conn.execute("INSERT INTO books_series_link (book, series) VALUES (?,?)", (i, sid))
         for a in b.get("authors", ["Frank Herbert"]):
             aid = conn.execute("INSERT INTO authors (name) VALUES (?)", (a,)).lastrowid
             conn.execute("INSERT INTO books_authors_link (book, author) VALUES (?,?)", (i, aid))
         if b.get("publisher"):
             pid = conn.execute("INSERT INTO publishers (name) VALUES (?)", (b["publisher"],)).lastrowid
             conn.execute("INSERT INTO books_publishers_link (book, publisher) VALUES (?,?)", (i, pid))
+        for tag in b.get("tags", []):
+            tid = conn.execute("INSERT INTO tags (name) VALUES (?)", (tag,)).lastrowid
+            conn.execute("INSERT INTO books_tags_link (book, tag) VALUES (?,?)", (i, tid))
         if b.get("isbn"):
             conn.execute("INSERT INTO identifiers (book, type, val) VALUES (?,?,?)", (i, "isbn", b["isbn"]))
         for kind, val in b.get("ids", {}).items():
@@ -62,10 +72,21 @@ def make_library(path: Path, books: list[dict]) -> str:
 class FakeResolver:
     """Stands in for AIResolver: returns canned metadata per book title."""
 
+    vision = object()  # an Image AI is configured
+    disabled_reason = image_disabled_reason = ""
+
     def __init__(self, answers: dict[str, AIMetadata]):
         self.answers = answers
         self.calls: list[str] = []
         self.cache = type("C", (), {"save": lambda self: None})()
+        self.stats = {}
+        self.person_calls: list[tuple[str, str]] = []
+        self.same_people: set[frozenset[str]] = set()  # author pairs the fake AI calls the same person
+
+    def same_person(self, book, a, b, title=None):
+        self.person_calls.append((a, b))
+        same = frozenset((a, b)) in self.same_people
+        return same, f"AI: {'same' if same else 'different'} person", True
 
     def enrich(self, book, ident, need):
         from calibre_dedup.planner import merge_ai
@@ -479,3 +500,372 @@ def test_library_vanishing_between_books_stops_the_analysis(libs, monkeypatch):
     plan = build_plan(src, tgt, trash)
     assert actions(plan) == [("Dune", Action.MOVE)]  # the second book's decision is dropped
     assert plan.stopped and plan.stop_reason == r"library not reachable: F:\lib"
+
+
+def test_same_series_and_number_proves_duplicate_whatever_the_title(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "An 2391", "authors": ["B. R. Bruss"], "series": "Urania", "series_index": 243}],
+        target=[{"title": "Anno 2391", "authors": ["Bruss, B. R."], "series": "urania", "series_index": 243,
+                 "publisher": "Mondadori", "year": 1960}],
+    )
+    assert build_plan(src, tgt, trash).items[0].action is Action.MOVE  # option off: titles differ
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.TRASH and "same series and number (urania #243)" in item.reason
+
+
+@pytest.mark.parametrize("target", [
+    {"series": "Urania", "series_index": 244},                  # other number
+    {"series": "Galassia", "series_index": 243},                # other series
+    {"series": "Urania", "series_index": 1},                    # target at Calibre's default number
+    {},                                                         # target without a series
+])
+def test_series_decides_nothing_when_series_or_number_differ(libs, target):
+    src, tgt, trash = libs(source=[{"title": "An 2391", "series": "Urania", "series_index": 243}],
+                           target=[{"title": "Anno 2391", **target}])
+    assert build_plan(src, tgt, trash, same_series=True).items[0].action is Action.MOVE
+
+
+@pytest.mark.parametrize("source", [
+    {},                                                         # no series
+    {"series": "Urania", "series_index": 1},                    # Calibre's default number
+    {"series": "Urania", "series_index": 0},
+    {"series_index": 7},                                        # a number without a series
+])
+def test_with_the_series_option_books_without_series_number_are_left_untouched(libs, source):
+    from calibre_dedup.planner import NO_SERIES_REASON
+    # Even an obvious duplicate (same ISBN) is left alone: nothing is decided or executed for it.
+    src, tgt, trash = libs(source=[{"title": "Dune", "isbn": "9780441013593", **source}],
+                           target=[{"title": "Dune", "isbn": "9780441013593"}])
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.LEAVE and item.reason == NO_SERIES_REASON and not item.ai_used
+    assert build_plan(src, tgt, trash).items[0].action is Action.TRASH  # option off: as before
+
+
+def test_the_series_option_changes_nothing_when_off(libs):
+    books = [
+        {"title": "Dune", "publisher": "Ace", "year": 1990, "series": "Dune", "series_index": 1},
+        {"title": "Dune Messiah", "isbn": "9780441013593", "series": "Dune", "series_index": 2},
+        {"title": "Children of Dune", "series_index": 7},
+        {"title": "Unknown", "authors": ["Unknown"]},
+    ]
+    src, tgt, trash = libs(source=books, target=[{"title": "Dune", "publisher": "Ace", "year": 1990}])
+    default, off = build_plan(src, tgt, trash), build_plan(src, tgt, trash, same_series=False)
+    assert [(i.action, i.reason) for i in off.items] == [(i.action, i.reason) for i in default.items]
+    assert not any("series" in i.reason for i in off.items)
+
+
+def test_a_move_judged_a_different_edition_can_be_forced_to_trash(libs):
+    from calibre_dedup.executor import plan_actions
+    from calibre_dedup.selection import can_override, override
+    src, tgt, trash = libs(
+        source=[{"title": "Il nemico di nebbia", "publisher": "Mondadori", "year": 2014},
+                {"title": "Dune Messiah", "publisher": "Ace", "year": 1990}],
+        target=[{"title": "Il Nemico Di Nebbia", "publisher": "Mondadori", "year": 1964}],
+    )
+    plan = build_plan(src, tgt, trash)
+    different, new = plan.items
+    assert different.action is Action.MOVE and "different year" in different.reason
+    assert different.match is not None and different.match.title == "Il Nemico Di Nebbia" and different.different
+    assert new.action is Action.MOVE and new.match is None  # nothing in the target: nothing to trash into
+    assert can_override(different, Action.TRASH) and can_override(new, Action.TRASH)  # Trash: always possible
+    override(different, Action.TRASH)
+    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == different.source.id)
+    assert action["op"] == "trash" and action["target_id"] == different.match.id
+
+
+# --- checks that could not run -------------------------------------------------------
+def test_ai_down_asks_and_retry_resets_the_counter(tmp_path):
+    from calibre_dedup.ai import AICache, AIError
+    from calibre_dedup.models import Book
+    from calibre_dedup.planner import MAX_CONSECUTIVE_AI_ERRORS, AIResolver
+
+    asked = []
+    answers = iter([True, False])  # Retry once, then Continue without AI
+    resolver = AIResolver(None, None, AICache(tmp_path / "cache.json"),
+                          on_down=lambda msg, image: asked.append((msg, image)) or next(answers))
+    book = Book(1, "T", ["A"], None, None, set(), {}, "", "b", str(tmp_path))
+    for _ in range(MAX_CONSECUTIVE_AI_ERRORS - 1):
+        assert resolver._error(book, AIError("down")) == "AI error: down"
+    assert resolver._error(book, AIError("down")) is None  # retry: nothing turned off
+    assert resolver.consecutive_errors == 0 and not resolver.disabled_reason
+    for _ in range(MAX_CONSECUTIVE_AI_ERRORS):
+        resolver._error(book, AIError("down"))
+    assert resolver.disabled_reason.startswith("AI disabled")
+    assert len(asked) == 2 and asked[0][1] is False and "failed 3 times" in asked[0][0]
+
+
+def test_cover_check_without_image_ai_is_reported(libs):
+    from calibre_dedup.planner import SKIP_COVER, run_summary
+
+    src, tgt, trash = libs(
+        source=[{"title": "Children of Dune", "cover": True}],
+        target=[{"title": "Children of Dune", "publisher": "Ace", "year": 1991, "cover": True}],
+    )
+    blind = CoverResolver(same=True)
+    blind.vision = None
+    plan = build_plan(src, tgt, trash, blind, cover_check=True)
+    item = plan.items[0]
+    assert item.action is Action.LEAVE and item.skipped == [SKIP_COVER]
+    assert "cover check skipped: no Image AI" in item.reason and blind.cover_calls == []
+    assert run_summary(plan)[1] == ["1 book(s): cover check skipped (no Image AI, or AI off)"]
+
+    item = build_plan(src, tgt, trash, None, cover_check=True).items[0]
+    assert item.skipped == [SKIP_COVER] and "cover check skipped: AI is off" in item.reason
+    assert build_plan(src, tgt, trash, None).items[0].skipped == []  # cover check off: nothing to report
+
+
+def test_year_recheck_without_ai_is_reported(libs):
+    from calibre_dedup.planner import SKIP_YEARS
+
+    src, tgt, trash = libs(
+        source=[{"title": "Dune", "publisher": "Ace", "year": 1965}],
+        target=[{"title": "Dune", "publisher": "Ace", "year": 2005}],
+    )
+    item = build_plan(src, tgt, trash, None, recheck_years=True).items[0]
+    assert item.action is Action.MOVE and item.skipped == [SKIP_YEARS]
+    assert "year re-check skipped: AI is off" in item.reason
+
+
+class DyingResolver(FakeResolver):
+    """The text AI is turned off while reading the first book."""
+
+    def enrich(self, book, ident, need):
+        self.calls.append(book.title)
+        self.disabled_reason = "AI disabled after 3 consecutive errors"
+        return ident, [self.disabled_reason]
+
+
+def test_books_decided_after_the_ai_went_down_are_marked(libs):
+    from calibre_dedup.planner import SKIP_AI, run_summary
+
+    src, tgt, trash = libs(
+        source=[{"title": "Dune"}, {"title": "Dune Messiah"}, {"title": "Other"}],
+        target=[{"title": "Dune"}, {"title": "Dune Messiah"}],
+    )
+    plan = build_plan(src, tgt, trash, DyingResolver({}))
+    assert [it.skipped for it in plan.items] == [[SKIP_AI], [SKIP_AI], []]
+    assert plan.ai_down == ["The text AI stopped responding at book 1 of 3: "
+                            "the books after it were decided without it."]
+    assert len(run_summary(plan)[1]) == 2
+
+
+def test_run_summary_counts_what_the_ai_did():
+    from calibre_dedup.models import Plan
+    from calibre_dedup.planner import run_summary
+
+    plan = Plan("s", "t", "x", stats={"read": 4, "read_cached": 10, "cover": 2, "cover_identical": 1,
+                                      "year_rechecks": 3})
+    assert run_summary(plan) == ("4 AI page reads (10 cached) · 3 cover comparisons (2 by AI, 0 cached, "
+                                 "1 identical files) · 3 year re-checks", [])
+    assert run_summary(Plan("s", "t", "x"))[0] == "AI not used"
+
+
+# --- similar titles -------------------------------------------------------------------
+def _similar(libs, source, target, **kw):
+    src, tgt, trash = libs(source=source, target=target)
+    return build_plan(src, tgt, trash, similar_titles=True, **kw).items[0]
+
+
+def test_similar_title_without_proof_is_left_to_check(libs):
+    item = _similar(libs, [{"title": "1 Abissi D'acciaio", "authors": ["Isaac Asimov"]}],
+                    [{"title": "Abissi D'Acciaio", "authors": ["Asimov, Isaac"]}])
+    assert item.action is Action.LEAVE and "check manually" in item.reason and item.match.title == "Abissi D'Acciaio"
+
+
+def test_similar_title_is_off_by_default_and_unrelated_titles_are_not_similar(libs):
+    src, tgt, trash = libs(source=[{"title": "1 Dune"}, {"title": "Dune Messiah"}], target=[{"title": "Dune"}])
+    assert actions(build_plan(src, tgt, trash)) == [("1 Dune", Action.MOVE), ("Dune Messiah", Action.MOVE)]
+    plan = build_plan(src, tgt, trash, similar_titles=True)
+    assert actions(plan) == [("1 Dune", Action.LEAVE), ("Dune Messiah", Action.MOVE)]
+    assert plan.items[1].match is None
+
+
+def test_similar_file_name_title_is_a_duplicate_with_proof(libs):
+    item = _similar(libs, [{"title": "(Urania - 0411- Supernormale - J. Hunter Holly)", "authors": ["J. Hunter Holly"],
+                            "isbn": "0-306-40615-2"}],
+                    [{"title": "Supernormale", "authors": ["J. Hunter Holly"], "isbn": "9780306406157"}])
+    assert item.action is Action.TRASH and "'supernormale'" in item.reason and "same ISBN" in item.reason
+
+
+def test_similar_title_with_identical_epub_text(libs):
+    item = _similar(libs, [{"title": "ASTRONAVI MALEDETTE", "authors": ["AA.VV."], "text": "Una storia. "}],
+                    [{"title": "ASTRONAVI MALEDETTE Inverno 2001", "authors": ["Autori Vari"], "text": "Una storia. "}])
+    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+
+
+def test_similar_title_cover_decides(libs):
+    src = [{"title": "1 Abissi D'acciaio", "authors": ["Isaac Asimov"], "cover": True}]
+    tgt = [{"title": "Abissi D'Acciaio", "authors": ["Isaac Asimov"], "cover": True}]
+    item = _similar(libs, src, tgt, resolver=CoverResolver(same=True), cover_check=True)
+    assert item.action is Action.TRASH and "same cover" in item.reason
+
+
+def test_similar_title_with_another_cover_is_moved(libs):
+    item = _similar(libs, [{"title": "1 Abissi D'acciaio", "authors": ["Isaac Asimov"], "cover": True}],
+                    [{"title": "Abissi D'Acciaio", "authors": ["Isaac Asimov"], "cover": True}],
+                    resolver=CoverResolver(same=False), cover_check=True)
+    assert item.action is Action.MOVE and "has another cover" in item.reason and item.different
+
+
+def test_similar_title_of_another_edition_is_moved(libs):
+    item = _similar(libs, [{"title": "1 Abissi D'acciaio", "authors": ["Isaac Asimov"], "publisher": "Urania"}],
+                    [{"title": "Abissi D'Acciaio", "authors": ["Isaac Asimov"], "publisher": "Oscar"}])
+    assert item.action is Action.MOVE and "is another book: different publisher" in item.reason
+
+
+def test_similar_title_cover_check_without_image_ai_is_reported(libs):
+    from calibre_dedup.planner import SKIP_COVER
+
+    blind = CoverResolver(same=True)
+    blind.vision = None
+    item = _similar(libs, [{"title": "1 Abissi D'acciaio", "authors": ["Isaac Asimov"], "cover": True}],
+                    [{"title": "Abissi D'Acciaio", "authors": ["Isaac Asimov"], "cover": True}],
+                    resolver=blind, cover_check=True)
+    assert item.action is Action.LEAVE and item.skipped == [SKIP_COVER]
+
+
+# --- always compare covers ------------------------------------------------------------
+class InsideCoverResolver(CoverResolver):
+    def __init__(self, same: bool, inside: bool | None):
+        super().__init__(same)
+        self.inside = inside  # None: no cover inside a file
+
+    def same_embedded_cover(self, a, b):
+        if self.inside is None:
+            return False, f"no cover inside the file of {a.label()!r} to confirm", False
+        return self.inside, f"covers inside the files: {'same' if self.inside else 'different'}", True
+
+
+YEARS_DIFFER = dict(
+    source=[{"title": "L'inferno a rovescio", "year": 2011, "publisher": "Mondadori", "cover": True,
+             "formats": ["EPUB", "MOBI"]}],
+    target=[{"title": "L'Inferno A Rovescio", "year": 1986, "publisher": "Mondadori", "cover": True}],
+)
+
+
+def test_always_cover_same_cover_overrides_the_metadata_as_trash_only(libs):
+    src, tgt, trash = libs(**YEARS_DIFFER)
+    item = build_plan(src, tgt, trash, InsideCoverResolver(True, True), always_cover=True).items[0]
+    assert item.action is Action.TRASH and item.by_cover and item.add_formats == []
+    assert "metadata differs: different year (2011 vs 1986)" in item.reason
+
+
+def test_always_cover_needs_the_covers_inside_the_files_too(libs):
+    src, tgt, trash = libs(**YEARS_DIFFER)
+    for inside in (False, None):
+        item = build_plan(src, tgt, trash, InsideCoverResolver(True, inside), always_cover=True).items[0]
+        assert item.action is Action.MOVE and not item.by_cover
+    item = build_plan(src, tgt, trash, InsideCoverResolver(False, True), always_cover=True).items[0]
+    assert item.action is Action.MOVE
+
+
+def test_without_always_cover_different_metadata_is_not_compared(libs):
+    src, tgt, trash = libs(**YEARS_DIFFER)
+    resolver = InsideCoverResolver(True, True)
+    assert build_plan(src, tgt, trash, resolver, cover_check=True).items[0].action is Action.MOVE
+    assert resolver.cover_calls == []
+
+
+def test_same_cover_when_metadata_cannot_decide_still_merges_formats(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Children of Dune", "cover": True, "formats": ["EPUB", "MOBI"]}],
+        target=[{"title": "Children of Dune", "publisher": "Ace", "year": 1991, "cover": True}],
+    )
+    item = build_plan(src, tgt, trash, InsideCoverResolver(True, None), always_cover=True).items[0]
+    assert item.action is Action.TRASH and item.by_cover and item.add_formats == ["MOBI"]
+
+
+def test_epub_cover_is_read_from_the_package(tmp_path):
+    import zipfile
+    from calibre_dedup.extract import _epub_cover
+
+    def epub(name, opf_meta, items):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("META-INF/container.xml", '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                       '<rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+            z.writestr("OEBPS/content.opf", '<package xmlns="http://www.idpf.org/2007/opf"><metadata>'
+                       f'{opf_meta}</metadata><manifest>{items}</manifest></package>')
+            z.writestr("OEBPS/img/front.jpg", b"FRONT")
+            z.writestr("OEBPS/img/other.jpg", b"OTHER")
+        return str(path)
+
+    other = '<item id="o" href="img/other.jpg" media-type="image/jpeg"/>'
+    assert _epub_cover(epub("a.epub", "", other + '<item id="f" href="img/front.jpg" media-type="image/jpeg" '
+                                         'properties="cover-image"/>')) == b"FRONT"
+    assert _epub_cover(epub("b.epub", '<meta name="cover" content="f"/>',
+                            other + '<item id="f" href="img/front.jpg" media-type="image/jpeg"/>')) == b"FRONT"
+    assert _epub_cover(epub("c.epub", "", other)) is None
+
+
+# --- authors written differently ------------------------------------------------------
+TUCKER = dict(
+    source=[{"title": "Signori Del Tempo", "authors": ["Wilson Tucke"], "text": "Il tempo dei signori. "}],
+    target=[{"title": "Signori Del Tempo", "authors": ["Wilson Tucker"], "text": "Il tempo dei signori. "}],
+)
+
+
+def test_author_one_letter_apart_is_the_same_person(libs):
+    src, tgt, trash = libs(**TUCKER)
+    assert build_plan(src, tgt, trash).items[0].action is Action.MOVE  # option off
+    resolver = FakeResolver({})
+    item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
+    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+    assert "same person: 'Wilson Tucke' / 'Wilson Tucker' (one letter apart)" in item.reason
+    assert resolver.person_calls == []  # no AI needed
+    assert build_plan(src, tgt, trash, None, author_variants=True).items[0].action is Action.TRASH  # nor any AI
+
+
+def test_other_author_spellings_are_asked_to_the_ai(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Delitto e castigo", "authors": ["Dostoevskij"], "text": "Pietroburgo. "}],
+        target=[{"title": "Delitto e castigo", "authors": ["Fyodor Dostoyevsky"], "text": "Pietroburgo. "},
+                {"title": "Delitto e castigo", "authors": ["Mario Rossi"]}],
+    )
+    resolver = FakeResolver({})
+    resolver.same_people = {frozenset(("Dostoevskij", "Fyodor Dostoyevsky"))}
+    item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
+    assert item.action is Action.TRASH and item.match.authors == ["Fyodor Dostoyevsky"] and item.ai_used
+    assert sorted(resolver.person_calls) == [("Dostoevskij", "Fyodor Dostoyevsky"), ("Dostoevskij", "Mario Rossi")]
+
+
+def test_different_people_with_the_same_title_are_not_compared(libs):
+    src, tgt, trash = libs(source=[{"title": "Nebbia", "authors": ["James Herbert"]}],
+                           target=[{"title": "Nebbia", "authors": ["Frank Herbert"]}])
+    item = build_plan(src, tgt, trash, FakeResolver({}), author_variants=True).items[0]
+    assert item.action is Action.MOVE and item.reason == "not in target"
+
+
+def test_same_person_asks_in_english_and_caches(tmp_path):
+    from calibre_dedup.ai import AICache
+    from calibre_dedup.models import Book
+    from calibre_dedup.planner import AIResolver
+
+    class Text:
+        profile = type("P", (), {"kind": "fake", "base_url": "", "model": "t"})()
+        prompts = []
+
+        def chat(self, system, user, images=None):
+            Text.prompts.append((system, user))
+            return '{"verdict": "same", "reason": "typo"}'
+
+    resolver = AIResolver(Text(), None, AICache(tmp_path / "cache.json"))
+    book = Book(1, "T", ["A"], None, None, set(), {}, "", "b", str(tmp_path))
+    assert resolver.same_person(book, "Wilson Tucke", "Wilson Tucker") == (True, "AI: same person", True)
+    assert resolver.same_person(book, "Wilson Tucker", "Wilson Tucke") == (True, "AI: same person (cached)", False)
+    system, user = Text.prompts[0]
+    assert len(Text.prompts) == 1 and "same person" in system and 'Name 1: "Wilson Tucke"' in user
+    assert "titled" not in user  # no title given: names only
+    assert resolver.same_person(book, "Wilson Tucke", "Wilson Tucker", "Il mondo di Tucker")[2] is True  # own key
+    assert 'Both books are titled: "Il mondo di Tucker"' in Text.prompts[1][1]
+
+
+def test_first_names_as_initials_are_the_same_person_without_ai(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "L'astronave che sapeva", "authors": ["Scott, Melissa"], "text": "Silenzio nello spazio profondo. "}],
+        target=[{"title": "L'Astronave Che Sapeva", "authors": ["M.Scott"], "text": "Silenzio nello spazio profondo. "}],
+    )
+    resolver = FakeResolver({})
+    item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
+    assert item.action is Action.TRASH and "(initials)" in item.reason
+    assert resolver.person_calls == []

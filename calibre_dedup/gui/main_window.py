@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,19 +23,21 @@ from PySide6.QtWidgets import (
 
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
+from ..eta import Eta
 from ..executor import execute_plan
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
 from ..normalize import strip_accents
-from ..planner import build_plan
+from ..planner import NO_SERIES_REASON, build_plan, run_summary
 from ..report import write_csv
 from ..selection import (
     FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
     can_override, filter_key, mergeable_formats, override, revert,
 )
-from ..session import make_resolver, require_calibre_dir
+from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
+from .cover_preview import CoverPreview
 from .settings_dialog import SettingsDialog
-from .style import BLUE, GREEN, RED, button_css, set_running
+from .style import BLUE, GREEN, RED, button_css, mark_inactive, set_running, style_none_item
 
 log = logging.getLogger("calibre_dedup")
 
@@ -64,7 +67,9 @@ def _elastic(label: QLabel) -> QLabel:
 
 
 # --- logging into the GUI -----------------------------------------------------
-AI_LOG_COLOR = "#7b1fa2"  # purple: lines from or about the AI in the log panel
+# Lines from or about the AI in the log panel: purple, dark on a light background,
+# light on a dark one (Windows dark mode), so they stay readable in both.
+AI_LOG_COLOR = {"light": "#7b1fa2", "dark": "#d7a6ff"}
 
 
 class _LogSignal(QObject):
@@ -87,6 +92,47 @@ class QtLogHandler(logging.Handler):
         self.signal.message.emit(self.format(record), is_ai_record(record))
 
 
+def configure_logging(handler: QtLogHandler, filename: str) -> None:
+    """Log to the window and to a rotating file in the data folder."""
+    file_handler = RotatingFileHandler(config_dir() / filename, maxBytes=5_000_000,
+                                       backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    requested_level = os.environ.get("CALIBRE_DEDUP_LOG_LEVEL", "").upper()
+    level = getattr(logging, requested_level, logging.DEBUG if "--debug" in sys.argv[1:] else logging.INFO)
+    root.setLevel(level)
+    root.addHandler(handler)
+    root.addHandler(file_handler)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    log.info("Logging configured at %s", logging.getLevelName(level))
+
+
+def open_file(path: str) -> None:
+    """Open with the associated app, off the GUI thread: on Windows the shell
+    can block until the viewer answers, and a busy viewer would freeze us."""
+    log.info("Opening %s", path)
+    if sys.platform != "win32":  # Qt's opener belongs on the GUI thread; it doesn't block there
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            log.warning("Could not open %s: no associated application", path)
+        return
+
+    def run():
+        try:
+            os.startfile(path)
+        except OSError as e:
+            log.warning("Could not open %s: %s", path, e)
+    threading.Thread(target=run, daemon=True, name="open-file").start()
+
+
+def with_eta(status: str, eta: str) -> str:
+    """"Book 12 of 2066: Analyzing …" -> "Book 12 of 2066 · about 3 h 10 min left: Analyzing …"
+    (before the title, which is cut first when the window is narrow)."""
+    if not eta or not status.startswith("Book "):
+        return status
+    head, sep, rest = status.partition(": ")
+    return f"{head} · {eta}{sep}{rest}"
+
+
 # --- table model ----------------------------------------------------------------
 
 
@@ -98,7 +144,7 @@ def _is_checked(value) -> bool:
 
 class PlanModel(QAbstractTableModel):
     HEADERS = ["✓", "ID", "Title", "Authors", "Action", "Reason", "Match in target", "Add formats", "AI", "Result"]
-    COL_CHECK, COL_ID, COL_ACTION, COL_REASON, COL_RESULT = 0, 1, 4, 5, 9
+    COL_CHECK, COL_ID, COL_TITLE, COL_AUTHORS, COL_ACTION, COL_REASON, COL_RESULT = 0, 1, 2, 3, 4, 5, 9
     selection_changed = Signal()
 
     def __init__(self):
@@ -225,7 +271,9 @@ class PlanModel(QAbstractTableModel):
             " & ".join(ident.authors or it.source.authors),
             action_label(it) + (" (manual)" if it.manual else ""),
             f"{why_blocked} | {it.reason}" if why_blocked else it.reason,
-            (it.match.label() + (" (moving now)" if it.match_planned else "")) if it.match else "",
+            (it.match.label() + (" (moving now)" if it.match_planned else "")
+             + (" (different edition)" if it.different and it.action is not Action.TRASH else ""))
+            if it.match else "",
             ", ".join(it.add_formats),
             ", ".join(sorted(ident.ai_fields)) or ("nothing found" if it.ai_used else ""),
             it.status,
@@ -282,7 +330,8 @@ class PlanFilter(QSortFilterProxyModel):
         super().__init__()
         self.terms: list[str] = []
         self.action = ""
-        self.ai_only = self.formats_only = self.checked_only = self.failed_only = False
+        self.ai_only = self.formats_only = self.checked_only = self.failed_only = self.reduced_only = False
+        self.cover_only = False
         self.hide_unique = True
 
     def update(self, **kw):
@@ -307,8 +356,13 @@ class PlanFilter(QSortFilterProxyModel):
             return False
         if self.failed_only and not it.status.startswith("FAILED"):
             return False
+        if self.reduced_only and not it.skipped:
+            return False
+        if self.cover_only and not it.by_cover:
+            return False
         # Same library: books with no duplicate are usually most of the list.
-        if self.hide_unique and model.plan is not None and model.plan.same_library and has_no_duplicate(it):
+        if self.hide_unique and model.plan is not None and (
+                skipped_no_series(it) or (model.plan.same_library and has_no_duplicate(it))):
             return False
         if self.terms:
             hay = strip_accents(" ".join(str(x) for x in model.values(it)[1:7])).casefold()
@@ -316,11 +370,17 @@ class PlanFilter(QSortFilterProxyModel):
         return True
 
 
+def skipped_no_series(it: PlanItem) -> bool:
+    """Left untouched by the "same series" option: no series and number."""
+    return it.action is Action.LEAVE and it.planned_reason == NO_SERIES_REASON
+
+
 def has_no_duplicate(it: PlanItem) -> bool:
     """Left in place because no other book shares its title and authors, or every
     one that does is a different edition. The other Leave books need a look:
     undecided pairs, and books whose title/authors couldn't be read."""
-    return it.action is Action.LEAVE and it.match is None and it.identity.has_title_authors
+    return (it.action is Action.LEAVE and (it.match is None or it.different) and it.identity.has_title_authors
+            and not skipped_no_series(it))
 
 
 class PlanTable(QTableView):
@@ -339,17 +399,35 @@ class AnalyzeWorker(QThread):
     items_ready = Signal(object)  # list of books just decided, for the live table
     finished_ok = Signal(object)
     failed = Signal(str)
+    ai_down = Signal(str, bool)  # message, image AI: the GUI asks the user, then calls answer()
     BATCH_SECONDS = 0.3  # books with no duplicate go by by the thousand: send them in batches
 
     def __init__(self, settings: Settings, source: str, target: str, trash: str):
         super().__init__()
         self.settings, self.source, self.target, self.trash = settings, source, target, trash
         self.cancel = threading.Event()
+        self._answered = threading.Event()
+        self._retry = False
+
+    def ask(self, message: str, image: bool) -> bool:
+        """Called on the worker thread when an AI keeps failing: wait for the user.
+        True = retry; False = go on without that AI (or Stop was chosen)."""
+        self._answered.clear()
+        self._retry = False
+        self.ai_down.emit(message, image)
+        while not self._answered.wait(0.2):
+            if self.cancel.is_set():  # e.g. the window is closing
+                return False
+        return self._retry
+
+    def answer(self, retry: bool) -> None:
+        self._retry = retry
+        self._answered.set()
 
     def run(self):
         resolver = None
         try:
-            resolver = make_resolver(self.settings)
+            resolver = make_resolver(self.settings, on_down=self.ask)
             batch: list = []
             sent = time.monotonic()
 
@@ -366,6 +444,10 @@ class AnalyzeWorker(QThread):
                               similar_matching=self.settings.similar_matching,
                               cover_check=self.settings.cover_check,
                               recheck_years=self.settings.recheck_years,
+                              same_series=self.settings.same_series,
+                              similar_titles=self.settings.similar_titles,
+                              always_cover=self.settings.always_cover,
+                              author_variants=self.settings.author_variants,
                               on_item=on_item)
             if batch:
                 self.items_ready.emit(batch.copy())
@@ -416,8 +498,16 @@ class MainWindow(QMainWindow):
         self._restored = 0  # remembered choices re-applied to this analysis' books
         self._progress_max = 1
         self._status_msg, self._status_since = "", 0.0  # current book, for the seconds counter
+        self._eta = Eta()  # time left of the analysis
         self.setWindowTitle("Calibre Duplicate Remover")
         self._restore_geometry()
+        # Warnings about the shown plan: settings changed since, an AI that stopped
+        # responding, checks that could not run. Hidden when there is nothing to say.
+        self.notice = QLabel()
+        self.notice.setWordWrap(True)
+        self.notice.setTextFormat(Qt.RichText)
+        self.notice.setVisible(False)
+        self._plan_signature: dict | None = None  # analysis settings of the shown plan
 
         # libraries
         libs = QGroupBox("Libraries")
@@ -436,6 +526,7 @@ class MainWindow(QMainWindow):
             box.setEditText(value)
             box.setToolTip(tip)
             box.lineEdit().setPlaceholderText(tip)
+            box.editTextChanged.connect(self._update_notices)
             browse = QPushButton("Browse…")
             browse.clicked.connect(lambda _=False, b=box, l=label: self._browse(b, l))
             grid.addWidget(QLabel(label), r, 0)
@@ -446,11 +537,10 @@ class MainWindow(QMainWindow):
 
         # AI row
         self.text_box = _compact(QComboBox(), 24)
-        self.text_box.setToolTip("Reads book text to find missing metadata. None: metadata only, no AI at all.")
         self.image_box = _compact(QComboBox(), 24)
-        self.image_box.setToolTip("A model that reads text and images: compares covers and reads scanned PDFs.\n"
-                                  "Only profiles marked 'Supports images' are listed. Needs a text AI.")
-        self.text_box.currentIndexChanged.connect(self._fill_image_box)
+        # After _compact's own tooltip update (same signal, connected earlier).
+        self.text_box.currentTextChanged.connect(self._ai_choice_changed)
+        self.image_box.currentTextChanged.connect(self._ai_choice_changed)
         self._fill_profiles()
         settings_btn = QPushButton("Settings…")
         settings_btn.clicked.connect(self._open_settings)
@@ -498,13 +588,22 @@ class MainWindow(QMainWindow):
             lambda: self.proxy.update(action=self.action_filter.currentData()))
         self.toggles = {}
         for attr, label in [("ai_only", "AI used"), ("formats_only", "Adds formats"),
-                            ("checked_only", "Only checked"), ("failed_only", "Only failed")]:
+                            ("checked_only", "Only checked"), ("failed_only", "Only failed"),
+                            ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover")]:
             box = QCheckBox(label)
             box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
             self.toggles[attr] = box
+        self.toggles["reduced_only"].setToolTip(
+            "Books decided with fewer checks than the settings ask for: the cover check or year re-check\n"
+            "could not run (no Image AI, AI off), or an AI stopped responding during the analysis.\n"
+            "Analyze again once that is fixed (answers already received are cached).")
+        self.toggles["cover_only"].setToolTip(
+            "Duplicates proven by the same cover. With 'Always compare covers', also books whose\n"
+            "metadata differ (year, publisher, edition): check them before executing.")
         self.hide_unique = QCheckBox("Hide books with no duplicate")
-        self.hide_unique.setToolTip("Same-library analysis only: hide books left in the library because "
-                                    "no other book has the same title and authors")
+        self.hide_unique.setToolTip("Same-library analysis: hide books left in the library because no other "
+                                    "book has the same title and authors.\nWith the series option: also hide "
+                                    "books left untouched because they have no series number.")
         self.hide_unique.setChecked(self.proxy.hide_unique)
         self.hide_unique.toggled.connect(lambda on: self.proxy.update(hide_unique=on))
         self.hide_unique.setVisible(False)
@@ -561,8 +660,16 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
         log_handler.signal.message.connect(self._append_log)
+        # The selected book's cover and its match's, stacked, to compare them.
+        self.cover = CoverPreview()
+        self.table.selectionModel().currentRowChanged.connect(self._show_covers)
+        top = QSplitter(Qt.Horizontal)
+        top.addWidget(self.table)
+        top.addWidget(self.cover)
+        top.setStretchFactor(0, 1)
+        top.setSizes([1100, 200])
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.table)
+        splitter.addWidget(top)
         splitter.addWidget(self.log_view)
         splitter.setSizes([600, 150])
 
@@ -579,6 +686,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
         layout.addLayout(filter_row)
         layout.addLayout(bulk_row)
+        layout.addWidget(self.notice)
         layout.addWidget(splitter, 1)
         layout.addWidget(self.progress)
         layout.addWidget(self.status_label)
@@ -597,20 +705,74 @@ class MainWindow(QMainWindow):
         for p in self.settings.profiles:
             self.text_box.addItem(self._profile_label(p), p.name)
         self.text_box.setCurrentIndex(max(0, self.text_box.findData(self.settings.text_profile)))
+        style_none_item(self.text_box)
         self.text_box.blockSignals(False)
         self.image_box.clear()  # refilled from the saved setting
         self._fill_image_box()
 
     def _fill_image_box(self):
-        """Image AI choices: profiles that support images. Off when the text AI is off."""
+        """Image AI choices: profiles that support images. The choice is kept when the
+        text AI is None (it is only inactive then; see _ai_choice_changed)."""
         current = self.image_box.currentData() if self.image_box.count() else self.settings.image_profile
+        self.image_box.blockSignals(True)
         self.image_box.clear()
         self.image_box.addItem("None (no cover check, skip scanned PDFs)", "")
         for p in self.settings.profiles:
             if p.vision:
                 self.image_box.addItem(self._profile_label(p), p.name)
         self.image_box.setCurrentIndex(max(0, self.image_box.findData(current)))
-        self.image_box.setEnabled(bool(self.text_box.currentData()))
+        style_none_item(self.image_box)
+        self.image_box.blockSignals(False)
+        self._ai_choice_changed()
+
+    def _ai_choice_changed(self, *_):
+        """Amber italic for a choice that won't take effect: "None", or an Image AI
+        while the text AI is None. The choice itself is never changed."""
+        text_on = bool(self.text_box.currentData())
+        image_on = bool(self.image_box.currentData())
+        mark_inactive(self.text_box, not text_on)
+        self.text_box.setToolTip(
+            "Reads book text to find missing metadata.\n"
+            + ("None: metadata only, no AI at all (no year re-check, no cover check)." if not text_on
+               else self.text_box.currentText()))
+        mark_inactive(self.image_box, not (text_on and image_on))
+        tip = ("A model that reads text and images: compares covers and reads scanned PDFs.\n"
+               "Only profiles marked 'Supports images' are listed.\n")
+        if not image_on:
+            tip += "None: covers aren't compared and scanned PDFs aren't read."
+        elif not text_on:
+            tip += f"Inactive: the Text AI is None. {self.image_box.currentText()} will be used when it's set."
+        else:
+            tip += self.image_box.currentText()
+        self.image_box.setToolTip(tip)
+        self._update_notices()
+
+    def _current_settings(self) -> Settings:
+        """The settings as shown in the window, without saving them."""
+        return replace(
+            self.settings, source_library=self._library("source"), target_library=self._library("target"),
+            trash_library=self._library("trash"), text_profile=self.text_box.currentData() or "",
+            image_profile=self.image_box.currentData() or "")
+
+    def _update_notices(self, *_):
+        """The amber bar above the table: what the user should know about the shown plan."""
+        lines = []
+        if self.plan is not None and self._plan_signature is not None and not self._busy:
+            changed = changed_settings(self._plan_signature, analysis_signature(self._current_settings()))
+            if changed:
+                lines.append(f"<b>Settings changed since this analysis</b> ({', '.join(changed)}): "
+                             "analyze again to apply them.")
+        if self.plan is not None and not (self._busy and self._operation == "analyze"):
+            _, warnings = run_summary(self.plan)
+            lines += [html.escape(w) for w in warnings]
+            if any(it.skipped for it in self.plan.items):
+                lines.append("Tick <b>Reduced checks</b> to list these books.")
+        dark = self.palette().color(self.backgroundRole()).lightness() < 128
+        self.notice.setStyleSheet(
+            "QLabel { background: %s; color: %s; border: 1px solid %s; border-radius: 3px; padding: 4px 8px; }"
+            % (("#3d2a00", "#ffd699", "#8a5a00") if dark else ("#fff3dc", "#5c3900", "#e0a030")))
+        self.notice.setText("<br>".join(f"⚠ {line}" for line in lines))
+        self.notice.setVisible(bool(lines))
 
     def _browse(self, box: QComboBox, label: str):
         d = QFileDialog.getExistingDirectory(self, label, box.currentText())
@@ -687,6 +849,7 @@ class MainWindow(QMainWindow):
         for btn in (self.check_btn, self.uncheck_btn, self.invert_btn):
             btn.setEnabled(editable)
         self._update_summary()
+        self._update_notices()
 
     def _update_summary(self):
         p = self.plan
@@ -773,12 +936,28 @@ class MainWindow(QMainWindow):
         text = f"{head}: {move} move, {trash} trash, {leave} leave"
         if leave:
             unique = sum(1 for it in self.plan.items if has_no_duplicate(it))
-            text += f" ({leave - unique} to review, {unique} with no duplicate)"
+            no_series = sum(1 for it in self.plan.items if skipped_no_series(it))
+            text += f" ({leave - unique - no_series} to review, {unique} with no duplicate"
+            text += f", {no_series} without series number)" if no_series else ")"
         text += f" · total {total}"
         hidden = total - self.proxy.rowCount()
         if hidden:
             text += f" · {hidden} hidden by filters"
-        self.status_label.setText(text)
+        info, _ = run_summary(self.plan)
+        self.status_label.setText(f"{text} · {info}")
+        self.status_label.setToolTip(info)
+
+    def _show_covers(self, current: QModelIndex, _previous=None):
+        if not current.isValid():
+            self.cover.clear()
+            return
+        it = self.model.items[self.proxy.mapToSource(current).row()]
+        if it.match is None:
+            self.cover.show_books([("This book", it.source), ("Match", None)], empty="No match")
+            return
+        match = "Match" + (" (moving now)" if it.match_planned else "") + (
+            " (different edition)" if it.different else "")
+        self.cover.show_books([("This book", it.source), (match, it.match)])
 
     def _toggle_selected_rows(self):
         items = [i for i in self._selected_items() if i.action is not Action.LEAVE]
@@ -791,8 +970,16 @@ class MainWindow(QMainWindow):
         if not index.isValid():
             return
         menu = QMenu(self)
-        # Opening files changes nothing: available even while analyzing or executing.
-        self._add_open_actions(menu, self.model.items[self.proxy.mapToSource(index).row()])
+        # Opening files and copying change nothing: available even while analyzing or executing.
+        item = self.model.items[self.proxy.mapToSource(index).row()]
+        self._add_open_actions(menu, item)
+        menu.addSeparator()
+        values = self.model.values(item)  # what the Title and Authors columns show
+        for label, text in (("Copy title", values[PlanModel.COL_TITLE]),
+                            ("Copy author", values[PlanModel.COL_AUTHORS])):
+            act = menu.addAction(label)
+            act.setEnabled(bool(text))
+            act.triggered.connect(lambda _=False, t=text: QApplication.clipboard().setText(t))
         items = self._selected_items()
         if items and self._can_edit():
             menu.addSeparator()
@@ -826,34 +1013,27 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(self.OPEN_SECOND_AFTER_MS, lambda: self._open_file(second))
 
     def _open_file(self, path: str):
-        """Open with the associated app, off the GUI thread: on Windows the shell
-        can block until the viewer answers, and a busy viewer would freeze us."""
-        log.info("Opening %s", path)
-        if sys.platform != "win32":  # Qt's opener belongs on the GUI thread; it doesn't block there
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-                log.warning("Could not open %s: no associated application", path)
-            return
-
-        def run():
-            try:
-                os.startfile(path)
-            except OSError as e:
-                log.warning("Could not open %s: %s", path, e)
-        threading.Thread(target=run, daemon=True, name="open-file").start()
+        open_file(path)
 
     def _add_override_actions(self, menu: QMenu, items: list[PlanItem]):
         same = self.plan.same_library
 
         def fits(i: PlanItem, action: Action, merge: bool | None) -> bool:
-            # merge: None = any; True/False = the duplicate has / has no formats to merge
-            return (i.action is not action and can_override(i, action, same)
-                    and (merge is None or bool(mergeable_formats(i)) == merge))
+            # merge: None = any; True = Merge & Trash (needs a match with formats to add);
+            # False = Trash only: always possible, nothing is merged
+            if not can_override(i, action, same):
+                return False
+            if action is not Action.TRASH:
+                return i.action is not action
+            if merge:
+                return bool(mergeable_formats(i)) and not (i.action is Action.TRASH and i.add_formats)
+            return not (i.action is Action.TRASH and not i.add_formats)
 
         # One library: finding duplicates, so a book can only be merged/trashed or kept.
         choices = [] if same else [(Action.MOVE, None, "Force move to target")]
         choices += [
-            (Action.TRASH, True, f"Force {MERGE_LABEL} (duplicate of the match, has extra formats)"),
-            (Action.TRASH, False, "Force Trash only (duplicate of the match, nothing to merge)"),
+            (Action.TRASH, True, f"Force {MERGE_LABEL} (add its extra formats to the match, then trash)"),
+            (Action.TRASH, False, "Force Trash only (nothing merged; with no match it will only be in the trash library)"),
             (Action.LEAVE, None, "Keep in library" if same else "Keep in source"),
         ]
         for action, merge, label in choices:
@@ -861,25 +1041,23 @@ class MainWindow(QMainWindow):
             act = menu.addAction(f"{label} ({n})" if len(items) > 1 else label)
             act.setEnabled(n > 0)
             act.triggered.connect(
-                lambda _=False, a=action, m=merge: self._override([i for i in items if fits(i, a, m)], a))
+                lambda _=False, a=action, m=merge: self._override([i for i in items if fits(i, a, m)], a, m))
         menu.addSeparator()
         n = sum(1 for i in items if i.manual)
         act = menu.addAction(f"Revert to analysis decision ({n})" if len(items) > 1 else "Revert to analysis decision")
         act.setEnabled(n > 0)
         act.triggered.connect(lambda: self._revert(items))
 
-    def _override(self, items: list[PlanItem], action: Action):
+    def _override(self, items: list[PlanItem], action: Action, merge: bool | None = None):
         skipped = 0
         same = self.plan.same_library
         for it in items:
-            if it.action is action:
-                continue
             if can_override(it, action, same):
-                override(it, action, same)
+                override(it, action, same, merge is not False)
             else:
                 skipped += 1
         if skipped:
-            self.status_label.setText(f"{skipped} book(s) skipped: no matching target book to be a duplicate of.")
+            self.status_label.setText(f"{skipped} book(s) skipped: already in the target library.")
         self.model.refresh()
 
     def _revert(self, items: list[PlanItem]):
@@ -897,14 +1075,16 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, text: str, ai: bool):
         if ai:  # kept as plain text (the JSON replies' indentation too), only coloured
-            self.log_view.appendHtml(f"<span style='color:{AI_LOG_COLOR}; white-space:pre-wrap'>"
+            color = AI_LOG_COLOR["dark" if self.log_view.palette().base().color().lightness() < 128 else "light"]
+            self.log_view.appendHtml(f"<span style='color:{color}; white-space:pre-wrap'>"
                                      f"{html.escape(text)}</span>")
         else:
             self.log_view.appendHtml(f"<span style='white-space:pre-wrap'>{html.escape(text)}</span>")
 
     def _open_settings(self):
         self._sync_settings()
-        dialog = SettingsDialog(self.settings, self)
+        dialog = SettingsDialog(self.settings, self,
+                                cache_busy=self.worker is not None and self._operation == "analyze")
         try:
             if dialog.exec():
                 self._fill_profiles()
@@ -914,21 +1094,91 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
 
     # --- analyze --------------------------------------------------------------------
+    def _preflight_ok(self) -> bool:
+        """Settings that are on but won't take effect, and AIs that can't be reached:
+        tell the user before the analysis starts. False = don't start."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)  # pinging a local AI server takes up to a few seconds
+        try:
+            issues = [i for i in preflight(self.settings)
+                      if not (i.dismissable and i.key in self.settings.dismissed_warnings)]
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not issues:
+            return True
+        box = QMessageBox(QMessageBox.Warning, "Before analyzing",
+                          "Some settings won't take effect in this analysis:", parent=self)
+        box.setInformativeText("\n\n".join(f"• {i.message}" for i in issues))
+        fix = next((i.fix_image_profile for i in issues if i.fix_image_profile), "")
+        fix_btn = box.addButton(f"Use {fix!r} as Image AI and analyze", QMessageBox.AcceptRole) if fix else None
+        go_btn = box.addButton("Analyze anyway", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(fix_btn or go_btn)
+        dismissable = [i.key for i in issues if i.dismissable]
+        dont_ask = None
+        if dismissable:
+            dont_ask = QCheckBox("Don't warn me again about these settings (unreachable AIs are always shown)"
+                                 if len(dismissable) < len(issues) else "Don't warn me again about these")
+            box.setCheckBox(dont_ask)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (fix_btn, go_btn):
+            return False
+        if dont_ask is not None and dont_ask.isChecked():
+            self.settings.dismissed_warnings = sorted(set(self.settings.dismissed_warnings) | set(dismissable))
+        if clicked is fix_btn:
+            self.image_box.setCurrentIndex(max(0, self.image_box.findData(fix)))
+        self._sync_settings()
+        return True
+
+    def _on_ai_down(self, message: str, image: bool):
+        """The worker waits for this answer: Retry, go on without that AI, or Stop."""
+        worker = self.worker
+        if not isinstance(worker, AnalyzeWorker):
+            return
+        if self._close_pending:
+            worker.answer(False)
+            return
+        what = "image AI" if image else "text AI"
+        box = QMessageBox(QMessageBox.Warning, "AI not responding", message, parent=self)
+        box.setInformativeText(
+            f"Retry: try the same request again (e.g. after starting the server).\n"
+            f"Continue without the {what}: the rest of this analysis is decided without it; "
+            "those books are marked (filter: Reduced checks). The setting isn't changed: "
+            "the next analysis tries it again.\n"
+            "Stop: keep the books analyzed so far.")
+        retry = box.addButton("Retry", QMessageBox.AcceptRole)
+        go_on = box.addButton(f"Continue without the {what}", QMessageBox.RejectRole)
+        stop = box.addButton("Stop", QMessageBox.DestructiveRole)
+        box.setDefaultButton(retry)
+        box.setEscapeButton(go_on)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is stop:
+            self._stop()
+        log.info("AI not responding: user chose %s", "retry" if clicked is retry else
+                 "stop" if clicked is stop else f"continue without the {what}")
+        worker.answer(clicked is retry)
+
     def _analyze(self):
         self._sync_settings()
+        if not self._preflight_ok():
+            return
+        self._plan_signature = analysis_signature(self.settings)
         source, target, trash = (self._library(k) for k in ("source", "target", "trash"))
         same = bool(source) and str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
         # Rows appear as books are decided; the table is read-only and unsorted until the end.
         self.plan = Plan(source, target, trash, same_library=same)
+        self._eta.reset()
         self.model.start_live(self.plan)
         self._restored = 0
-        self.hide_unique.setVisible(same)
+        self.hide_unique.setVisible(same or self.settings.same_series)
         self._fill_action_filter(same)
         worker = AnalyzeWorker(self.settings, source, target, trash)
         worker.progress.connect(self._on_progress)
         worker.items_ready.connect(self._on_items)
         worker.finished_ok.connect(self._analysis_done)
         worker.failed.connect(self._analysis_failed)
+        worker.ai_down.connect(self._on_ai_down)
         self._start(worker, "analyze")
         log.info("Analysis started")
 
@@ -941,6 +1191,7 @@ class MainWindow(QMainWindow):
 
     def _analysis_failed(self, message: str):
         self.plan = None
+        self._plan_signature = None
         self.model.set_plan(None)
         self._worker_failed(message)
 
@@ -950,6 +1201,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(done)
         if msg.startswith("Analyzing ") and total:
             msg = f"Book {min(done + 1, total)} of {total}: {msg}"
+            self._eta.update(done, total)
         self._status_msg, self._status_since = msg, time.monotonic()
         self._show_status()
 
@@ -957,7 +1209,7 @@ class MainWindow(QMainWindow):
         """Current book, plus seconds spent on it: an AI answer can take minutes."""
         if not self._busy or not self._status_msg:
             return
-        text = self._status_msg
+        text = with_eta(self._status_msg, self._eta.text() if self._operation == "analyze" else "")
         if self._stopping:
             text = f"Stopping after the current book… · {text}"
         elapsed = int(time.monotonic() - self._status_since)
@@ -970,7 +1222,7 @@ class MainWindow(QMainWindow):
         restored = self._restored  # applied batch by batch as books were decided
         self.plan = plan
         self.model.set_plan(plan)
-        self.hide_unique.setVisible(plan.same_library)
+        self.hide_unique.setVisible(plan.same_library or any(skipped_no_series(it) for it in plan.items))
         self._fill_action_filter(plan.same_library)
         log.debug("Plan model populated: items=%d", len(plan.items))
         self._finish()
@@ -982,6 +1234,11 @@ class MainWindow(QMainWindow):
                  plan.count(Action.MOVE), plan.count(Action.TRASH), plan.count(Action.LEAVE))
         if restored:
             log.info("Restored %d manual choice(s) from a previous analysis of these libraries", restored)
+        info, warnings = run_summary(plan)
+        log.info("Analysis checks: %s", info)
+        for w in warnings:
+            log.warning("Analysis checks: %s", w)
+        self._update_notices()
         if plan.stop_reason and not self._close_pending:
             QMessageBox.warning(
                 self, "Analysis stopped",
@@ -1004,10 +1261,13 @@ class MainWindow(QMainWindow):
         trashes = len(todo) - moves
         where = "permanently deleted" if self.settings.delete_permanently else "moved to Calibre's recycle bin"
         n_blocked = len(self.model.blocked)
+        no_copy = sum(1 for i in todo if i.action is Action.TRASH and i.match is None)
         answer = QMessageBox.question(
             self, "Execute checked books",
             f"{moves} books will be moved to the target library.\n"
             f"{trashes} duplicates will be moved to the trash library.\n"
+            + (f"   {no_copy} of them (forced) have no copy in the target: "
+               "they will only be in the trash library.\n" if no_copy else "") +
             f"{len(p.items) - len(todo)} books stay in the source library"
             + (f" (including {n_blocked} blocked)" if n_blocked else "") + ".\n\n"
             f"After a verified copy, each book is {where} in the source library.\n\nContinue?")
@@ -1129,17 +1389,7 @@ class MainWindow(QMainWindow):
 
 def run_gui() -> int:
     handler = QtLogHandler()
-    file_handler = RotatingFileHandler(config_dir() / "calibre_dedup.log", maxBytes=5_000_000,
-                                       backupCount=3, encoding="utf-8")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root = logging.getLogger()
-    requested_level = os.environ.get("CALIBRE_DEDUP_LOG_LEVEL", "").upper()
-    level = getattr(logging, requested_level, logging.DEBUG if "--debug" in sys.argv[1:] else logging.INFO)
-    root.setLevel(level)
-    root.addHandler(handler)
-    root.addHandler(file_handler)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    log.info("Logging configured at %s", logging.getLevelName(level))
+    configure_logging(handler, "calibre_dedup.log")
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Calibre Duplicate Remover")

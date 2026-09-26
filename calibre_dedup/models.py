@@ -21,6 +21,9 @@ class Book:
     has_cover: bool = False
     comments: str | None = None
     asins: set[str] = field(default_factory=set)  # Amazon ids (mobi-asin, amazon*)
+    series: str | None = None
+    series_index: float | None = None  # only meaningful with a series
+    tags: set[str] = field(default_factory=set)
 
     def label(self) -> str:
         return f"{self.title} — {' & '.join(self.authors)}"
@@ -42,12 +45,15 @@ class Identity:
     ai_year: int | None = None
     ai_publisher: str | None = None
     asins: set[str] = field(default_factory=set)  # from metadata only
+    # (normalized series name, number): set only with the "same series" option and
+    # a real number (not Calibre's default 1). Same series and number = same book.
+    series: tuple[str, float] | None = None
 
     def copy(self) -> "Identity":
         return Identity(
             self.title, list(self.authors), self.publisher, self.edition,
             self.year, set(self.isbns), set(self.ai_fields), self.ai_year, self.ai_publisher,
-            set(self.asins),
+            set(self.asins), self.series,
         )
 
     @property
@@ -73,8 +79,15 @@ class PlanItem:
     identity: Identity
     match: Book | None = None  # the target copy (or a source book planned to move)
     match_planned: bool = False  # True if `match` is a source book being moved
+    # `match` is a different edition, not a duplicate: kept so the user can still
+    # force Trash into it (and open it to compare).
+    different: bool = False
     add_formats: list[str] = field(default_factory=list)  # formats to add to the target copy
     ai_used: bool = False
+    # Checks that were wanted for this book but could not run (see planner.SKIP_*),
+    # e.g. the cover check with no Image AI, or the AI turned off after errors.
+    skipped: list[str] = field(default_factory=list)
+    by_cover: bool = False  # a duplicate because the covers are the same
     status: str = ""  # filled during execution
     selected: bool = True  # user wants this item executed (meaningless for LEAVE)
     manual: bool = False  # action overridden by the user
@@ -100,6 +113,10 @@ class Plan:
     stopped: bool = False  # analysis was stopped: only some source books have an item
     stop_reason: str = ""  # why it stopped by itself (e.g. a disk error); empty when the user stopped it
     same_library: bool = False  # duplicates within one library (source == target)
+    # What the AI did (planner.AIResolver.stats) plus "year_rechecks", for the summary.
+    stats: dict[str, int] = field(default_factory=dict)
+    # An AI that stopped responding during the run, e.g. "text AI stopped at book 812 of 2066".
+    ai_down: list[str] = field(default_factory=list)
 
     def count(self, action: Action) -> int:
         return sum(1 for i in self.items if i.action is action)

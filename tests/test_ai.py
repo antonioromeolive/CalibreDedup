@@ -78,6 +78,25 @@ def test_every_provider_sends_the_advanced_parameters(kind, monkeypatch):
     assert sent["reasoning_effort"] == "none" and "messages" in sent
 
 
+def test_azure_content_filter_is_a_filtered_error(monkeypatch):
+    class Refused(FakeResponse):
+        status_code = 400
+        text = "..."
+    body = {"error": {"code": "content_filter", "status": 400, "innererror": {
+        "code": "ResponsibleAIPolicyViolation", "content_filter_result": {
+            "hate": {"filtered": False, "severity": "safe"}, "jailbreak": {"detected": False, "filtered": False},
+            "violence": {"filtered": True, "severity": "high"}}}}}
+    monkeypatch.setattr(ai.requests, "post", lambda *a, **k: Refused(body))
+    monkeypatch.setattr(ProviderProfile, "api_key", property(lambda self: "key"))
+    with pytest.raises(AIError, match=r"content filter refused the request \(violence\)") as e:
+        make_provider(profile(AZURE, [])).chat("s", "u")
+    assert e.value.filtered and e.value.status == 400
+    monkeypatch.setattr(ai.requests, "post", lambda *a, **k: Refused({"error": {"code": "BadRequest"}}))
+    with pytest.raises(AIError, match="Azure OpenAI error 400") as e:
+        make_provider(profile(AZURE, [])).chat("s", "u")
+    assert not e.value.filtered
+
+
 def test_invalid_parameters_are_not_sent(monkeypatch):
     monkeypatch.setattr(ai.requests, "post", lambda *a, **k: pytest.fail("must not be sent"))
     with pytest.raises(AIError, match="Invalid advanced parameters"):
@@ -223,3 +242,15 @@ def test_unexpected_errors_are_shown_not_raised():
 def test_invalid_json_shows_the_reply():
     ok, report = run_test(ScriptedProvider('{"title": "Il guardiano", oops}'))
     assert not ok and "not valid JSON" in report and '{"title": "Il guardiano", oops}' in report
+
+
+@pytest.mark.parametrize("url,version,expected", [
+    ("https://r.openai.azure.com", "2024-10-21", ("https://r.openai.azure.com", False)),
+    ("https://r.openai.azure.com/", "v1", ("https://r.openai.azure.com", True)),
+    ("https://r.services.ai.azure.com/openai/v1", "2024-10-21", ("https://r.services.ai.azure.com", True)),
+    ("https://r.services.ai.azure.com/openai/v1/", "v1", ("https://r.services.ai.azure.com", True)),
+    ("https://r.openai.azure.com/openai/", "2024-10-21", ("https://r.openai.azure.com", False)),
+])
+def test_azure_endpoint_as_shown_in_the_portal_is_accepted(url, version, expected):
+    from calibre_dedup.ai import azure_endpoint
+    assert azure_endpoint(url, version) == expected

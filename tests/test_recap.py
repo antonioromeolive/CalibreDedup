@@ -24,3 +24,25 @@ def test_no_duplicate_means_left_with_nothing_to_compare_or_only_different_editi
 ])
 def test_everything_else_is_not_counted_as_no_duplicate(it):
     assert not has_no_duplicate(it)
+
+
+def test_books_left_untouched_by_the_series_option_are_counted_apart():
+    from calibre_dedup.gui.main_window import skipped_no_series
+    from calibre_dedup.planner import NO_SERIES_REASON
+    skipped = PlanItem(item(Action.LEAVE).source, Action.LEAVE, NO_SERIES_REASON, Identity(title="Dune", authors=["X"]))
+    assert skipped_no_series(skipped) and not has_no_duplicate(skipped)
+    assert not skipped_no_series(item(Action.LEAVE))
+
+
+def test_a_different_edition_left_in_place_still_counts_as_no_duplicate():
+    it = item(Action.LEAVE, match=OTHER)
+    it.different = True
+    assert has_no_duplicate(it)
+
+
+def test_time_left_goes_before_the_title():
+    from calibre_dedup.gui.main_window import with_eta
+    assert with_eta("Book 12 of 2066: Analyzing Dune: part 1", "about 3 h 10 min left") == \
+        "Book 12 of 2066 · about 3 h 10 min left: Analyzing Dune: part 1"
+    assert with_eta("Book 12 of 2066: Analyzing Dune", "") == "Book 12 of 2066: Analyzing Dune"
+    assert with_eta("Reading libraries", "about 1 h 00 min left") == "Reading libraries"

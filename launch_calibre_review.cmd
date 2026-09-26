@@ -25,14 +25,14 @@ echo(%* | findstr /i /c:"--cli" >nul
 if not errorlevel 1 goto cli
 
 rem The window: started without a console, and this script ends at once.
-rem If nothing appears, run it from a console to see the error:  python -m calibre_dedup
-start "" %PYTHONW% -m calibre_dedup %*
+rem If nothing appears, run it from a console to see the error:  python -m calibre_dedup.review_app
+start "" %PYTHONW% -m calibre_dedup.review_app %*
 exit /b 0
 
 :cli
-%PYTHON% -m calibre_dedup %*
+%PYTHON% -m calibre_dedup.review_app %*
 if errorlevel 1 (
     echo.
-    echo Calibre Duplicate Remover ended with an error.
+    echo Calibre Metadata Review ended with an error.
     pause
 )

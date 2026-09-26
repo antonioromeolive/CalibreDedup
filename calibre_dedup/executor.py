@@ -82,10 +82,12 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
             if update_metadata and item.identity.ai_fields:
                 a["set"] = _ai_values(item)
             actions.append(a)
-        elif item.action is Action.TRASH and item.match is not None:
+        elif item.action is Action.TRASH:
             a = {"op": "trash", "src_id": item.source.id, "title": item.source.title,
                  "add_formats": item.add_formats}
-            if item.match_planned:
+            if item.match is None:  # forced by the user: no target copy to check or merge into
+                a["no_target"] = True
+            elif item.match_planned:
                 a["target_src_id"] = item.match.id
             else:
                 a["target_id"] = item.match.id
@@ -116,29 +118,17 @@ def _ai_values(item: PlanItem) -> dict:
     return values
 
 
-def execute_plan(
-    plan: Plan, calibre_dir: Path, update_metadata: bool = True, permanent: bool = False,
-    on_result: Callable[[PlanItem, bool, str], None] | None = None,
-    cancel: threading.Event | None = None,
-) -> tuple[int, int]:
-    """Execute MOVE and TRASH items. Returns (succeeded, failed)."""
-    if calibre_is_running():
-        raise ExecutionError("Calibre is running. Close Calibre (and calibre-server) before executing the plan.")
-    actions = plan_actions(plan, update_metadata)
-    if not actions:
-        return 0, 0
+def run_bridge(calibre_dir: Path, payload: dict, on_message: Callable[[dict], None],
+               cancel: threading.Event | None = None) -> None:
+    """Run bridge_script.py in calibre-debug with `payload` as its plan, calling
+    `on_message` for each "result" / "stopped" event it prints. Holds the
+    execution lock: only one plan (of any CalibreDedup program) runs at a time."""
     execution_lock = _ExecutionLock()
     execution_lock.acquire()
-    items = {i.source.id: i for i in plan.items}
-    ok = failed = 0
-
     try:
         with tempfile.TemporaryDirectory(prefix="cdr_exec_") as tmp:
             plan_file = Path(tmp) / "plan.json"
-            plan_file.write_text(json.dumps({
-                "source": plan.source_library, "target": plan.target_library, "trash": plan.trash_library,
-                "permanent": permanent, "actions": actions,
-            }), encoding="utf-8")
+            plan_file.write_text(json.dumps(payload), encoding="utf-8")
             proc = subprocess.Popen(
                 [str(tool(calibre_dir, "calibre-debug")), str(BRIDGE), str(plan_file)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -164,19 +154,7 @@ def execute_plan(
                         log.info("calibre: %s", line.rstrip())
                     continue
                 msg = json.loads(line[6:])
-                if msg["event"] == "result":
-                    item = items[msg["src_id"]]
-                    item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
-                    if msg["ok"]:
-                        ok += 1
-                        log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
-                    else:
-                        failed += 1
-                        _keep_failed_in_source(item)
-                        log.error("Book %s (%s): %s", item.source.id, item.source.title, msg.get("trace") or msg["msg"])
-                    if on_result:
-                        on_result(item, msg["ok"], msg["msg"])
-                elif msg["event"] == "stopped":
+                if msg["event"] == "stopped":
                     log.warning("Execution stopped by user")
                 elif msg["event"] == "cleanup_start":
                     log.info("Removing empty source folders…")
@@ -185,9 +163,47 @@ def execute_plan(
                              msg["removed"], msg["deferred"])
                 elif msg["event"] == "done":
                     done = True
+                else:
+                    on_message(msg)
             proc.wait()
             if not done:
                 raise ExecutionError(f"calibre-debug exited with code {proc.returncode}; see the log for details")
-        return ok, failed
     finally:
         execution_lock.release()
+
+
+def execute_plan(
+    plan: Plan, calibre_dir: Path, update_metadata: bool = True, permanent: bool = False,
+    on_result: Callable[[PlanItem, bool, str], None] | None = None,
+    cancel: threading.Event | None = None,
+) -> tuple[int, int]:
+    """Execute MOVE and TRASH items. Returns (succeeded, failed)."""
+    if calibre_is_running():
+        raise ExecutionError("Calibre is running. Close Calibre (and calibre-server) before executing the plan.")
+    actions = plan_actions(plan, update_metadata)
+    if not actions:
+        return 0, 0
+    items = {i.source.id: i for i in plan.items}
+    ok = failed = 0
+
+    def on_message(msg: dict) -> None:
+        nonlocal ok, failed
+        if msg["event"] != "result":
+            return
+        item = items[msg["src_id"]]
+        item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
+        if msg["ok"]:
+            ok += 1
+            log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
+        else:
+            failed += 1
+            _keep_failed_in_source(item)
+            log.error("Book %s (%s): %s", item.source.id, item.source.title, msg.get("trace") or msg["msg"])
+        if on_result:
+            on_result(item, msg["ok"], msg["msg"])
+
+    run_bridge(calibre_dir, {
+        "source": plan.source_library, "target": plan.target_library, "trash": plan.trash_library,
+        "permanent": permanent, "actions": actions,
+    }, on_message, cancel)
+    return ok, failed
