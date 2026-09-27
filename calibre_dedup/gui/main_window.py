@@ -28,7 +28,9 @@ from ..executor import execute_plan
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
 from ..normalize import strip_accents
-from ..planner import NO_SERIES_REASON, build_plan, run_summary
+from ..planner import (
+    AI_OFF, MAX_CONSECUTIVE_AI_ERRORS, NO_SERIES_REASON, RETRY, SKIP_BOOK, build_plan, run_summary,
+)
 from ..report import write_csv
 from ..selection import (
     FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
@@ -90,6 +92,27 @@ class QtLogHandler(logging.Handler):
 
     def emit(self, record):
         self.signal.message.emit(self.format(record), is_ai_record(record))
+
+
+def ask_ai_down(parent, message: str, what: str, more_help: str) -> str | None:
+    """The "AI not responding" dialog: RETRY, SKIP_BOOK, AI_OFF, or None for Stop."""
+    box = QMessageBox(QMessageBox.Warning, "AI not responding", message, parent=parent)
+    box.setInformativeText(
+        "Retry: try the same request again (e.g. after starting the server).\n"
+        f"Skip this book: go on to the next book with the {what}; you are asked again only "
+        f"if it fails {MAX_CONSECUTIVE_AI_ERRORS} more times in a row.\n" + more_help)
+    retry = box.addButton("Retry", QMessageBox.AcceptRole)
+    skip = box.addButton("Skip this book", QMessageBox.AcceptRole)
+    go_on = box.addButton(f"Continue without the {what}", QMessageBox.RejectRole)
+    stop = box.addButton("Stop", QMessageBox.DestructiveRole)
+    box.setDefaultButton(skip)
+    box.setEscapeButton(skip)
+    box.exec()
+    clicked = box.clickedButton()
+    choice = {retry: RETRY, skip: SKIP_BOOK, go_on: AI_OFF}.get(clicked, SKIP_BOOK if clicked is not stop else None)
+    log.info("AI not responding: user chose %s", {RETRY: "retry", SKIP_BOOK: "skip this book",
+                                                    AI_OFF: f"continue without the {what}", None: "stop"}[choice])
+    return choice
 
 
 def configure_logging(handler: QtLogHandler, filename: str) -> None:
@@ -407,21 +430,21 @@ class AnalyzeWorker(QThread):
         self.settings, self.source, self.target, self.trash = settings, source, target, trash
         self.cancel = threading.Event()
         self._answered = threading.Event()
-        self._retry = False
+        self._choice = AI_OFF
 
-    def ask(self, message: str, image: bool) -> bool:
+    def ask(self, message: str, image: bool) -> str:
         """Called on the worker thread when an AI keeps failing: wait for the user.
-        True = retry; False = go on without that AI (or Stop was chosen)."""
+        RETRY, SKIP_BOOK, or AI_OFF: go on without that AI (also when Stop was chosen)."""
         self._answered.clear()
-        self._retry = False
+        self._choice = AI_OFF
         self.ai_down.emit(message, image)
         while not self._answered.wait(0.2):
             if self.cancel.is_set():  # e.g. the window is closing
-                return False
-        return self._retry
+                return AI_OFF
+        return self._choice
 
-    def answer(self, retry: bool) -> None:
-        self._retry = retry
+    def answer(self, choice: str) -> None:
+        self._choice = choice
         self._answered.set()
 
     def run(self):
@@ -1131,33 +1154,22 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_ai_down(self, message: str, image: bool):
-        """The worker waits for this answer: Retry, go on without that AI, or Stop."""
+        """The worker waits for this answer: Retry, skip the book, go on without that AI, or Stop."""
         worker = self.worker
         if not isinstance(worker, AnalyzeWorker):
             return
         if self._close_pending:
-            worker.answer(False)
+            worker.answer(AI_OFF)
             return
         what = "image AI" if image else "text AI"
-        box = QMessageBox(QMessageBox.Warning, "AI not responding", message, parent=self)
-        box.setInformativeText(
-            f"Retry: try the same request again (e.g. after starting the server).\n"
-            f"Continue without the {what}: the rest of this analysis is decided without it; "
-            "those books are marked (filter: Reduced checks). The setting isn't changed: "
-            "the next analysis tries it again.\n"
-            "Stop: keep the books analyzed so far.")
-        retry = box.addButton("Retry", QMessageBox.AcceptRole)
-        go_on = box.addButton(f"Continue without the {what}", QMessageBox.RejectRole)
-        stop = box.addButton("Stop", QMessageBox.DestructiveRole)
-        box.setDefaultButton(retry)
-        box.setEscapeButton(go_on)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is stop:
+        choice = ask_ai_down(self, message, what,
+                             f"Continue without the {what}: the rest of this analysis is decided without it; "
+                             "those books are marked (filter: Reduced checks). The setting isn't changed: "
+                             "the next analysis tries it again.\n"
+                             "Stop: keep the books analyzed so far.")
+        if choice is None:
             self._stop()
-        log.info("AI not responding: user chose %s", "retry" if clicked is retry else
-                 "stop" if clicked is stop else f"continue without the {what}")
-        worker.answer(clicked is retry)
+        worker.answer(choice or AI_OFF)
 
     def _analyze(self):
         self._sync_settings()

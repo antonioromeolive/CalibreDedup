@@ -1,4 +1,4 @@
-"""Extract text from the first/last pages of an e-book.
+﻿"""Extract text from the first/last pages of an e-book.
 
 * EPUB: read directly (spine order).
 * PDF: Calibre's bundled pdftotext/pdfinfo; pdftoppm renders pages of scanned
@@ -34,6 +34,52 @@ EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
 MIN_TEXT = 200  # below this a PDF is considered scanned (image only)
 MIN_EPUB_TEXT = 2000  # below this an EPUB is taken as images only (no text fingerprint)
+
+
+# What a file should start with, for the formats with a clear signature (others are not checked).
+_EXPECTED = {
+    "PDF": lambda h: b"%PDF" in h[:1024],
+    "EPUB": lambda h: h.startswith(b"PK\x03\x04"),
+    "KEPUB": lambda h: h.startswith(b"PK\x03\x04"),
+    "DOCX": lambda h: h.startswith(b"PK\x03\x04"),
+    "MOBI": lambda h: h[60:68] == b"BOOKMOBI",
+    "AZW3": lambda h: h[60:68] == b"BOOKMOBI",
+    "LIT": lambda h: h.startswith(b"ITOLITLS"),
+    "DJVU": lambda h: h.startswith(b"AT&TFORM"),
+    "RTF": lambda h: h.startswith(b"{\\rtf"),
+}
+# What a file really is, from its first bytes: for the note.
+_CONTENT = [
+    (lambda h: b"%PDF" in h[:1024], "a PDF"),
+    (lambda h: h.startswith(b"PK\x03\x04"), "a ZIP archive"),
+    (lambda h: h.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"), "a Word 97-2003 document"),
+    (lambda h: h.startswith(b"ITOLITLS"), "a Microsoft Reader (LIT) book"),
+    (lambda h: h[60:68] == b"BOOKMOBI", "a MOBI book"),
+    (lambda h: h[60:68] == b"TEXtREAd", "a PalmDoc book"),
+    (lambda h: h.startswith(b"{\\rtf"), "an RTF document"),
+    (lambda h: h.startswith(b"AT&TFORM"), "a DjVu document"),
+    (lambda h: h.startswith(b"Rar!"), "a RAR archive"),
+    (lambda h: h.startswith(b"\xff\xd8\xff"), "a JPEG image"),
+    (lambda h: h.startswith(b"\x89PNG"), "a PNG image"),
+    (lambda h: h.lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")), "an HTML page"),
+]
+
+
+def file_problem(fmt: str, path: str) -> str:
+    """Why a book's file is not what its format says ("" if it is, or can't be told):
+    empty, or e.g. a ".pdf" that holds a Word document. Missing files are not checked."""
+    check = _EXPECTED.get(fmt)
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return ""
+    if not head:
+        return f"the {fmt} file is empty"
+    if check is None or check(head):
+        return ""
+    what = next((name for test, name in _CONTENT if test(head)), None)
+    return f"the {fmt} file is really {what}" if what else f"the {fmt} file is not a valid {fmt}"
 
 
 @dataclass
@@ -130,7 +176,8 @@ class TextExtractor:
         n = min(self.pdf_pages, total)
         first, last = (1, n) if part == "start" else (total - n + 1, total)
         text = self._run("pdftotext", ["-f", str(first), "-l", str(last), "-enc", "UTF-8", path, "-"])
-        text = _clean(text.decode("utf-8", "replace"))
+        # As much text as the other formats: a few dense pages can exceed a small model's context
+        text = _slice(_clean(text.decode("utf-8", "replace")), part, self.text_chars)
         source = f"PDF pages {first}-{last}"
         if len(text) >= MIN_TEXT or not self.render_images:
             return Excerpt(text=text, source=source)

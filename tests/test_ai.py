@@ -2,7 +2,8 @@ import pytest
 
 from calibre_dedup import ai
 from calibre_dedup.ai import (
-    GOOD, NOTE, PROBLEM, AIError, _with_extra, connection_test, extra_params, make_provider, report_text,
+    GOOD, NOTE, PROBLEM, AIError, _with_extra, ask_fitting, connection_test, extra_params, make_provider,
+    report_text,
 )
 from calibre_dedup.config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile
 
@@ -91,10 +92,44 @@ def test_azure_content_filter_is_a_filtered_error(monkeypatch):
     with pytest.raises(AIError, match=r"content filter refused the request \(violence\)") as e:
         make_provider(profile(AZURE, [])).chat("s", "u")
     assert e.value.filtered and e.value.status == 400
+    image_refused = {"error": {"message": "Your input image may contain content that is not allowed by our "
+                                          "content safety system.", "type": "invalid_request_error",
+                               "param": None, "code": "content_policy_violation"}}
+    monkeypatch.setattr(ai.requests, "post", lambda *a, **k: Refused(image_refused))
+    with pytest.raises(AIError, match="content filter refused the image") as e:
+        make_provider(profile(AZURE, [])).chat("s", "u")
+    assert e.value.filtered
     monkeypatch.setattr(ai.requests, "post", lambda *a, **k: Refused({"error": {"code": "BadRequest"}}))
     with pytest.raises(AIError, match="Azure OpenAI error 400") as e:
         make_provider(profile(AZURE, [])).chat("s", "u")
     assert not e.value.filtered
+
+
+def test_context_size_errors_are_recognised_with_how_much_fits():
+    ollama = AIError('Ollama error 400: {"error":"{\\"error\\":{\\"code\\":400,\\"message\\":\\"request (20000 '
+                     'tokens) exceeds the available context size (16000 tokens), try increasing it\\",\\"type\\":'
+                     '\\"exceed_context_size_error\\"}}"}', status=400)
+    assert ollama.too_long and ollama.fit == pytest.approx(0.8)
+    openai = AIError("OpenAI error 400: This model's maximum context length is 8000 tokens. However, your "
+                     "messages resulted in 10000 tokens.", status=400)
+    assert openai.too_long and openai.fit == pytest.approx(0.8)
+    anthropic = AIError("Anthropic error 400: prompt is too long: 10000 tokens > 8000 maximum", status=400)
+    assert anthropic.too_long and anthropic.fit == pytest.approx(0.8)
+    assert AIError("x: context_length_exceeded").too_long and AIError("x: context_length_exceeded").fit is None
+    assert not AIError("Ollama error 500: model not found").too_long
+
+
+def test_ask_fitting_cuts_the_text_until_it_fits():
+    sent = []
+    def ask(text):
+        sent.append(len(text))
+        if len(text) > 1000:
+            raise AIError(f"request ({len(text)} tokens) exceeds the available context size (1000 tokens)")
+        return "ok"
+    assert ask_fitting(ask, "a" * 5000, "book") == ("ok", 900)
+    assert sent == [5000, 900]
+    with pytest.raises(AIError):  # nothing short enough fits
+        ask_fitting(lambda t: (_ for _ in ()).throw(AIError("prompt is too long")), "a" * 5000, "book")
 
 
 def test_invalid_parameters_are_not_sent(monkeypatch):

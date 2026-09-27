@@ -16,12 +16,14 @@ import time
 import zlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import requests
 
 from .config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, config_dir
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class AIError(Exception):
@@ -31,11 +33,54 @@ class AIError(Exception):
         # The provider's content filter refused this request (e.g. a violent novel's
         # pages): about this book, not a sign that the AI is down.
         self.filtered = filtered
+        # The request was longer than the model's context: about this book too. `fit`:
+        # the context size / the request's tokens, when the server said them (else None).
+        self.too_long, self.fit = _too_long(message)
+
+
+# (pattern, whether its first number is the request's tokens, else the context size)
+_TOO_LONG_SIZES = [
+    (re.compile(r"request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)"), True),  # llama.cpp/Ollama
+    (re.compile(r"maximum context length is (\d+) tokens.*?(\d+) tokens", re.S), False),  # OpenAI, Azure
+    (re.compile(r"prompt is too long: (\d+) tokens > (\d+)"), True),  # Anthropic
+]
+_TOO_LONG = re.compile(r"exceed_context_size|context_length_exceeded|exceeds the available context size|"
+                       r"maximum context length|prompt is too long", re.I)
+
+
+def _too_long(message: str) -> tuple[bool, float | None]:
+    for pattern, tokens_first in _TOO_LONG_SIZES:
+        m = pattern.search(message)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            tokens, limit = (a, b) if tokens_first else (b, a)
+            return True, (limit / tokens if tokens else None)
+    return bool(_TOO_LONG.search(message)), None
+
+
+MIN_FITTED_CHARS = 500  # below this, cutting the text further is pointless: the error stands
+
+
+def ask_fitting(ask: Callable[[str], T], text: str, label: str, keep_end: bool = False) -> tuple[T, int | None]:
+    """ask(text); when the request is longer than the model's context, ask again with
+    the text cut to fit (its start, or its end with `keep_end`). Returns (the answer,
+    the characters sent if the text was cut, else None)."""
+    cut = None
+    while True:
+        try:
+            return ask(text), cut
+        except AIError as e:
+            if not e.too_long or len(text) <= MIN_FITTED_CHARS:
+                raise
+            cut = max(MIN_FITTED_CHARS, int(len(text) * min(e.fit or 0.5, 0.9) * 0.9))
+            log.info("%s: longer than the AI's context, asking again with %d characters", label, cut)
+            text = text[-cut:] if keep_end else text[:cut]
 
 
 def _filter_error(provider: str, r: requests.Response) -> AIError | None:
     """The error for a request refused by the content filter (Azure: 400 with code
-    content_filter), naming the categories that triggered it; None for other errors."""
+    content_filter, or content_policy_violation for an image), naming the categories
+    that triggered it; None for other errors."""
     try:
         data = r.json()
     except ValueError:
@@ -44,6 +89,8 @@ def _filter_error(provider: str, r: requests.Response) -> AIError | None:
     if not isinstance(err, dict):
         return None
     inner = err.get("innererror") if isinstance(err.get("innererror"), dict) else {}
+    if err.get("code") == "content_policy_violation":  # an input image refused
+        return AIError(f"{provider} content filter refused the image", status=r.status_code, filtered=True)
     if err.get("code") != "content_filter" and inner.get("code") != "ResponsibleAIPolicyViolation":
         return None
     results = inner.get("content_filter_result") or {}

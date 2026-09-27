@@ -1,4 +1,4 @@
-"""calibre-review: what the AI read vs the metadata, actions, and the reviewer with a fake AI."""
+﻿"""calibre-review: what the AI read vs the metadata, actions, and the reviewer with a fake AI."""
 
 import json
 
@@ -193,6 +193,18 @@ def test_an_ai_that_keeps_failing_asks_and_can_be_skipped(tmp_path):
     assert result.ai_down and "disabled" in result.items[-1].note
 
 
+def test_skip_this_book_keeps_the_ai_on_and_asks_again_after_as_many_errors(tmp_path):
+    from calibre_dedup.planner import SKIP_BOOK
+    lib = make_library(tmp_path / "lib", [{"title": f"Book {i}", "text": "x"} for i in range(7)])
+    asked = []
+    reviewer = Reviewer(FakeProvider(fail=True), FakeExtractor(), AICache(tmp_path / "cache.json"),
+                        on_down=lambda msg, image: asked.append(msg) or SKIP_BOOK)
+    result = scan_library(lib, "", reviewer)
+    assert len(asked) == 2  # after books 3 and 6
+    assert not reviewer.disabled_reason and not result.ai_down
+    assert all(i.found is None and i.note == "AI error: down" for i in result.items)
+
+
 class FilteringProvider(FakeProvider):
     """Refuses any request whose text holds the violent passage."""
     def chat(self, system, user, images=None):
@@ -219,7 +231,27 @@ def test_a_filtered_book_is_asked_again_with_less_and_nothing_is_disabled(tmp_pa
                         vision, on_down=lambda m, i: pytest.fail("asked"))
     items = scan_library(lib, "", reviewer).items
     assert all(i.found is not None for i in items) and "cover only" in items[0].note
-    assert vision.calls[2] == ("The first attached image is the book's cover.\nNo text could be extracted.", 1)
+    assert vision.calls[3] == ("The first attached image is the book's cover.\nNo text could be extracted.", 1)
+
+
+class ImageFilteringProvider(FakeProvider):
+    """Refuses any request with images, as Azure does for a cover it will not look at."""
+    def chat(self, system, user, images=None):
+        self.calls.append((user, len(images or [])))
+        if images:
+            raise AIError("Azure OpenAI content filter refused the image", status=400, filtered=True)
+        return self.reply
+
+
+def test_a_refused_cover_is_skipped_and_the_text_is_read_alone(tmp_path, monkeypatch):
+    lib = make_library(tmp_path / "lib", [{"title": f"Book {i}", "text": "x"} for i in range(4)])
+    monkeypatch.setattr(Reviewer, "_cover", lambda self, b: ("PNG", ""))
+    vision = ImageFilteringProvider(REPLY, name="v")
+    reviewer = Reviewer(FakeProvider(), FakeExtractor("Frontespizio"), AICache(tmp_path / "c.json"),
+                        vision, on_down=lambda m, i: pytest.fail("asked"))
+    items = scan_library(lib, "", reviewer).items
+    assert all(i.found is not None and "text only" in i.note for i in items)
+    assert not reviewer.image_disabled_reason
 
 
 def test_filtered_errors_never_turn_the_ai_off(tmp_path):
@@ -229,6 +261,50 @@ def test_filtered_errors_never_turn_the_ai_off(tmp_path):
     result = scan_library(lib, "", reviewer)
     assert all(i.found is None and "content filter" in i.note for i in result.items)
     assert not reviewer.disabled_reason and not result.ai_down
+
+
+class SmallContextProvider(FakeProvider):
+    """A model with a 2000-token context (one character = one token)."""
+    def chat(self, system, user, images=None):
+        self.calls.append((user, len(images or [])))
+        if len(user) > 2000:
+            raise AIError(f'Ollama error 400: {{"message":"request ({len(user)} tokens) exceeds the available '
+                          f'context size (2000 tokens)"}}', status=400)
+        return self.reply
+
+
+def test_a_book_longer_than_the_context_is_read_again_shorter_and_nothing_is_disabled(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": f"Book {i}", "text": "x"} for i in range(4)])
+    vision = SmallContextProvider(REPLY, name="v")
+    reviewer = Reviewer(FakeProvider(), FakeExtractor("Frontespizio " * 1000), AICache(tmp_path / "c.json"),
+                        vision, on_down=lambda m, i: pytest.fail("asked"))
+    items = scan_library(lib, "", reviewer).items
+    assert all(i.found is not None and "context size" in i.note for i in items)
+    assert not reviewer.image_disabled_reason
+
+
+def test_a_book_whose_file_is_another_format_is_proposed_for_the_trash_unread(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "Il giocatore", "text": "x"}, {"title": "Dune", "text": "x"}])
+    (tmp_path / "lib" / "a/b (1)" / "book.epub").write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + bytes(600))
+    text = FakeProvider(REPLY)
+    items = scan_library(lib, "", Reviewer(text, FakeExtractor(), AICache(tmp_path / "c.json"))).items
+    assert (items[0].action, items[0].selected, items[0].found) == (ReviewAction.TRASH, True, None)
+    assert "EPUB file is really a Word 97-2003 document" in items[0].note
+    assert len(text.calls) == 1 and items[1].action is ReviewAction.UPDATE
+
+
+def test_file_problem_checks_the_first_bytes(tmp_path):
+    from calibre_dedup.extract import file_problem
+    def write(name, data):
+        (tmp_path / name).write_bytes(data)
+        return str(tmp_path / name)
+    assert file_problem("PDF", write("ok.pdf", b"%PDF-1.4\n...")) == ""
+    assert "a Microsoft Reader (LIT) book" in file_problem("PDF", write("lit.pdf", b"ITOLITLS" + bytes(100)))
+    assert "a MOBI book" in file_problem("PDF", write("mobi.pdf", b"ernani" + bytes(54) + b"BOOKMOBI"))
+    assert "a JPEG image" in file_problem("PDF", write("jpg.pdf", b"\xff\xd8\xff\xeb" + bytes(100)))
+    assert "empty" in file_problem("EPUB", write("empty.epub", b""))
+    assert file_problem("TXT", write("any.txt", b"\xff\xd8\xff")) == ""  # formats without a signature: not checked
+    assert file_problem("PDF", str(tmp_path / "missing.pdf")) == ""
 
 
 def test_trash_library_must_differ_from_the_reviewed_one(tmp_path):

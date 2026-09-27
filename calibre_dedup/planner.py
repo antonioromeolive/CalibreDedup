@@ -27,7 +27,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from .ai import AICache, AIError, AIMetadata, Provider, compare_authors, compare_covers, extract_metadata
+from .ai import (
+    AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
+)
 from .extract import TextExtractor, cover_png, epub_text_digest
 from .library import read_books
 from .matcher import Decision, Verdict, compare, decide
@@ -42,6 +44,10 @@ log = logging.getLogger(__name__)
 
 ProgressFn = Callable[[int, int, str], None]  # (done, total, message)
 MAX_CONSECUTIVE_AI_ERRORS = 3
+# Answers to "AI not responding" (AIResolver.on_down). True/False mean RETRY/AI_OFF.
+RETRY = "retry"  # send the same request again
+SKIP_BOOK = "skip"  # leave this book without the AI, keep the AI on (asked again after as many errors)
+AI_OFF = "off"  # go on without that AI for the rest of the run
 MAX_LIBRARY_PATH = 89  # Calibre refuses longer library paths on Windows
 # With the "same series" option, source books without a series and a real number
 # are left alone: nothing is decided or executed for them.
@@ -131,14 +137,16 @@ class AIResolver:
     own errors, so a failing image AI never switches off the text AI.
 
     After MAX_CONSECUTIVE_AI_ERRORS errors in a row, `on_down(message, image)` is
-    asked (the GUI shows a dialog): True retries the same request, False turns
-    that AI off for the rest of this run. Without it, the AI is turned off. It is
-    never turned off in the settings: the next run tries it again.
+    asked (the GUI shows a dialog): RETRY (or True) sends the same request again,
+    SKIP_BOOK leaves this book without the AI and goes on with it, AI_OFF (or False)
+    turns that AI off for the rest of this run. Without it, the AI is turned off. It
+    is never turned off in the settings: the next run tries it again.
+    Errors about one book (content filter, too long for the context) are not counted.
     """
 
     def __init__(self, provider: Provider, extractor: TextExtractor, cache: AICache,
                  vision_provider: Provider | None = None,
-                 on_down: Callable[[str, bool], bool] | None = None):
+                 on_down: Callable[[str, bool], str | bool] | None = None):
         self.provider = provider
         self.vision = vision_provider
         self.extractor = extractor
@@ -182,7 +190,7 @@ class AIResolver:
         """Count an error; returns the note for the book, or None to retry the request."""
         what = "image AI" if image else "AI"
         log.warning("%s error on %s: %s", what, book.label(), e)
-        if e.filtered:  # refused for this book's content: the AI works, don't count it
+        if e.filtered or e.too_long:  # refused for this book (its content, its length): the AI works
             return f"{what}: {e}"
         if image:
             self.image_errors += 1
@@ -191,15 +199,21 @@ class AIResolver:
             self.consecutive_errors += 1
             count, disabled = self.consecutive_errors, self.disabled_reason
         if count >= MAX_CONSECUTIVE_AI_ERRORS and not disabled:
-            if self.on_down is not None and self.on_down(
-                    f"The {'image' if image else 'text'} AI failed {count} times in a row.\n\n"
-                    f"Last error (on {book.label()}):\n{e}", image):
-                log.info("%s: retrying after %d consecutive errors", what, count)
+            choice = AI_OFF if self.on_down is None else self.on_down(
+                f"The {'image' if image else 'text'} AI failed {count} times in a row.\n\n"
+                f"Last error (on {book.label()}):\n{e}", image)
+            choice = {True: RETRY, False: AI_OFF}.get(choice, choice)
+            if choice in (RETRY, SKIP_BOOK):
                 if image:
                     self.image_errors = 0
                 else:
                     self.consecutive_errors = 0
+            if choice == RETRY:
+                log.info("%s: retrying after %d consecutive errors", what, count)
                 return None
+            if choice == SKIP_BOOK:
+                log.info("%s: %s skipped after %d consecutive errors, %s kept on", what, book.label(), count, what)
+                return f"{what} error: {e}"
             reason = f"{what} disabled after {count} consecutive errors"
             if image:
                 self.image_disabled_reason = reason
@@ -338,7 +352,8 @@ class AIResolver:
             return None, note
         log.info("AI reading %s of %s (%s)", part, book.label(), excerpt.source)
         try:
-            meta = extract_metadata(provider, excerpt.text, images)
+            meta, _ = ask_fitting(lambda text: extract_metadata(provider, text, images), excerpt.text,
+                                  book.label(), keep_end=part == "end")
         except AIError as e:
             raise (ImageAIError(str(e), e.status, e.filtered) if images else e) from e
         self.stats["read"] += 1

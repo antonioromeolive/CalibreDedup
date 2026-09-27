@@ -18,11 +18,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from .ai import AICache, AIError, ReviewMetadata, read_book_metadata
+from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadata
 from .executor import ExecutionError, run_bridge
 from .calibre_env import calibre_is_running
 from .config import config_dir
-from .extract import cover_png
+from .extract import cover_png, file_problem
 from .library import LibraryError, read_books
 from .models import Book
 from .normalize import authors_key, is_unknown, same_publisher, series_key, strip_accents
@@ -61,14 +61,16 @@ class ReviewItem:
     selected: bool = False
     manual: bool = False  # action chosen by the user
     status: str = ""  # filled during execution
+    broken: bool = False  # every file is empty or not what its format says (a ".pdf" holding a .doc)
 
     def __post_init__(self):
         if self.found is not None and not self.changes:
             self.changes = find_changes(self.book, self.found)
         if self.changes and self.action is ReviewAction.KEEP and not self.manual:
             self.action, self.selected = ReviewAction.UPDATE, True
-        elif not self.book.formats and self.action is ReviewAction.KEEP and not self.manual:
-            self.action, self.selected = ReviewAction.TRASH, True  # a record with no file: nothing to keep
+        elif ((not self.book.formats or self.broken)
+              and self.action is ReviewAction.KEEP and not self.manual):
+            self.action, self.selected = ReviewAction.TRASH, True  # no usable file: nothing to keep
 
     def to_write(self, fields_on: set[str] | list[str]) -> dict:
         """The changes that will be written: not excluded, and the field is on."""
@@ -228,16 +230,21 @@ class Reviewer(AIResolver):
               read: str) -> tuple[ReviewMetadata, str]:
         """Ask the AI; when its content filter refuses the pages (a violent novel),
         ask again with less: the first FILTERED_RETRY_CHARS characters (the title
-        page is at the start), then the cover alone. Returns (metadata, what was read)."""
+        page is at the start), then the text without images (a refused cover), then
+        the cover alone. Returns (metadata, what was read)."""
         attempts = [(text, images, read)]
         if len(text) > FILTERED_RETRY_CHARS:
             attempts.append((text[:FILTERED_RETRY_CHARS], images,
                              f"{read} (first {FILTERED_RETRY_CHARS} chars: content filter)"))
+        if images and text.strip():
+            attempts.append((text[:FILTERED_RETRY_CHARS], [], "text only, no images (content filter)"))
         if has_cover and (text.strip() or len(images) > 1):
             attempts.append(("", images[:1], "cover only (content filter)"))
         for i, (t, imgs, what) in enumerate(attempts):
             try:
-                return read_book_metadata(provider, t, imgs, has_cover=has_cover), what
+                meta, cut = ask_fitting(lambda text: read_book_metadata(provider, text, imgs, has_cover=has_cover),
+                                        t, book.label())
+                return meta, (f"{what} (first {cut} chars: context size)" if cut else what)
             except AIError as e:
                 if not e.filtered or i == len(attempts) - 1:
                     raise
@@ -332,8 +339,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
             break
         if progress:
             progress(n, len(books), f"Reading {book.label()}")
-        meta, note = reviewer.review(book)
-        item = ReviewItem(book, meta, note)
+        item = _review_book(reviewer, book)
         if item.changes:
             log.info("%s: %s", book.label(), ", ".join(
                 f"{k} {format_value(k, current_value(book, k))!r} -> {format_value(k, v)!r}"
@@ -346,6 +352,19 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     result.stats = dict(reviewer.stats)
     result.ai_down = [r for r in (reviewer.disabled_reason, reviewer.image_disabled_reason) if r]
     return result
+
+
+def _review_book(reviewer: Reviewer, book: Book) -> ReviewItem:
+    """Files that are not what their format says are not read: when all are, the book
+    is proposed for the trash without asking the AI; else the AI reads the others."""
+    bad = {fmt: problem for fmt, path in book.formats.items() if (problem := file_problem(fmt, path))}
+    if bad:
+        log.warning("%s: %s", book.label(), "; ".join(bad.values()))
+    if bad and len(bad) == len(book.formats):
+        return ReviewItem(book, None, "; ".join(bad.values()) + ": proposed for the trash", broken=True)
+    good = replace(book, formats={f: p for f, p in book.formats.items() if f not in bad}) if bad else book
+    meta, note = reviewer.review(good)
+    return ReviewItem(book, meta, _join(note, "; ".join(bad.values())))
 
 
 def summary(result: ReviewResult) -> str:

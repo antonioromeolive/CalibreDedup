@@ -35,9 +35,10 @@ from ..review import (
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from .main_window import (
-    AI_LOG_COLOR, PlanTable, QtLogHandler, _compact, _elastic, _is_checked, configure_logging, open_file,
-    with_eta,
+    AI_LOG_COLOR, PlanTable, QtLogHandler, _compact, _elastic, _is_checked, ask_ai_down, configure_logging,
+    open_file, with_eta,
 )
+from ..planner import AI_OFF
 from .cover_preview import CoverPreview
 from .settings_dialog import SettingsDialog
 from .style import BLUE, GREEN, RED, button_css, mark_inactive, set_running, style_none_item
@@ -298,20 +299,20 @@ class ScanWorker(QThread):
         self.settings, self.library, self.trash = settings, library, trash
         self.cancel = threading.Event()
         self._answered = threading.Event()
-        self._retry = False
+        self._choice = AI_OFF
 
-    def ask(self, message: str, image: bool) -> bool:
+    def ask(self, message: str, image: bool) -> str:
         """See main_window.AnalyzeWorker.ask."""
         self._answered.clear()
-        self._retry = False
+        self._choice = AI_OFF
         self.ai_down.emit(message, image)
         while not self._answered.wait(0.2):
             if self.cancel.is_set():
-                return False
-        return self._retry
+                return AI_OFF
+        return self._choice
 
-    def answer(self, retry: bool) -> None:
-        self._retry = retry
+    def answer(self, choice: str) -> None:
+        self._choice = choice
         self._answered.set()
 
     def run(self):
@@ -895,23 +896,15 @@ class ReviewWindow(QMainWindow):
         if not isinstance(worker, ScanWorker):
             return
         if self._close_pending:
-            worker.answer(False)
+            worker.answer(AI_OFF)
             return
         what = "image AI" if image else "text AI"
-        box = QMessageBox(QMessageBox.Warning, "AI not responding", message, parent=self)
-        box.setInformativeText(f"Retry: try the same request again (e.g. after starting the server).\n"
-                               f"Continue without the {what}: the rest of the books are read without it.\n"
-                               "Stop: keep the books read so far.")
-        retry = box.addButton("Retry", QMessageBox.AcceptRole)
-        go_on = box.addButton(f"Continue without the {what}", QMessageBox.RejectRole)
-        stop = box.addButton("Stop", QMessageBox.DestructiveRole)
-        box.setDefaultButton(retry)
-        box.setEscapeButton(go_on)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is stop:
+        choice = ask_ai_down(self, message, what,
+                             f"Continue without the {what}: the rest of the books are read without it.\n"
+                             "Stop: keep the books read so far.")
+        if choice is None:
             self._stop()
-        worker.answer(clicked is retry)
+        worker.answer(choice or AI_OFF)
 
     # --- execute ----------------------------------------------------------------------------
     def _execute(self):
