@@ -34,7 +34,7 @@ from ..planner import (
 from ..report import write_csv
 from ..selection import (
     FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
-    can_override, filter_key, mergeable_formats, override, revert,
+    can_override, runs_main_action, filter_key, mergeable_formats, override, revert,
 )
 from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
 from .cover_preview import CoverPreview
@@ -166,7 +166,7 @@ def _is_checked(value) -> bool:
 
 
 class PlanModel(QAbstractTableModel):
-    HEADERS = ["✓", "ID", "Title", "Authors", "Action", "Reason", "Match in target", "Add formats", "AI", "Result"]
+    HEADERS = ["✓", "ID", "Title", "Authors", "Action", "Reason", "Match in target", "Formats", "AI", "Result"]
     COL_CHECK, COL_ID, COL_TITLE, COL_AUTHORS, COL_ACTION, COL_REASON, COL_RESULT = 0, 1, 2, 3, 4, 5, 9
     selection_changed = Signal()
 
@@ -227,7 +227,8 @@ class PlanModel(QAbstractTableModel):
             return 0
 
         def gone(it: PlanItem) -> bool:
-            return it.status.startswith("OK") and it.action is not Action.LEAVE
+            # (an unticked book is "OK" when only its unreadable formats went to the trash library)
+            return it.status.startswith("OK") and it.action is not Action.LEAVE and it.selected
         keep = [it for it in self.plan.items if not gone(it)]
         removed = len(self.plan.items) - len(keep)
         if removed:
@@ -297,7 +298,7 @@ class PlanModel(QAbstractTableModel):
             (it.match.label() + (" (moving now)" if it.match_planned else "")
              + (" (different edition)" if it.different and it.action is not Action.TRASH else ""))
             if it.match else "",
-            ", ".join(it.add_formats),
+            _formats_text(it),
             ", ".join(sorted(ident.ai_fields)) or ("nothing found" if it.ai_used else ""),
             it.status,
         ]
@@ -354,7 +355,7 @@ class PlanFilter(QSortFilterProxyModel):
         self.terms: list[str] = []
         self.action = ""
         self.ai_only = self.formats_only = self.checked_only = self.failed_only = self.reduced_only = False
-        self.cover_only = False
+        self.cover_only = self.unreadable_only = False
         self.hide_unique = True
 
     def update(self, **kw):
@@ -383,6 +384,8 @@ class PlanFilter(QSortFilterProxyModel):
             return False
         if self.cover_only and not it.by_cover:
             return False
+        if self.unreadable_only and not it.bad_formats:
+            return False
         # Same library: books with no duplicate are usually most of the list.
         if self.hide_unique and model.plan is not None and (
                 skipped_no_series(it) or (model.plan.same_library and has_no_duplicate(it))):
@@ -391,6 +394,15 @@ class PlanFilter(QSortFilterProxyModel):
             hay = strip_accents(" ".join(str(x) for x in model.values(it)[1:7])).casefold()
             return all(t in hay for t in self.terms)
         return True
+
+
+def _formats_text(it: PlanItem) -> str:
+    """Formats added to the match, and what happens to the ones Calibre can't open."""
+    parts = [f"add {', '.join(it.add_formats)}"] if it.add_formats else []
+    if it.bad_formats and not it.unreadable:
+        bad = ", ".join(sorted(it.bad_formats))
+        parts.append(f"{bad} to trash" if it.trash_bad else f"{bad} unreadable, kept")
+    return " · ".join(parts)
 
 
 def skipped_no_series(it: PlanItem) -> bool:
@@ -471,6 +483,7 @@ class AnalyzeWorker(QThread):
                               similar_titles=self.settings.similar_titles,
                               always_cover=self.settings.always_cover,
                               author_variants=self.settings.author_variants,
+                              trash_unreadable=self.settings.trash_unreadable,
                               on_item=on_item)
             if batch:
                 self.items_ready.emit(batch.copy())
@@ -612,7 +625,8 @@ class MainWindow(QMainWindow):
         self.toggles = {}
         for attr, label in [("ai_only", "AI used"), ("formats_only", "Adds formats"),
                             ("checked_only", "Only checked"), ("failed_only", "Only failed"),
-                            ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover")]:
+                            ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover"),
+                            ("unreadable_only", "Unreadable files")]:
             box = QCheckBox(label)
             box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
             self.toggles[attr] = box
@@ -620,6 +634,10 @@ class MainWindow(QMainWindow):
             "Books decided with fewer checks than the settings ask for: the cover check or year re-check\n"
             "could not run (no Image AI, AI off), or an AI stopped responding during the analysis.\n"
             "Analyze again once that is fixed (answers already received are cached).")
+        self.toggles["unreadable_only"].setToolTip(
+            "Books with files Calibre can't open (a format it doesn't read, a fake PDF, a file that\n"
+            "fails to open). Only such files: Trash, to the trash library. Some: the Formats column says\n"
+            "whether they go to the trash library (right-click to change); the book keeps the others.")
         self.toggles["cover_only"].setToolTip(
             "Duplicates proven by the same cover. With 'Always compare covers', also books whose\n"
             "metadata differ (year, publisher, edition): check them before executing.")
@@ -1065,6 +1083,15 @@ class MainWindow(QMainWindow):
             act.setEnabled(n > 0)
             act.triggered.connect(
                 lambda _=False, a=action, m=merge: self._override([i for i in items if fits(i, a, m)], a, m))
+        partial = [i for i in items if i.bad_formats and not i.unreadable]
+        if partial:
+            menu.addSeparator()
+            for value, label in ((True, "Move the unreadable formats to the trash library"),
+                                 (False, "Keep the unreadable formats")):
+                n = sum(1 for i in partial if i.trash_bad != value)
+                act = menu.addAction(f"{label} ({n})" if len(items) > 1 else label)
+                act.setEnabled(n > 0)
+                act.triggered.connect(lambda _=False, v=value: self._set_trash_bad(partial, v))
         menu.addSeparator()
         n = sum(1 for i in items if i.manual)
         act = menu.addAction(f"Revert to analysis decision ({n})" if len(items) > 1 else "Revert to analysis decision")
@@ -1081,6 +1108,11 @@ class MainWindow(QMainWindow):
                 skipped += 1
         if skipped:
             self.status_label.setText(f"{skipped} book(s) skipped: already in the target library.")
+        self.model.refresh()
+
+    def _set_trash_bad(self, items: list[PlanItem], value: bool):
+        for it in items:
+            it.trash_bad = value
         self.model.refresh()
 
     def _revert(self, items: list[PlanItem]):
@@ -1269,18 +1301,25 @@ class MainWindow(QMainWindow):
             return
         p = self.plan
         todo = actionable(p)
-        moves = sum(1 for i in todo if i.action is Action.MOVE)
-        trashes = len(todo) - moves
+        main = [i for i in todo if runs_main_action(i, self.model.blocked)]
+        moves = sum(1 for i in main if i.action is Action.MOVE)
+        trashes = sum(1 for i in main if i.action is Action.TRASH)
         where = "permanently deleted" if self.settings.delete_permanently else "moved to Calibre's recycle bin"
         n_blocked = len(self.model.blocked)
-        no_copy = sum(1 for i in todo if i.action is Action.TRASH and i.match is None)
+        unreadable = sum(1 for i in main if i.action is Action.TRASH and i.unreadable)
+        no_copy = sum(1 for i in main if i.action is Action.TRASH and i.match is None) - unreadable
+        trashed_whole = {id(i) for i in main if i.action is Action.TRASH}
+        bad = sum(1 for i in todo if i.bad_formats_to_trash and id(i) not in trashed_whole)
         answer = QMessageBox.question(
             self, "Execute checked books",
             f"{moves} books will be moved to the target library.\n"
-            f"{trashes} duplicates will be moved to the trash library.\n"
+            f"{trashes} books will be moved to the trash library.\n"
+            + (f"   {unreadable} of them have no file Calibre can open.\n" if unreadable else "")
             + (f"   {no_copy} of them (forced) have no copy in the target: "
-               "they will only be in the trash library.\n" if no_copy else "") +
-            f"{len(p.items) - len(todo)} books stay in the source library"
+               "they will only be in the trash library.\n" if no_copy else "")
+            + (f"{bad} books have formats Calibre can't open: each whole record is copied to the trash "
+               "library, then those formats are removed from the source.\n" if bad else "") +
+            f"{len(p.items) - len(main)} books stay in the source library"
             + (f" (including {n_blocked} blocked)" if n_blocked else "") + ".\n\n"
             f"After a verified copy, each book is {where} in the source library.\n\nContinue?")
         if answer != QMessageBox.Yes:

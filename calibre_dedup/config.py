@@ -97,6 +97,9 @@ class Settings:
     always_cover: bool = False  # compare covers even when the metadata says different; same cover wins
     author_variants: bool = True  # same title, author written differently ("Frederickk"/"Frederick"; AI if on)
     similar_titles: bool = True  # same author, one title inside the other ("1 Dune" / "Dune"): needs proof
+    # Tick books with files Calibre can't open (fake or unsupported formats): all bad, the book
+    # goes to the trash library; some, its record is copied there and those formats leave the source.
+    trash_unreadable: bool = False
     update_metadata: bool = True  # write AI-found title/authors/publisher to moved books
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""

@@ -22,7 +22,7 @@ import os
 import threading
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -30,7 +30,7 @@ from typing import Callable
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
-from .extract import TextExtractor, cover_png, epub_text_digest
+from .extract import TextExtractor, cover_png, epub_text_digest, unreadable_formats
 from .library import read_books
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
@@ -527,9 +527,13 @@ def build_plan(
     similar_titles: bool = False,
     always_cover: bool = False,
     author_variants: bool = False,
+    trash_unreadable: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
+    Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
+    `trash_unreadable` also ticks them: all formats bad, the book goes to the trash
+    library; some, its record is copied there and those formats leave the source.
     `similar_titles`: with no book of the same title, also look at books by the
     same author whose title contains this one's, or the other way round (see
     _decide_similar). `always_cover`: compare covers also when the metadata says
@@ -584,10 +588,27 @@ def build_plan(
             plan.stopped = True  # keep what was analyzed so far
             break
         progress(n - 1, total, f"Analyzing {sb.label()}")
+        book = sb  # as the analysis sees it: without the formats Calibre can't open
         try:
-            item = _plan_one(sb, index, main_index, resolver, ignore_subtitle, same_library,
-                             similar_matching, cover_check, recheck_years, same_series, stats, similar,
-                             always_cover, by_title)
+            bad = unreadable_formats(sb.formats)
+            if bad and set(bad) >= set(sb.formats):
+                item = _unreadable_item(sb, bad, trash_unreadable, same_series)
+            else:
+                # Decided on the formats Calibre can open: a fake PDF is never merged into a match.
+                book = replace(sb, formats={f: p for f, p in sb.formats.items() if f not in bad}) if bad else sb
+                item = _plan_one(book, index, main_index, resolver, ignore_subtitle, same_library,
+                                 similar_matching, cover_check, recheck_years, same_series, stats, similar,
+                                 always_cover, by_title)
+                item.source = sb  # the record itself (the executor acts on it)
+                extractor = getattr(resolver, "extractor", None)
+                if hasattr(extractor, "failed_formats"):  # files that failed to open while deciding
+                    bad.update(extractor.failed_formats(book.formats))
+                if bad and set(bad) >= set(sb.formats):
+                    item = _unreadable_item(sb, bad, trash_unreadable, same_series)
+                elif bad:
+                    item.bad_formats = bad
+                    item.trash_bad = item.planned_trash_bad = trash_unreadable
+                    item.reason = item.planned_reason = _join(item.reason, [_bad_note(bad)])
         except OSError as e:
             # A missing or locked file is this book's problem; anything else (the
             # drive went away, I/O errors) would fail every book: stop, keep the rest.
@@ -614,9 +635,9 @@ def build_plan(
                     down[what] = n
         if same_library:
             if item.action is not Action.TRASH:
-                add_to_index(_Candidate(sb, item.identity, planned=False, ai_done=item.ai_used))
+                add_to_index(_Candidate(book, item.identity, planned=False, ai_done=item.ai_used))
         elif item.action is Action.MOVE:
-            add_to_index(_Candidate(sb, item.identity, planned=True, ai_done=item.ai_used))
+            add_to_index(_Candidate(book, item.identity, planned=True, ai_done=item.ai_used))
         # Only now: the user may change the item from here on (planner decisions
         # above use the analysis' own verdict, never the user's override).
         if on_item is not None:
@@ -669,6 +690,23 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
     warnings = list(plan.ai_down)
     warnings += [f"{n} book(s): {SKIP_EXPLAINED[k]}" for k, n in counts.items()]
     return " · ".join(parts) or "AI not used", warnings
+
+
+UNREADABLE_REASON = "no file Calibre can open"
+
+
+def _bad_note(bad: dict[str, str]) -> str:
+    return "unreadable: " + "; ".join(bad.values())
+
+
+def _unreadable_item(sb: Book, bad: dict[str, str], selected: bool, same_series: bool) -> PlanItem:
+    """Every format of the book is one Calibre can't open: nothing to keep, to the
+    trash library (ticked only with the setting on; the user decides otherwise)."""
+    item = PlanItem(sb, Action.TRASH, f"{UNREADABLE_REASON} ({'; '.join(bad.values())})",
+                    metadata_identity(sb, same_series), bad_formats=bad)
+    item.selected = item.planned_selected = selected
+    log.info("%s: %s", sb.label(), item.reason)
+    return item
 
 
 def _metadata_richness(book: Book) -> int:

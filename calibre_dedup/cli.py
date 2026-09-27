@@ -54,7 +54,8 @@ def run(argv: list[str]) -> int:
                           similar_matching=settings.similar_matching, cover_check=settings.cover_check,
                           recheck_years=settings.recheck_years, same_series=settings.same_series,
                           similar_titles=settings.similar_titles, always_cover=settings.always_cover,
-                          author_variants=settings.author_variants)
+                          author_variants=settings.author_variants,
+                          trash_unreadable=settings.trash_unreadable)
         print(file=sys.stderr)
     finally:
         if resolver:

@@ -45,6 +45,17 @@ def copy_verified(src, book_id, dest):
     return new_id
 
 
+def trash_formats(src, book_id, trash, formats):
+    """Copy the whole record, as it is, to the trash library, then remove `formats`
+    (files Calibre can't open) from the source record, which keeps its other formats."""
+    new_id = copy_verified(src, book_id, trash)
+    src.remove_formats({book_id: list(formats)})
+    left = set(formats) & set(src.formats(book_id))
+    if left:
+        raise RuntimeError(f"could not remove {', '.join(sorted(left))} from the source")
+    return f"record copied to trash (id {new_id}); {', '.join(formats)} removed from source"
+
+
 def cleanup_empty_dirs(root, folders, attempts=3):
     """Remove the removed books' folders (and their author folders) if empty,
     after all database work is finished. Only these are checked: walking a
@@ -180,6 +191,12 @@ def main(plan_path):
                     raise RuntimeError("book is no longer in the source library")
                 if src.field_for("title", sid) != action["title"]:
                     raise RuntimeError("book changed since the analysis; re-run the analysis")
+                done = ""  # what was done before the action itself
+                if action.get("trash_formats"):
+                    done = trash_formats(src, sid, trash, action["trash_formats"]) + "; "
+                if action["op"] == "trash_formats":  # nothing else to do for this book
+                    emit(event="result", src_id=sid, ok=True, msg=done[:-2])
+                    continue
 
                 if action["op"] == "move":
                     new_id = copy_verified(src, sid, tgt)
@@ -188,18 +205,20 @@ def main(plan_path):
                     msg = f"moved to target (id {new_id})"
                     if changed:
                         msg += f"; filled {', '.join(changed)}"
-                elif action["op"] == "update":
+                elif action["op"] == "update":  # the book stays in the source
                     changed = fill_metadata(src, sid, action.get("set") or {})
                     msg = f"updated metadata in source"
                     if changed:
                         msg += f"; filled {', '.join(changed)}"
+                    emit(event="result", src_id=sid, ok=True, msg=done + msg)
+                    continue
                 elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes
                     changed, path, formats = set_metadata(src, sid, action["set"])
                     if action.get("tag"):  # only once the update is written
                         add_tag(src, [sid], action["tag"])
                     msg = f"updated {', '.join(changed) or 'nothing'}" + (f"; tagged {action['tag']}"
                                                                           if action.get("tag") else "")
-                    emit(event="result", src_id=sid, ok=True, msg=msg, path=path, formats=formats)
+                    emit(event="result", src_id=sid, ok=True, msg=done + msg, path=path, formats=formats)
                     continue
                 elif action["op"] == "trash" and action.get("no_target"):
                     # Forced by the user for a book with no copy in the target.
@@ -231,7 +250,7 @@ def main(plan_path):
                     if sid in src.all_book_ids():
                         raise
                     msg += "; source record removed, empty folder cleanup deferred"
-                emit(event="result", src_id=sid, ok=True, msg=msg)
+                emit(event="result", src_id=sid, ok=True, msg=done + msg)
             except Exception as e:
                 emit(event="result", src_id=sid, ok=False, msg=str(e), trace=traceback.format_exc())
     finally:

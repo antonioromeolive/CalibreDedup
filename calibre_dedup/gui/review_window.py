@@ -158,7 +158,11 @@ class ReviewModel(QAbstractTableModel):
             label = ACTION_LABELS[it.action]
             if it.action is ReviewAction.UPDATE and not it.to_write(self.fields_on):
                 label += " (nothing to write)"
-            return label + (" (manual)" if it.manual else "")
+            label += " (manual)" if it.manual else ""
+            if it.bad_formats and not it.broken and not (it.selected and it.action is ReviewAction.TRASH):
+                bad = ", ".join(sorted(it.bad_formats))
+                label += f"\n+ {bad} to trash" if it.trash_bad else f"\n{bad} unreadable, kept"
+            return label
         if col == self.COL_READ:
             return it.note
         return it.status
@@ -219,7 +223,7 @@ class ReviewFilter(QSortFilterProxyModel):
         self.terms: list[str] = []
         self.action = ""
         self.changes_only = True
-        self.unread_only = self.checked_only = self.failed_only = False
+        self.unread_only = self.checked_only = self.failed_only = self.unreadable_only = False
 
     def update(self, **kw):
         for k, v in kw.items():
@@ -242,6 +246,8 @@ class ReviewFilter(QSortFilterProxyModel):
         if self.checked_only and not (it.selected and it.action is not ReviewAction.KEEP):
             return False
         if self.failed_only and not it.status.startswith("FAILED"):
+            return False
+        if self.unreadable_only and not it.bad_formats:
             return False
         if self.terms:
             hay = strip_accents(" ".join(model.text(it, c) for c in range(1, len(model.HEADERS)))).casefold()
@@ -485,6 +491,10 @@ class ReviewWindow(QMainWindow):
             ("unread_only", "Not read", "Books the AI could not read (no file, no text, errors)"),
             ("checked_only", "Only checked", ""),
             ("failed_only", "Only failed", ""),
+            ("unreadable_only", "Unreadable files",
+             "Books with files Calibre can't open (a format it doesn't read, a fake PDF, a file that fails to\n"
+             "open). Only such files: proposed for the trash. Some: the whole record is copied to the trash\n"
+             "library as it is, then those files are removed from the book (right-click to keep them)."),
         ]:
             box = QCheckBox(label)
             box.setToolTip(tip)
@@ -681,13 +691,15 @@ class ReviewWindow(QMainWindow):
         """Ticks and actions: when idle and while scanning, never while executing."""
         return not self.model.locked and (not self._busy or self._operation == "scan")
 
-    def _counts(self) -> tuple[int, int, int]:
-        """(updates, trashes, books only tagged as reviewed) that Execute would do."""
+    def _counts(self) -> tuple[int, int, int, int]:
+        """(updates, trashes, books only tagged as reviewed, books losing unreadable
+        formats) that Execute would do."""
         actions = review_actions(self.model.items, self.fields_on)
         updates = sum(1 for a in actions if a["op"] == "set")
         trashes = sum(1 for a in actions if a["op"] == "trash")
         tags = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag")
-        return updates, trashes, tags
+        formats = sum(1 for a in actions if a.get("trash_formats"))
+        return updates, trashes, tags, formats
 
     def _update_summary(self):
         items = self.model.items
@@ -704,15 +716,16 @@ class ReviewWindow(QMainWindow):
             f"<b style='color:{ACTION_COLORS[ReviewAction.UPDATE]}'>{changed} with differences</b> · "
             f"<b style='color:#e65100'>{unread} not read</b> · {len(items)} books"
             + (f" · {skipped} already {REVIEWED_TAG}" if skipped else ""))
-        updates, trashes, tags = self._counts()
+        updates, trashes, tags, formats = self._counts()
         self.checked_label.setText(f"{updates} to update · {trashes} to trash · "
-                                   f"{updates + tags} to tag {REVIEWED_TAG}")
+                                   + (f"{formats} losing unreadable formats · " if formats else "")
+                                   + f"{updates + tags} to tag {REVIEWED_TAG}")
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
                                  else f"2. Execute and mark reviewed ({updates + trashes + tags})")
         set_running(self.execute_btn, executing)
         self.execute_btn.setEnabled(not self._busy and self.worker is None and self.result is not None
-                                    and bool(updates + trashes + tags))
+                                    and bool(updates + trashes + tags + formats))
 
     # --- table interaction ------------------------------------------------------------------
     def _visible_items(self) -> list[ReviewItem]:
@@ -773,6 +786,15 @@ class ReviewWindow(QMainWindow):
                 act = menu.addAction(f"{label} ({len(fits)})" if len(items) > 1 else label)
                 act.setEnabled(bool(fits))
                 act.triggered.connect(lambda _=False, a=action, f=fits: self._set_action(f, a))
+            partial = [i for i in items if i.bad_formats and not i.broken]
+            if partial:
+                menu.addSeparator()
+                for value, label in ((True, "Move the unreadable formats to the trash library"),
+                                     (False, "Keep the unreadable formats")):
+                    fits = [i for i in partial if i.trash_bad != value]
+                    act = menu.addAction(f"{label} ({len(fits)})" if len(items) > 1 else label)
+                    act.setEnabled(bool(fits))
+                    act.triggered.connect(lambda _=False, v=value, f=fits: self._set_trash_bad(f, v))
             menu.addSeparator()
             for name in FIELDS:
                 having = [i for i in items if name in i.changes]
@@ -788,6 +810,11 @@ class ReviewWindow(QMainWindow):
     def _set_action(self, items: list[ReviewItem], action: ReviewAction):
         for it in items:
             it.set_action(action)
+        self.model.refresh()
+
+    def _set_trash_bad(self, items: list[ReviewItem], value: bool):
+        for it in items:
+            it.trash_bad = value
         self.model.refresh()
 
     def _exclude(self, items: list[ReviewItem], name: str, exclude: bool):
@@ -916,8 +943,8 @@ class ReviewWindow(QMainWindow):
             return
         self._sync_settings()
         self.result.trash_library = self._library("trash")
-        updates, trashes, tags = self._counts()
-        if trashes and not self.result.trash_library:
+        updates, trashes, tags, formats = self._counts()
+        if (trashes or formats) and not self.result.trash_library:
             QMessageBox.warning(self, "No trash library", "Choose a trash library to move books to it.")
             return
         fields = ", ".join(FIELD_LABELS[f].lower() for f in FIELDS if f in self.fields_on) or "none"
@@ -928,6 +955,8 @@ class ReviewWindow(QMainWindow):
                 f"{updates} books will have their metadata updated (fields: {fields}).\n"
                 f"{trashes} books will be moved to the trash library; after a verified copy, each is "
                 f"{where} in the reviewed library.\n"
+                + (f"{formats} books have formats Calibre can't open: each whole record is copied to the trash "
+                   "library, then those formats are removed from the book.\n" if formats else "") +
                 f"The {updates} updated books and {tags} more (unchecked or nothing to change) will be tagged "
                 f"{REVIEWED_TAG}: the next scan skips them.\n"
                 + (f"The {unread} books the AI could not read are not tagged: the next scan tries them again.\n"
@@ -935,7 +964,10 @@ class ReviewWindow(QMainWindow):
                 + "\nContinue?") != QMessageBox.Yes:
             return
         self.model.locked = True
-        self._done_count, self._exec_total = 0, updates + trashes + tags
+        # (a book losing its unreadable formats with nothing written reports twice: formats, then tag)
+        self._done_count = 0
+        self._exec_total = updates + trashes + tags + sum(
+            1 for i in self.model.items if i.bad_formats_to_trash and not i.to_write(self.fields_on))
         self.progress.setMaximum(max(self._exec_total, 1))
         self.progress.setValue(0)
         worker = ExecuteWorker(self.settings, self.result, self.fields_on)

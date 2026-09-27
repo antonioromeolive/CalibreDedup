@@ -462,6 +462,15 @@ class SettingsDialog(QDialog):
             "While it is on, source books without a series and a number are left untouched:\n"
             "run the analysis again with it off for those.")
         self.a_series.setChecked(s.same_series)
+        self.a_unreadable = QCheckBox("Move files Calibre can't open to the trash library without asking")
+        self.a_unreadable.setToolTip(
+            "Files Calibre can't open: a format it doesn't read (DOC, JPG...), a file that isn't what its\n"
+            "format says (a \"PDF\" that is really a LIT book or a picture), or one that fails to open.\n"
+            "A book with only such files goes to the trash library. A book with some: its whole record is\n"
+            "copied to the trash library as it is, then those formats are removed from the source.\n"
+            "On: these are ticked like the other decisions. Off: they are listed (filter: Unreadable files)\n"
+            "and you tick them yourself.")
+        self.a_unreadable.setChecked(s.trash_unreadable)
         self.a_update = QCheckBox("Write AI-found title/authors/publisher/ISBN to moved books (only empty fields)")
         self.a_update.setChecked(s.update_metadata)
         self.a_permanent = QCheckBox("Delete permanently from source (else: Calibre's recycle bin)")
@@ -486,6 +495,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.a_author_variants)
         form.addRow(self.a_similar_titles)
         form.addRow(self.a_series)
+        form.addRow(self.a_unreadable)
         form.addRow(self.a_update)
         form.addRow(self.a_permanent)
         form.addRow("Calibre program folder", crow)
@@ -506,7 +516,7 @@ class SettingsDialog(QDialog):
             # Hidden, not left out: accept() still reads (and keeps) their values.
             for widget in (self.a_subtitle, self.a_similar, self.a_cover, self.a_cover_note, self.a_always_cover,
                            self.a_always_cover_note, self.a_years, self.a_years_note, self.a_author_variants,
-                           self.a_similar_titles, self.a_series, self.a_update, reset):
+                           self.a_similar_titles, self.a_series, self.a_unreadable, self.a_update, reset):
                 form.setRowVisible(widget, False)
             form.labelForField(self.a_pdf_pages).setText("PDF pages to read (from the start)")
             form.labelForField(self.a_chars).setText("Characters to read (other formats, from the start)")
@@ -601,6 +611,7 @@ class SettingsDialog(QDialog):
         s.same_series = self.a_series.isChecked()
         s.similar_titles = self.a_similar_titles.isChecked()
         s.author_variants = self.a_author_variants.isChecked()
+        s.trash_unreadable = self.a_unreadable.isChecked()
         s.update_metadata = self.a_update.isChecked()
         s.delete_permanently = self.a_permanent.isChecked()
         s.calibre_dir = self.a_calibre.text().strip()

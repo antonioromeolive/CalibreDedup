@@ -6,7 +6,8 @@ from pathlib import Path
 from .models import Action, Plan
 
 COLUMNS = ["source_id", "checked", "manual", "title", "authors", "action", "reason", "match", "add_formats",
-           "publisher", "edition", "year", "isbn", "ai_used", "ai_fields", "status"]
+           "unreadable_formats", "unreadable_to_trash", "publisher", "edition", "year", "isbn", "ai_used",
+           "ai_fields", "status"]
 
 
 def write_csv(plan: Plan, path: str | Path) -> None:
@@ -19,7 +20,8 @@ def write_csv(plan: Plan, path: str | Path) -> None:
                 it.source.id, "yes" if it.selected and it.action is not Action.LEAVE else "",
                 "yes" if it.manual else "", i.title or it.source.title, " & ".join(i.authors or it.source.authors),
                 it.action.value, it.reason, it.match.label() if it.match else "",
-                ",".join(it.add_formats), i.publisher or "", i.edition or "", i.year or "",
+                ",".join(it.add_formats), ",".join(sorted(it.bad_formats)),
+                "yes" if it.bad_formats_to_trash else "", i.publisher or "", i.edition or "", i.year or "",
                 ",".join(sorted(i.isbns)), "yes" if it.ai_used else "", ",".join(sorted(i.ai_fields)),
                 it.status,
             ])

@@ -14,7 +14,7 @@ from typing import Callable
 from .calibre_env import CREATE_NO_WINDOW, calibre_is_running, tool
 from .config import config_dir
 from .models import Action, Plan, PlanItem
-from .selection import actionable
+from .selection import actionable, blocked, runs_main_action
 
 log = logging.getLogger(__name__)
 BRIDGE = Path(__file__).with_name("bridge_script.py")
@@ -74,31 +74,35 @@ class _ExecutionLock:
 
 
 def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
-    """Bridge actions for the checked, unblocked items."""
+    """Bridge actions for the checked, unblocked items. "trash_formats": the formats
+    Calibre can't open, taken out of the source first (the whole record is copied to
+    the trash library as it is); on its own for a book whose action doesn't run."""
     actions = []
+    stuck = blocked(plan)
     for item in actionable(plan):
-        if item.action is Action.MOVE:
+        main = runs_main_action(item, stuck)
+        a = None
+        if main and item.action is Action.MOVE:
             a = {"op": "move", "src_id": item.source.id, "title": item.source.title}
             if update_metadata and item.identity.ai_fields:
                 a["set"] = _ai_values(item)
-            actions.append(a)
-        elif item.action is Action.TRASH:
+        elif main and item.action is Action.TRASH:
             a = {"op": "trash", "src_id": item.source.id, "title": item.source.title,
                  "add_formats": item.add_formats}
-            if item.match is None:  # forced by the user: no target copy to check or merge into
+            if item.match is None:  # forced by the user, or unreadable: no target copy to check or merge into
                 a["no_target"] = True
             elif item.match_planned:
                 a["target_src_id"] = item.match.id
             else:
                 a["target_id"] = item.match.id
+        elif main and item.action is Action.LEAVE and update_metadata and item.ai_used and item.identity.ai_fields:
+            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": _ai_values(item)}
+        bad = item.bad_formats_to_trash if not (a and a["op"] == "trash") else []  # trashed whole anyway
+        if bad:
+            a = a or {"op": "trash_formats", "src_id": item.source.id, "title": item.source.title}
+            a["trash_formats"] = bad
+        if a:
             actions.append(a)
-        elif item.action is Action.LEAVE and update_metadata and item.ai_used and item.identity.ai_fields:
-            actions.append({
-                "op": "update",
-                "src_id": item.source.id,
-                "title": item.source.title,
-                "set": _ai_values(item),
-            })
     return actions
 
 

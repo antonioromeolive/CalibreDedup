@@ -82,6 +82,31 @@ def file_problem(fmt: str, path: str) -> str:
     return f"the {fmt} file is really {what}" if what else f"the {fmt} file is not a valid {fmt}"
 
 
+# Formats Calibre can read (its input formats). Others (DOC, JPG, MBP...) are stored
+# by Calibre but can't be opened or converted by it.
+CALIBRE_INPUT_FORMATS = {
+    "AZW", "AZW1", "AZW3", "AZW4", "CB7", "CBC", "CBR", "CBZ", "CHM", "DJV", "DJVU", "DOCM", "DOCX", "DOTX",
+    "EPUB", "FB2", "FBZ", "HTM", "HTML", "HTMLZ", "KEPUB", "LIT", "LRF", "MARKDOWN", "MD", "MOBI", "ODT", "OEB",
+    "OPF", "PDB", "PDF", "PML", "PMLZ", "PRC", "RB", "RECIPE", "RTF", "SHTM", "SHTML", "SNB", "TCR", "TEXT",
+    "TEXTILE", "TPZ", "TXT", "TXTZ", "XHTM", "XHTML", "ZIP", "RAR", "7Z",
+}
+
+
+def unreadable_formats(formats: dict[str, str]) -> dict[str, str]:
+    """The book's formats Calibre can't open, with why: not an input format of
+    Calibre, or a file that is not what its format says. Missing files and
+    ORIGINAL_* formats (Calibre's own backups) are not counted."""
+    bad = {}
+    for fmt, path in formats.items():
+        if fmt.startswith("ORIGINAL_") or not Path(path).is_file():
+            continue
+        if fmt not in CALIBRE_INPUT_FORMATS:
+            bad[fmt] = f"Calibre can't read {fmt} files"
+        elif problem := file_problem(fmt, path):
+            bad[fmt] = problem
+    return bad
+
+
 @dataclass
 class Excerpt:
     text: str = ""
@@ -99,6 +124,8 @@ class TextExtractor:
         self._converted: dict[str, str] = {}  # path -> full text (ebook-convert cache)
         self._conversion_failed: set[str] = set()
         self._covers: dict[str, bytes | None] = {}  # path -> cover inside the file
+        # path -> why its text could not be read (corrupt, DRM, no Calibre reader...)
+        self.failed: dict[str, str] = {}
         self._tmp = tempfile.TemporaryDirectory(prefix="cdr_")
 
     def close(self) -> None:
@@ -132,7 +159,13 @@ class TextExtractor:
             return Excerpt(text=text, source=f"{fmt} {part} {self.text_chars} chars")
         except Exception as e:  # corrupt, DRM, unsupported...
             log.warning("Cannot extract text from %s: %s", path, e)
+            if Path(path).is_file():  # not a file (or drive) that went away meanwhile
+                self.failed[path] = f"Calibre can't read the {fmt} file ({_error_line(str(e))})"
             return Excerpt(source=f"{fmt} extraction failed: {e}")
+
+    def failed_formats(self, formats: dict[str, str]) -> dict[str, str]:
+        """The book's formats whose text could not be read so far, with why."""
+        return {fmt: self.failed[path] for fmt, path in formats.items() if path in self.failed}
 
     def embedded_cover(self, formats: dict[str, str]) -> tuple[str, bytes] | None:
         """The cover image stored inside the book's file (not Calibre's cover.jpg,
@@ -216,6 +249,12 @@ class TextExtractor:
         if proc.returncode != 0:
             raise RuntimeError(f"{name} failed: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
         return proc.stdout
+
+
+def _error_line(error: str) -> str:
+    """The telling line of a tool's error: its last non-empty line (tracebacks end there)."""
+    lines = [line.strip() for line in error.splitlines() if line.strip()]
+    return (lines[-1] if lines else error)[:150]
 
 
 def _slice(text: str, part: str, chars: int) -> str:

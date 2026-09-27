@@ -21,10 +21,12 @@ FILTER_LABELS = {Action.MOVE.value: ACTION_LABELS[Action.MOVE], MERGE: MERGE_LAB
 
 
 def mergeable_formats(item: PlanItem) -> list[str]:
-    """Formats of the book that its match lacks; PDF is never merged."""
+    """Formats of the book that its match lacks; PDF, and formats Calibre can't open,
+    are never merged."""
     if item.match is None:
         return []
-    return [f for f in item.source.formats if f not in item.match.formats and f != "PDF"]
+    return [f for f in item.source.formats
+            if f not in item.match.formats and f != "PDF" and f not in item.bad_formats]
 
 
 def filter_key(item: PlanItem) -> str:
@@ -73,7 +75,7 @@ def revert(item: PlanItem) -> None:
     item.reason = item.planned_reason
     item.add_formats = list(item.planned_add_formats)
     item.manual = False
-    item.selected = item.action is not Action.LEAVE
+    item.selected = item.planned_selected
 
 
 # --- dependencies ---------------------------------------------------------------
@@ -101,15 +103,18 @@ def actionable(plan: Plan) -> list[PlanItem]:
 
     A book left in source may still be updated with AI metadata when it was
     enriched but not moved/trash-ed. Those updates must be allowed without
-    treating normal leave decisions as executable actions.
+    treating normal leave decisions as executable actions. A book whose
+    unreadable formats go to the trash library is processed for that alone,
+    ticked or not.
     """
     stuck = blocked(plan)
-    return [
-        i for i in plan.items
-        if i.selected and i.source.id not in stuck and (
-            i.action is not Action.LEAVE or (i.ai_used and bool(i.identity.ai_fields))
-        )
-    ]
+    return [i for i in plan.items if runs_main_action(i, stuck) or i.bad_formats_to_trash]
+
+
+def runs_main_action(i: PlanItem, stuck: dict[int, str]) -> bool:
+    """Whether the item's own action (move, trash, metadata update) runs on Execute."""
+    return i.selected and i.source.id not in stuck and (
+        i.action is not Action.LEAVE or (i.ai_used and bool(i.identity.ai_fields)))
 
 
 # --- remembering choices --------------------------------------------------------
@@ -146,6 +151,8 @@ class SelectionStore:
                     continue
             if "selected" in e and item.action is not Action.LEAVE:
                 item.selected = bool(e["selected"])
+            if "trash_bad" in e and item.bad_formats and not item.unreadable:
+                item.trash_bad = bool(e["trash_bad"])
             restored += 1
         return restored
 
@@ -158,8 +165,13 @@ class SelectionStore:
                 e["action"] = item.action.value
                 if item.action is Action.TRASH and not item.add_formats:
                     e["merge"] = False
-            if item.action is not Action.LEAVE and not item.selected:
-                e["selected"] = False
+            # Only a tick that differs from the analysis' own: unreadable books start
+            # unticked unless the setting is on, and follow the setting until changed.
+            default = item.planned_selected if item.action is item.planned_action else item.action is not Action.LEAVE
+            if item.action is not Action.LEAVE and item.selected != default:
+                e["selected"] = item.selected
+            if item.bad_formats and not item.unreadable and item.trash_bad != item.planned_trash_bad:
+                e["trash_bad"] = item.trash_bad
             if e and item.source.uuid:
                 entries[item.source.uuid] = e
         data = self._read()

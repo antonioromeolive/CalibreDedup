@@ -88,6 +88,12 @@ class PlanItem:
     # e.g. the cover check with no Image AI, or the AI turned off after errors.
     skipped: list[str] = field(default_factory=list)
     by_cover: bool = False  # a duplicate because the covers are the same
+    # Formats Calibre can't open (format -> why). All of them: the item trashes the book.
+    # Some: the book was decided on the others, and with `trash_bad` its whole record is
+    # copied to the trash library as it is, then those formats are removed from the source.
+    bad_formats: dict[str, str] = field(default_factory=dict)
+    trash_bad: bool = False
+    planned_trash_bad: bool = False  # the analysis' own choice (the setting)
     status: str = ""  # filled during execution
     selected: bool = True  # user wants this item executed (meaningless for LEAVE)
     manual: bool = False  # action overridden by the user
@@ -95,12 +101,23 @@ class PlanItem:
     planned_action: Action | None = None
     planned_reason: str = ""
     planned_add_formats: list[str] = field(default_factory=list)
+    planned_selected: bool = True
 
     def __post_init__(self):
         self.planned_action = self.action
         self.planned_reason = self.reason
         self.planned_add_formats = list(self.add_formats)
-        self.selected = self.action is not Action.LEAVE
+        self.selected = self.planned_selected = self.action is not Action.LEAVE
+
+    @property
+    def unreadable(self) -> bool:
+        """Every format of the book is one Calibre can't open."""
+        return bool(self.bad_formats) and set(self.bad_formats) >= set(self.source.formats)
+
+    @property
+    def bad_formats_to_trash(self) -> list[str]:
+        """The formats to take out of the source on Execute (some formats bad, box ticked)."""
+        return sorted(self.bad_formats) if self.trash_bad and not self.unreadable else []
 
 
 @dataclass
