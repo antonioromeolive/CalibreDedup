@@ -1,3 +1,25 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Planner tests on real (tiny) metadata.db files built with the Calibre schema subset we read."""
 
 import itertools
@@ -180,19 +202,33 @@ def test_non_library_folder_rejected(libs, tmp_path):
         build_plan(src, tgt, str(junk))
 
 
-def test_same_library_merges_formats_and_keeps_richer_record(tmp_path, monkeypatch):
+def test_same_library_keeps_the_epub_copy_and_merges_the_other_formats(tmp_path, monkeypatch):
     monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
     library = make_library(tmp_path / "library", [
         {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["EPUB"]},
         {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["MOBI"],
-         "cover": True, "comments": "A novel"},
+         "cover": True, "comments": "A novel"},  # richer, but EPUB is preferred
     ])
     plan = build_plan(library, library, str(tmp_path / "trash"))
 
-    assert actions(plan) == [("Dune", Action.TRASH), ("Dune", Action.LEAVE)]
-    duplicate = plan.items[0]
-    assert duplicate.add_formats == ["EPUB"]
-    assert duplicate.match is not None
+    assert actions(plan) == [("Dune", Action.LEAVE), ("Dune", Action.TRASH)]
+    duplicate = plan.items[1]
+    assert duplicate.add_formats == ["MOBI"]
+    assert duplicate.match is not None and duplicate.match.id == 1
+
+
+def test_same_library_keeps_mobi_over_azw_then_the_richer_record(tmp_path, monkeypatch):
+    monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
+    library = make_library(tmp_path / "library", [
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["AZW3"], "comments": "A novel"},
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["MOBI"]},
+        {"title": "Emma", "publisher": "Penguin", "year": 1990, "formats": ["EPUB"]},
+        {"title": "Emma", "publisher": "Penguin", "year": 1990, "formats": ["EPUB"], "comments": "richer"},
+    ])
+    plan = build_plan(library, library, str(tmp_path / "trash"))
+    assert actions(plan) == [("Dune", Action.TRASH), ("Dune", Action.LEAVE),
+                             ("Emma", Action.TRASH), ("Emma", Action.LEAVE)]
+    assert plan.items[0].match.id == 2 and plan.items[2].match.id == 4
 
 
 def test_same_library_leaves_distinct_books(tmp_path, monkeypatch):
@@ -869,3 +905,48 @@ def test_first_names_as_initials_are_the_same_person_without_ai(libs):
     item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
     assert item.action is Action.TRASH and "(initials)" in item.reason
     assert resolver.person_calls == []
+
+
+def test_cleanup_only_trashes_the_duplicates_and_copies_nothing(libs):
+    from calibre_dedup.executor import plan_actions
+    from calibre_dedup.selection import blocked, override
+    src, tgt, trash = libs(
+        source=[
+            {"title": "Dune", "isbn": "9780441013593", "formats": ["EPUB"]},  # in the target: trash
+            {"title": "Dune Messiah", "publisher": "Ace", "year": 1969},  # a copy: goes to trash
+            {"title": "Dune Messiah", "publisher": "Ace", "year": 1969,
+             "comments": "richer"},  # not in the target: the richer copy stays
+            {"title": "Children of Dune", "isbn": "9780441104024", "formats": ["EPUB", "MOBI"]},
+        ],
+        target=[{"title": "Dune", "isbn": "9780441013593", "formats": ["EPUB"]},
+                {"title": "Children of Dune", "isbn": "9780441104024", "formats": ["EPUB"]}])
+    plan = build_plan(src, tgt, trash, cleanup_only=True)
+    assert actions(plan) == [("Dune", Action.TRASH), ("Dune Messiah", Action.TRASH),
+                             ("Dune Messiah", Action.LEAVE), ("Children of Dune", Action.LEAVE)]
+    copy, kept = plan.items[1], plan.items[2]
+    assert "cleanup only: not in the target" in kept.reason
+    assert copy.match.id == 3 and copy.match_in_source and not copy.match_planned and copy.selected
+    assert "another copy (#3) stays in the source" in copy.reason
+    children = plan.items[3]
+    assert "its copy lacks MOBI" in children.reason and children.match is not None and not children.selected
+    assert [(a["op"], a["src_id"], a["add_formats"], a.get("keep_src_id")) for a in plan_actions(plan, True)] == [
+        ("trash", 1, [], None), ("trash", 2, [], 3)]
+    kept.selected, kept.action = True, Action.TRASH  # trashing the kept copy too blocks its copy
+    assert "the copy kept in the source" in blocked(plan)[2]
+    override(children, Action.TRASH)  # the user can still merge it (right-click Merge & Trash)
+    assert children.add_formats == ["MOBI"] and children.selected
+
+
+def test_cleanup_only_keeps_the_epub_copy(libs):
+    from calibre_dedup.selection import override
+    src, tgt, trash = libs(
+        source=[{"title": "Dune Messiah", "publisher": "Ace", "year": 1969, "formats": ["MOBI"],
+                 "comments": "richer"},
+                {"title": "Dune Messiah", "publisher": "Ace", "year": 1969, "formats": ["EPUB"]}],
+        target=[])
+    plan = build_plan(src, tgt, trash, cleanup_only=True)
+    assert actions(plan) == [("Dune Messiah", Action.LEAVE), ("Dune Messiah", Action.LEAVE)]
+    mobi = plan.items[0]  # it has a format the EPUB copy lacks: left for the user
+    assert mobi.match.id == 2 and "another copy (#2) stays in the source, but it lacks MOBI" in mobi.reason
+    override(mobi, Action.TRASH)  # right-click Merge & Trash: its MOBI goes to the EPUB copy
+    assert mobi.add_formats == ["MOBI"] and mobi.match_in_source and mobi.selected

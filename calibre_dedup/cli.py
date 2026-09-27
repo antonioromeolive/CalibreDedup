@@ -1,3 +1,25 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Command-line interface: analyze (and optionally execute) without the GUI."""
 
 from __future__ import annotations
@@ -27,6 +49,9 @@ def run(argv: list[str]) -> int:
     ap.add_argument("--image-profile",
                     help="profile of the image AI, for covers and scanned PDFs; '' for none (default: as in the GUI)")
     ap.add_argument("--no-ai", action="store_true", help="use metadata only")
+    ap.add_argument("--cleanup-only", action="store_true", default=None,
+                    help="only send the source books already in the target to the trash library; "
+                         "copy nothing to the target (default: as set in the GUI)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
     ap.add_argument("--report", help="write the plan as CSV to this file")
@@ -55,7 +80,8 @@ def run(argv: list[str]) -> int:
                           recheck_years=settings.recheck_years, same_series=settings.same_series,
                           similar_titles=settings.similar_titles, always_cover=settings.always_cover,
                           author_variants=settings.author_variants,
-                          trash_unreadable=settings.trash_unreadable)
+                          trash_unreadable=settings.trash_unreadable,
+                          cleanup_only=settings.cleanup_only if args.cleanup_only is None else True)
         print(file=sys.stderr)
     finally:
         if resolver:

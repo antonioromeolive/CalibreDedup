@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT (see the LICENSE file for the full terms)
+
 .venv/
 __pycache__/
 *.egg-info/

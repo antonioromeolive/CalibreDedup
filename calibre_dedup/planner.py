@@ -1,3 +1,25 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Build the plan: decide, for every source book, whether to move it to the
 target library, send it to the trash library, or leave it where it is. When
 source and target are the same library, duplicate records are merged into the
@@ -528,12 +550,15 @@ def build_plan(
     always_cover: bool = False,
     author_variants: bool = False,
     trash_unreadable: bool = False,
+    cleanup_only: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
     Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
     `trash_unreadable` also ticks them: all formats bad, the book goes to the trash
     library; some, its record is copied there and those formats leave the source.
+    `cleanup_only`: nothing is copied to the target; only the source books already in
+    it go to the trash library (see _cleanup_only). Ignored when source is target.
     `similar_titles`: with no book of the same title, also look at books by the
     same author whose title contains this one's, or the other way round (see
     _decide_similar). `always_cover`: compare covers also when the metadata says
@@ -571,8 +596,14 @@ def build_plan(
 
     total = len(source_books)
     analysis_books = source_books
-    if same_library:
-        analysis_books = sorted(source_books, key=_metadata_richness, reverse=True)
+    cleanup = cleanup_only and not same_library
+    unreadable: dict[int, dict[str, str]] = {}  # id(book) -> its formats Calibre can't open
+    if same_library or cleanup:
+        # Of two copies, the one decided first is kept: the best format (EPUB, MOBI, AZW),
+        # then the richer metadata.
+        unreadable = {id(b): unreadable_formats(b.formats) for b in source_books}
+        analysis_books = sorted(source_books, key=lambda b: (-_format_rank(b, unreadable[id(b)]),
+                                                             _metadata_richness(b)), reverse=True)
     libraries = [Path(source, "metadata.db")] + ([Path(target, "metadata.db")] if target_books else [])
     checked = time.monotonic()
 
@@ -589,8 +620,9 @@ def build_plan(
             break
         progress(n - 1, total, f"Analyzing {sb.label()}")
         book = sb  # as the analysis sees it: without the formats Calibre can't open
+        kept = False  # cleanup: a book not in the target, kept in the source (its copies are trashed)
         try:
-            bad = unreadable_formats(sb.formats)
+            bad = dict(unreadable[id(sb)]) if id(sb) in unreadable else unreadable_formats(sb.formats)
             if bad and set(bad) >= set(sb.formats):
                 item = _unreadable_item(sb, bad, trash_unreadable, same_series)
             else:
@@ -609,6 +641,8 @@ def build_plan(
                     item.bad_formats = bad
                     item.trash_bad = item.planned_trash_bad = trash_unreadable
                     item.reason = item.planned_reason = _join(item.reason, [_bad_note(bad)])
+            if cleanup:
+                kept = _cleanup_only(item)
         except OSError as e:
             # A missing or locked file is this book's problem; anything else (the
             # drive went away, I/O errors) would fail every book: stop, keep the rest.
@@ -636,7 +670,7 @@ def build_plan(
         if same_library:
             if item.action is not Action.TRASH:
                 add_to_index(_Candidate(book, item.identity, planned=False, ai_done=item.ai_used))
-        elif item.action is Action.MOVE:
+        elif item.action is Action.MOVE or kept:
             add_to_index(_Candidate(book, item.identity, planned=True, ai_done=item.ai_used))
         # Only now: the user may change the item from here on (planner decisions
         # above use the analysis' own verdict, never the user's override).
@@ -654,7 +688,7 @@ def build_plan(
                     else "")
             plan.ai_down.append(f"The {what} stopped responding at book {n} of {total}{rest}.")
     progress(len(plan.items), total, "Analysis stopped" if plan.stopped else "Analysis complete")
-    if same_library:
+    if same_library or cleanup:
         order = {id(b): i for i, b in enumerate(source_books)}
         plan.items.sort(key=lambda item: order[id(item.source)])
     return plan
@@ -693,6 +727,35 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
 
 
 UNREADABLE_REASON = "no file Calibre can open"
+CLEANUP = "cleanup only"
+
+
+def _cleanup_only(item: PlanItem) -> bool:
+    """Cleanup of the source: the target is never written. A book not in the target
+    stays in the source (returns True: it is the copy kept); a copy of such a book
+    goes to the trash library, the kept one stays. A duplicate whose kept copy lacks
+    some of its formats (trashing it would drop them from both libraries) stays too:
+    the user decides, e.g. right-click Merge & Trash. The other duplicates go to the
+    trash library as usual."""
+    kept = False
+    if item.action is Action.TRASH and item.match_planned and item.match is not None:
+        item.match_planned, item.match_in_source = False, True  # nothing is moved: it stays
+        if not item.add_formats:
+            item.reason = item.planned_reason = (f"{CLEANUP}: another copy (#{item.match.id}) stays "
+                                                 f"in the source ({item.reason})")
+            return False
+        why = f"another copy (#{item.match.id}) stays in the source, but it lacks {', '.join(item.add_formats)}"
+    elif item.action is Action.MOVE:
+        why, kept = "not in the target", True
+    elif item.action is Action.TRASH and item.add_formats:
+        why = f"in the target, but its copy lacks {', '.join(item.add_formats)}"
+    else:
+        return False
+    item.action = item.planned_action = Action.LEAVE
+    item.add_formats, item.planned_add_formats = [], []
+    item.reason = item.planned_reason = f"{CLEANUP}: {why}, left in source ({item.reason})"
+    item.selected = item.planned_selected = False
+    return kept
 
 
 def _bad_note(bad: dict[str, str]) -> str:
@@ -707,6 +770,16 @@ def _unreadable_item(sb: Book, bad: dict[str, str], selected: bool, same_series:
     item.selected = item.planned_selected = selected
     log.info("%s: %s", sb.label(), item.reason)
     return item
+
+
+# Which copy of a book is kept when there are several: the one with the best of these formats.
+KEEP_FORMAT_ORDER = [("EPUB",), ("MOBI",), ("AZW", "AZW3")]
+
+
+def _format_rank(book: Book, bad: dict[str, str]) -> int:
+    """0 for a book with an EPUB Calibre can open, 1 with a MOBI, 2 with an AZW, 3 otherwise."""
+    good = set(book.formats) - set(bad)
+    return next((rank for rank, fmts in enumerate(KEEP_FORMAT_ORDER) if good & set(fmts)), len(KEEP_FORMAT_ORDER))
 
 
 def _metadata_richness(book: Book) -> int:

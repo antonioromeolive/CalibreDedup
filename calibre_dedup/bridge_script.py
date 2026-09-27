@@ -1,3 +1,25 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Executes a plan inside Calibre's own Python environment.
 
 Run as:  calibre-debug bridge_script.py plan.json
@@ -224,6 +246,25 @@ def main(plan_path):
                     # Forced by the user for a book with no copy in the target.
                     new_id = copy_verified(src, sid, trash)
                     msg = f"moved to trash (id {new_id})" + ("; no copy in the target" if tgt is not None else "")
+                elif action["op"] == "trash" and action.get("keep_src_id"):
+                    # Cleanup only: another copy of the book stays (or was just moved to the target).
+                    kid = action["keep_src_id"]
+                    if kid in moved:
+                        db, keep = tgt, moved[kid]
+                    elif kid in src.all_book_ids():
+                        db, keep = src, kid
+                    else:
+                        raise RuntimeError(f"the copy to keep (#{kid}) is no longer in the source")
+                    added = []
+                    for fmt in action.get("add_formats") or []:
+                        path = src.format_abspath(sid, fmt)
+                        if path and fmt not in db.formats(keep):
+                            db.add_format(keep, fmt, path, replace=False)
+                            added.append(fmt)
+                    new_id = copy_verified(src, sid, trash)
+                    msg = f"moved to trash (id {new_id}); copy #{kid} kept"
+                    if added:
+                        msg += f"; added {', '.join(added)} to it"
                 elif action["op"] == "trash":
                     tid = action.get("target_id") or moved.get(action.get("target_src_id"))
                     if tid is None or tid not in tgt.all_book_ids():

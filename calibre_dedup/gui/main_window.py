@@ -1,3 +1,25 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from __future__ import annotations
 
 import html
@@ -296,6 +318,7 @@ class PlanModel(QAbstractTableModel):
             action_label(it) + (" (manual)" if it.manual else ""),
             f"{why_blocked} | {it.reason}" if why_blocked else it.reason,
             (it.match.label() + (" (moving now)" if it.match_planned else "")
+             + (" (kept in source)" if it.match_in_source else "")
              + (" (different edition)" if it.different and it.action is not Action.TRASH else ""))
             if it.match else "",
             _formats_text(it),
@@ -484,6 +507,7 @@ class AnalyzeWorker(QThread):
                               always_cover=self.settings.always_cover,
                               author_variants=self.settings.author_variants,
                               trash_unreadable=self.settings.trash_unreadable,
+                              cleanup_only=self.settings.cleanup_only,
                               on_item=on_item)
             if batch:
                 self.items_ready.emit(batch.copy())
@@ -569,6 +593,15 @@ class MainWindow(QMainWindow):
             grid.addWidget(box, r, 1)
             grid.addWidget(browse, r, 2)
             self.lib_boxes[key] = box
+        self.cleanup_box = QCheckBox("Cleanup source only (don't copy anything to the target)")
+        self.cleanup_box.setToolTip(
+            "Only the source books already in the target are handled: they go to the trash library.\n"
+            "Nothing is written to the target: books not in it stay in the source, and so do\n"
+            "duplicates whose target copy lacks one of their formats (trashing them would drop that\n"
+            "format from both libraries): right-click to Merge & Trash them, or leave them.")
+        self.cleanup_box.setChecked(settings.cleanup_only)
+        self.cleanup_box.toggled.connect(self._update_notices)
+        grid.addWidget(self.cleanup_box, len(rows), 1, 1, 2)
         grid.setColumnStretch(1, 1)
 
         # AI row
@@ -793,7 +826,7 @@ class MainWindow(QMainWindow):
         return replace(
             self.settings, source_library=self._library("source"), target_library=self._library("target"),
             trash_library=self._library("trash"), text_profile=self.text_box.currentData() or "",
-            image_profile=self.image_box.currentData() or "")
+            image_profile=self.image_box.currentData() or "", cleanup_only=self.cleanup_box.isChecked())
 
     def _update_notices(self, *_):
         """The amber bar above the table: what the user should know about the shown plan."""
@@ -861,6 +894,7 @@ class MainWindow(QMainWindow):
         s.source_library, s.target_library, s.trash_library = (self._library(k) for k in ("source", "target", "trash"))
         s.text_profile = self.text_box.currentData() or ""
         s.image_profile = self.image_box.currentData() or ""
+        s.cleanup_only = self.cleanup_box.isChecked()
         s.save()
 
     def _set_busy(self, busy: bool):
@@ -886,6 +920,7 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(not busy)  # no sorting while rows arrive or results come in
         for box in self.lib_boxes.values():
             box.setEnabled(not busy)
+        self.cleanup_box.setEnabled(not busy)
         editable = self._can_edit()
         for btn in (self.check_btn, self.uncheck_btn, self.invert_btn):
             btn.setEnabled(editable)

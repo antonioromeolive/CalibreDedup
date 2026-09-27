@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo
+# SPDX-License-Identifier: MIT (see the LICENSE file for the full terms)
+
 # Runtime dependencies
 PySide6-Essentials>=6.6
 requests>=2.31
