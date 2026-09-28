@@ -54,7 +54,14 @@ def test_ai_year_is_included_in_move_metadata():
     item = plan.items[0]
     item.identity = Identity(year=1990, ai_fields={"year"})
 
-    assert plan_actions(plan, update_metadata=True)[0]["set"] == {"year": 1990}
+    action = plan_actions(plan, update_metadata=True)[0]
+    assert action["set"] == {"year": 1990} and action["updated_tag"] == "AIUpdated"
+
+
+def test_moves_without_ai_metadata_ask_for_no_tag():
+    plan = make_plan()
+    plan.items[0].identity = Identity(year=1990, ai_fields={"year"})
+    assert "updated_tag" not in plan_actions(plan, update_metadata=False)[0]
 
 
 def test_failed_execution_keeps_book_in_source():
@@ -88,6 +95,7 @@ def test_leave_items_with_ai_metadata_are_updated_in_source():
         "src_id": item.source.id,
         "title": item.source.title,
         "set": {"title": "New title", "authors": ["Alice Example"]},
+        "updated_tag": "AIUpdated",
     }
 
 

@@ -41,8 +41,9 @@ from pathlib import Path
 from typing import Callable
 
 from . import perf
+from .archives import Unpack, prepare as unpack_archives
 from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadata
-from .executor import ExecutionError, run_bridge
+from .executor import AI_UPDATED_TAG, ExecutionError, run_bridge
 from .calibre_env import calibre_is_running
 from .config import config_dir
 from .extract import cover_png, unreadable_formats
@@ -89,6 +90,13 @@ class ReviewItem:
     # as it is, then those formats are removed from the book (whatever its action).
     bad_formats: dict[str, str] = field(default_factory=dict)
     trash_bad: bool = True
+    # The book's archives (archives.Unpack): unpacked on Execute when their `unpack` is on,
+    # whatever the book's action (unless the whole book goes to the trash).
+    archives: list = field(default_factory=list)
+
+    @property
+    def archives_to_unpack(self) -> list:
+        return [u for u in self.archives if u.unpack and not u.problem]
 
     @property
     def broken(self) -> bool:
@@ -361,8 +369,11 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  progress: Callable[[int, int, str], None] | None = None,
                  cancel: threading.Event | None = None,
                  on_item: Callable[[ReviewItem], None] | None = None,
-                 skip_reviewed: bool = True) -> ReviewResult:
-    """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day)."""
+                 skip_reviewed: bool = True,
+                 unpack: Callable[[Book, Unpack], bool] | None = None) -> ReviewResult:
+    """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
+    `unpack(book, archive)`: asked for each clear archive whether to unpack it (see
+    archives.py); None: archives are read as they are."""
     check_libraries(library, trash)
     books = read_books(library)
     skipped = sum(1 for b in books if is_reviewed(b)) if skip_reviewed else 0
@@ -380,7 +391,11 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
         perf.book(n + 1)
         if progress:
             progress(n, len(books), f"Reading {book.label()}")
-        item = _review_book(reviewer, book)
+        seen, archives = unpack_archives(book, reviewer.extractor, unpack) if unpack is not None else (book, [])
+        item = _review_book(reviewer, book, seen)
+        if archives:
+            item.archives = archives
+            item.note = _join(item.note, "; ".join(u.note for u in archives))
         if item.changes:
             log.info("%s: %s", book.label(), ", ".join(
                 f"{k} {format_value(k, current_value(book, k))!r} -> {format_value(k, v)!r}"
@@ -396,17 +411,19 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     return result
 
 
-def _review_book(reviewer: Reviewer, book: Book) -> ReviewItem:
+def _review_book(reviewer: Reviewer, book: Book, seen: Book | None = None) -> ReviewItem:
     """Files Calibre can't open are not read: when no file can be, the book is proposed
     for the trash without asking the AI; else the AI reads the others (the next one
-    when a file fails to open), and those files are proposed for the trash library."""
-    bad = unreadable_formats(book.formats)
+    when a file fails to open), and those files are proposed for the trash library.
+    `seen`: the book as read, with an unpacked archive's files instead of the archive."""
+    seen = seen or book
+    bad = unreadable_formats(seen.formats)
     while True:
-        if bad and set(bad) >= set(book.formats):
+        if bad and set(bad) >= set(seen.formats):
             log.warning("%s: %s", book.label(), "; ".join(bad.values()))
             return ReviewItem(book, None, f"no file Calibre can open ({'; '.join(bad.values())}): "
                                           "proposed for the trash", bad_formats=bad)
-        good = replace(book, formats={f: p for f, p in book.formats.items() if f not in bad}) if bad else book
+        good = replace(seen, formats={f: p for f, p in seen.formats.items() if f not in bad}) if bad else seen
         meta, note = reviewer.review(good)
         extractor = reviewer.extractor
         failed = extractor.failed_formats(good.formats) if hasattr(extractor, "failed_formats") else {}
@@ -434,7 +451,8 @@ def summary(result: ReviewResult) -> str:
 def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> list[dict]:
     """Bridge actions: "set" for the checked updates, "trash" (no target) for the
     checked trash, and one "tag" with every other reviewed book: updated or not,
-    each book of the scan is tagged REVIEWED_TAG ("set" tags its book too). Not the
+    each book of the scan is tagged REVIEWED_TAG ("set" tags its book too, and
+    AI_UPDATED_TAG when a field is written). Not the
     books the AI couldn't read (unless the user chose Keep): the next scan tries
     them again. "trash_formats": the formats Calibre can't open go first (the whole
     record is copied to the trash library as it is), on their own for a book with
@@ -449,10 +467,13 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
         bad = it.bad_formats_to_trash
         if bad:
             base["trash_formats"] = bad
+        unpack = [u.spec(remove=True) for u in it.archives_to_unpack]
+        if unpack:
+            base["unpack"] = unpack
         changes = it.to_write(fields_on) if it.selected and it.action is ReviewAction.UPDATE else {}
         if not changes:
-            if bad:
-                actions.append({**base, "op": "trash_formats"})
+            if bad or unpack:
+                actions.append({**base, "op": "trash_formats" if bad else "unpack"})
             if (it.found is not None or it.manual) and not is_reviewed(it.book):
                 tag_ids.append(it.book.id)
             continue
@@ -464,7 +485,7 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
                     values["series_index"] = value[1]
             else:
                 values[name] = value
-        actions.append({**base, "op": "set", "set": values, "tag": REVIEWED_TAG})
+        actions.append({**base, "op": "set", "set": values, "tag": REVIEWED_TAG, "updated_tag": AI_UPDATED_TAG})
     if tag_ids:
         actions.append({"op": "tag", "src_ids": tag_ids, "tag": REVIEWED_TAG})
     return actions
@@ -504,7 +525,8 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
     actions = review_actions(result.items, fields_on)
     if not actions:
         return 0, 0, 0
-    if any(a["op"] == "trash" or a.get("trash_formats") for a in actions) and not result.trash_library:
+    if any(a["op"] == "trash" or a.get("trash_formats") or a.get("unpack") for a in actions) \
+            and not result.trash_library:
         raise ExecutionError("Choose a trash library to move books to it.")
     items = {i.book.id: i for i in result.items}
     sent = {a["src_id"]: a for a in actions if "src_id" in a}
@@ -538,6 +560,10 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
                 gone = set(action["trash_formats"])
                 item.book = replace(item.book, formats={f: p for f, p in item.book.formats.items() if f not in gone})
                 item.bad_formats = {f: why for f, why in item.bad_formats.items() if f not in gone}
+            if action.get("unpack"):  # done: its files are now the book's formats
+                item.archives = [u for u in item.archives if not u.unpack]
+                if msg.get("formats") and action["op"] != "set":
+                    item.book = replace(item.book, formats={f.upper(): p for f, p in msg["formats"].items() if p})
             if action["op"] == "set":
                 book = apply_to_book(item.book, action["set"], msg.get("path"), msg.get("formats"))
                 book.tags = set(book.tags) | ({action["tag"]} if action.get("tag") else set())

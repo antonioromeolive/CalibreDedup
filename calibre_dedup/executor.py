@@ -26,9 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
-import tempfile
 import threading
 from pathlib import Path
 from typing import Callable
@@ -37,9 +35,13 @@ from .calibre_env import CREATE_NO_WINDOW, calibre_is_running, tool
 from .config import config_dir
 from .models import Action, Plan, PlanItem
 from .selection import actionable, blocked, runs_main_action
+from .tempdirs import RunDir, lock, unlock
 
 log = logging.getLogger(__name__)
 BRIDGE = Path(__file__).with_name("bridge_script.py")
+# Added to every book whose metadata is written from what the AI read in it (both programs),
+# only when a field actually changes: search it in Calibre to check the AI's work.
+AI_UPDATED_TAG = "AIUpdated"
 
 
 class ExecutionError(Exception):
@@ -62,18 +64,7 @@ class _ExecutionLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("a+b")
         try:
-            self._file.seek(0)
-            if self._file.read(1) == b"":
-                self._file.seek(0)
-                self._file.write(b"0")
-                self._file.flush()
-            self._file.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock(self._file)
         except OSError as e:
             self._file.close()
             self._file = None
@@ -83,13 +74,7 @@ class _ExecutionLock:
         if self._file is None:
             return
         try:
-            if os.name == "nt":
-                import msvcrt
-                self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            unlock(self._file)
         finally:
             self._file.close()
             self._file = None
@@ -98,7 +83,8 @@ class _ExecutionLock:
 def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
     """Bridge actions for the checked, unblocked items. "trash_formats": the formats
     Calibre can't open, taken out of the source first (the whole record is copied to
-    the trash library as it is); on its own for a book whose action doesn't run."""
+    the trash library as it is); on its own for a book whose action doesn't run.
+    "unpack": the archives to unpack (see archives.Unpack.spec), likewise."""
     actions = []
     stuck = blocked(plan)
     for item in actionable(plan):
@@ -107,7 +93,7 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
         if main and item.action is Action.MOVE:
             a = {"op": "move", "src_id": item.source.id, "title": item.source.title}
             if update_metadata and item.identity.ai_fields:
-                a["set"] = _ai_values(item)
+                a["set"], a["updated_tag"] = _ai_values(item), AI_UPDATED_TAG
         elif main and item.action is Action.TRASH:
             a = {"op": "trash", "src_id": item.source.id, "title": item.source.title,
                  "add_formats": item.add_formats}
@@ -120,11 +106,20 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
             else:
                 a["target_id"] = item.match.id
         elif main and item.action is Action.LEAVE and update_metadata and item.ai_used and item.identity.ai_fields:
-            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": _ai_values(item)}
-        bad = item.bad_formats_to_trash if not (a and a["op"] == "trash") else []  # trashed whole anyway
+            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": _ai_values(item),
+                 "updated_tag": AI_UPDATED_TAG}
+        trashed = bool(a and a["op"] == "trash")
+        bad = item.bad_formats_to_trash if not trashed else []  # trashed whole anyway
+        # Archives: their files are added first (a merge may need them); a book trashed
+        # whole keeps its archive, since the record goes to the trash library anyway.
+        unpack = [u.spec(remove=not trashed) for u in item.archives_to_unpack]
+        if bad or unpack:
+            a = a or {"op": "trash_formats" if bad else "unpack", "src_id": item.source.id,
+                      "title": item.source.title}
         if bad:
-            a = a or {"op": "trash_formats", "src_id": item.source.id, "title": item.source.title}
             a["trash_formats"] = bad
+        if unpack:
+            a["unpack"] = unpack
         if a:
             actions.append(a)
     return actions
@@ -154,8 +149,9 @@ def run_bridge(calibre_dir: Path, payload: dict, on_message: Callable[[dict], No
     execution_lock = _ExecutionLock()
     execution_lock.acquire()
     try:
-        with tempfile.TemporaryDirectory(prefix="cdr_exec_") as tmp:
-            plan_file = Path(tmp) / "plan.json"
+        with RunDir("execute_") as tmp:
+            payload = {**payload, "tmp": str(tmp)}  # where the bridge extracts archives
+            plan_file = tmp / "plan.json"
             plan_file.write_text(json.dumps(payload), encoding="utf-8")
             proc = subprocess.Popen(
                 [str(tool(calibre_dir, "calibre-debug")), str(BRIDGE), str(plan_file)],
@@ -222,6 +218,8 @@ def execute_plan(
         item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
         if msg["ok"]:
             ok += 1
+            if item.archives_to_unpack:  # done: the book no longer has them
+                item.archives = [u for u in item.archives if not u.unpack]
             log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
         else:
             failed += 1

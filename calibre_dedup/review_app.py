@@ -33,6 +33,7 @@ import sys
 
 
 def run_cli(argv: list[str]) -> int:
+    from . import perf, tempdirs
     from .ai import AICache
     from .config import config_dir, load_review_settings
     from .review import (
@@ -57,9 +58,13 @@ def run_cli(argv: list[str]) -> int:
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer of the review first (review_cache.json)")
+    ap.add_argument("--unpack", action="store_true",
+                    help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are read as they are)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
+    perf.configure("calibre_review_perf.log")
+    tempdirs.sweep()
     if args.text_profile:
         settings.text_profile = args.text_profile
     if args.image_profile is not None:
@@ -77,7 +82,8 @@ def run_cli(argv: list[str]) -> int:
         def progress(done, total, msg):
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
         result = scan_library(args.library, args.trash, reviewer, progress,
-                              skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed)
+                              skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed,
+                              unpack=(lambda book, archive: True) if args.unpack else None)
         print(file=sys.stderr)
     finally:
         reviewer.cache.save()

@@ -18,7 +18,7 @@ metadata isn't enough.
 
 Both programs work the same way, in three steps:
 
-1. **Analyze** (button *1. Analyze (dry run)*, or *1. Scan with AI* in the review):
+1. **Analyze** (button *1. Analyze (dry run)*):
    read-only, safe while Calibre is open. Books appear in a list as soon as they are
    decided, each with the proposed action and the reason.
 2. **Review** the list: filter it, tick or untick books, change any proposal.
@@ -62,7 +62,7 @@ console to see the error.
 **Libraries.** Calibre needs library paths shorter than 89 characters. A target or trash
 library is created when you choose an empty folder.
 
-**Both programs at once.** Analyses and scans can run side by side. Executions take turns:
+**Both programs at once.** Analyses can run side by side. Executions take turns:
 while one program executes, the other's *Execute* waits until it is done.
 
 
@@ -157,7 +157,9 @@ default into the source library's Calibre recycle bin (Settings → Analysis →
 permanently from source* to skip it).
 
 With *Write AI-found title/authors/publisher/ISBN to moved books* (on by default), the
-values the AI read are written to the moved copy, **only into empty fields**.
+values the AI read are written to the moved copy (and to books left in place that the AI
+read), **only into empty fields**. Each book changed this way gets the tag **`AIUpdated`**,
+so `tags:AIUpdated` in Calibre lists everything the AI changed, in both programs.
 
 Books moved or trashed successfully leave the list (the log keeps a line for each); failed,
 unticked and *Leave* rows stay. At the end, book and author folders that Windows left behind
@@ -318,6 +320,36 @@ With *Move files Calibre can't open to the trash library without asking* (off by
 these rows start ticked; otherwise they are listed (filter *Unreadable files*) for you to
 decide.
 
+### Books stored as an archive (RAR, ZIP, 7Z)
+
+Some books are only an archive holding the real files (a PDF, an EPUB, a DOC, a plot
+summary…). Both programs handle them the same way.
+
+- **During the analysis** (nothing is written) the archive's contents are listed. If they
+  are clear, you are asked **"Unpack the RAR file?"**, with what it would add. The box **Do
+  this for all books** answers the same for the rest of this analysis (it is cleared at the
+  next one).
+- **Unpack:** the files are extracted into a temporary folder and the book is analyzed with
+  them instead of the archive (an EPUB inside is read first, its cover and text can be
+  compared). The Formats column says what Execute will do.
+- **On Execute**, before the book's own action: the archive is extracted again and checked
+  against the analysis (a changed archive is refused), the whole record is copied as it is
+  to the trash library, the formats the book **doesn't have** are added (never replaced),
+  and the archive is removed from the book. The archive is removed even when there was
+  nothing new to add: it is kept in the trash library. A book that goes to the trash whole
+  keeps its archive.
+- **What is added:** the e-book formats Calibre reads (EPUB, PDF, MOBI, TXT, ODT, RTF…),
+  exactly as they are. Not added: formats Calibre can't read (DOC), pictures, notes (a TXT
+  under 20 KB, such as "trama.txt"), other leftovers (Thumbs.db, .nfo, .url).
+- **Unclear archives are left as they are**, with the reason: two files of the same format
+  (maybe different books), nothing Calibre can read inside, an archive inside the archive, a
+  password or a damaged file.
+- The filter **Archives** lists these books; right-click → *Unpack the archive on Execute* /
+  *Keep the archive* changes your answer. On the command line, `--unpack` unpacks every clear
+  archive without asking (default: archives are left as they are).
+
+RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
+
 ### Settings (Settings → Analysis)
 
 | Setting | Default | What it does |
@@ -332,7 +364,7 @@ decide.
 | Match similar titles by the same author | on | Needs proof: ISBN, same text or same cover. |
 | Same author + same series + same number = same book | off | For reliably numbered collections only. |
 | Move files Calibre can't open to the trash library without asking | off | Ticks those rows. |
-| Write AI-found title/authors/publisher/ISBN to moved books | on | Only empty fields. |
+| Write AI-found title/authors/publisher/ISBN to moved books | on | Only empty fields; changed books are tagged `AIUpdated`. |
 | Delete permanently from source | off | Else Calibre's recycle bin. |
 | Calibre program folder | found automatically | Where `calibre-debug` and the converters are. |
 
@@ -347,6 +379,7 @@ python -m calibre_dedup --cli ... --execute        # perform the plan (default: 
 python -m calibre_dedup --cli ... --text-profile "Azure gpt-4o" --image-profile ""
 python -m calibre_dedup --cli ... --no-ai          # metadata only
 python -m calibre_dedup --cli ... --cleanup-only   # nothing copied to the target
+python -m calibre_dedup --cli ... --unpack         # unpack every clear RAR/ZIP/7Z archive
 python -m calibre_dedup --cli ... --clear-cache    # ask the AI again
 ```
 
@@ -363,17 +396,17 @@ the cover) and compares what it read with Calibre's metadata. Where they differ,
 an update of **title, authors, publisher, year and series (with its number)**, as printed in
 the book itself.
 
-Choose the **library to review** and the **trash library**, then **1. Scan with AI**.
+Choose the **library to review** and the **trash library**, then **1. Analyze (dry run)**.
 
-### Step 1: Scan
+### Step 1: Analyze
 
 - **What is read:** the first pages (PDF: *PDF pages to read*, default 6; other formats:
   *Characters to read*, default 12,000) and, with an **Image AI**, the cover: Calibre's
   `cover.jpg`, else the cover inside the file. With an Image AI each book goes to it once
   (text, cover and, for scanned PDFs, page images); without one, the Text AI reads the text
   only and scanned PDFs are skipped.
-- **Stop** at any point: what was scanned can be executed, and the next scan continues (see
-  *Continue another day* below).
+- **Stop** at any point: what was analyzed can be executed, and the next analysis continues
+  (see *Continue another day* below).
 
 ### Step 2: Review the list
 
@@ -396,6 +429,9 @@ Choose the **library to review** and the **trash library**, then **1. Scan with 
   are proposed for the trash, ticked. A book with some unreadable files is read from the
   others, and those files are proposed for the trash library (the record is copied there
   first). See [Files Calibre can't open](#files-calibre-cant-open).
+- **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
+  the Duplicate Remover (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
+  an unpacked book stays visible with *Only with differences*, since Execute changes it.
 
 ### Step 3: Execute
 
@@ -406,12 +442,16 @@ reviewed library when trashing*). Updated and trashed books leave the list.
 
 ### Continue another day, on any computer
 
-Every book whose metadata is updated also gets the tag **`AIReviewed`**, and the next scan
-skips books with that tag (*Skip books tagged AIReviewed*, on by default). So you can stop a
-scan anywhere, execute what you have, and continue later, even from another computer: the
-mark is in the library itself, not in the cache. Only updated books are tagged: books with
-no differences, or that you keep, are read again by the next scan (quickly on the same
-computer, from the cache). To review a book again, remove the tag in Calibre.
+On Execute, **every book the AI read** gets the tag **`AIReviewed`**: updated, unchecked,
+kept, or with nothing to change. The next analysis skips books with that tag (*Skip books
+tagged AIReviewed*, on by default). So you can stop an analysis anywhere, execute what you
+have, and continue later, even from another computer: the mark is in the library itself,
+not in the cache. Books the AI could not read are not tagged (unless you chose *Keep as it
+is*): the next analysis tries them again. To review a book again, remove the tag in
+Calibre.
+
+The books whose metadata was actually written also get the tag **`AIUpdated`** (as with the
+Duplicate Remover): search `tags:AIUpdated` in Calibre to check what the AI changed.
 
 ### Settings
 
@@ -420,7 +460,7 @@ The review has its own settings (`review_settings.json`) and its own AI cache
 time, both start as a copy of the Duplicate Remover's: the same AI profiles, trash library,
 Calibre folder and reading limits (Settings → *Reading*). After that a change in one program
 doesn't reach the other; API keys stay shared (they are stored per profile name). AI answers
-are cached per book and cover, so a second scan is quick, even after an update renamed the
+are cached per book and cover, so a second analysis is quick, even after an update renamed the
 book's files.
 
 ### Command line
@@ -431,7 +471,8 @@ python -m calibre_dedup.review_app --cli ... --fields title,authors --execute   
 python -m calibre_dedup.review_app --cli ... --include-reviewed                  # also books tagged AIReviewed
 ```
 
-Also `--trash`, `--text-profile`, `--image-profile` (`""` for none) and `--clear-cache`.
+Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
+clear RAR/ZIP/7Z archive without asking) and `--clear-cache`.
 Options left out are taken from the review's saved settings.
 
 
@@ -571,10 +612,15 @@ there automatically.
 
 The **performance logs** hold one JSON object per line, to compare AI providers: for each
 request its size (characters, images, bytes), time, tokens and Ollama's own timings; for each
-analysis or scan, its length, the books sent to the AI and the totals. They hold no book
+analysis, its length, the books sent to the AI and the totals. They hold no book
 metadata: a book is only its number in the run.
 
 The logs rotate at 5 MB, keeping 3 old files.
+
+**Temporary files** (texts converted by Calibre, covers, rendered PDF pages, the plan sent
+to Calibre) go to `%TEMP%\CalibreDedup`, one folder per run, deleted when the run ends
+(*Stop* included). A folder left behind by a program that was killed or crashed is deleted
+the next time either program starts; folders of a program still running are never touched.
 
 
 ## Tests
@@ -686,7 +732,7 @@ Both books are titled: "<title>"
 
 ### 4. Identifying a book (Metadata Review)
 
-Used for every book the review scans (unless cached): the AI reads the first pages and the
+Used for every book the review analyzes (unless cached): the AI reads the first pages and the
 cover and proposes title, authors, publisher, year and series, which are compared with
 Calibre's metadata. `REVIEW_PROMPT`:
 

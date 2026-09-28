@@ -98,6 +98,8 @@ def revert(item: PlanItem) -> None:
     item.add_formats = list(item.planned_add_formats)
     item.manual = False
     item.selected = item.planned_selected
+    for u in item.archives:
+        u.unpack = u.planned
 
 
 # --- dependencies ---------------------------------------------------------------
@@ -130,11 +132,11 @@ def actionable(plan: Plan) -> list[PlanItem]:
     A book left in source may still be updated with AI metadata when it was
     enriched but not moved/trash-ed. Those updates must be allowed without
     treating normal leave decisions as executable actions. A book whose
-    unreadable formats go to the trash library is processed for that alone,
-    ticked or not.
+    unreadable formats go to the trash library, or whose archive is unpacked, is
+    processed for that alone, ticked or not.
     """
     stuck = blocked(plan)
-    return [i for i in plan.items if runs_main_action(i, stuck) or i.bad_formats_to_trash]
+    return [i for i in plan.items if runs_main_action(i, stuck) or i.bad_formats_to_trash or i.archives_to_unpack]
 
 
 def runs_main_action(i: PlanItem, stuck: dict[int, str]) -> bool:

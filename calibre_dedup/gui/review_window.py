@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import OLLAMA, Settings, config_dir, load_review_settings
 from ..eta import Eta
+from ..executor import AI_UPDATED_TAG
 from ..extract import TextExtractor
 from ..normalize import strip_accents
 from ..review import (
@@ -57,8 +58,8 @@ from ..review import (
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from .main_window import (
-    AI_LOG_COLOR, PlanTable, QtLogHandler, _compact, _elastic, _is_checked, ask_ai_down, configure_logging,
-    open_file, with_eta,
+    AI_LOG_COLOR, ARCHIVES_TIP, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
+    add_unpack_actions, archive_texts, ask_ai_down, ask_unpack, configure_logging, open_file, with_eta,
 )
 from ..planner import AI_OFF
 from .cover_preview import CoverPreview
@@ -184,6 +185,8 @@ class ReviewModel(QAbstractTableModel):
             if it.bad_formats and not it.broken and not (it.selected and it.action is ReviewAction.TRASH):
                 bad = ", ".join(sorted(it.bad_formats))
                 label += f"\n+ {bad} to trash" if it.trash_bad else f"\n{bad} unreadable, kept"
+            if it.archives and not (it.selected and it.action is ReviewAction.TRASH):
+                label += "\n" + "\n".join(archive_texts(it.archives))
             return label
         if col == self.COL_READ:
             return it.note
@@ -245,7 +248,7 @@ class ReviewFilter(QSortFilterProxyModel):
         self.terms: list[str] = []
         self.action = ""
         self.changes_only = True
-        self.unread_only = self.checked_only = self.failed_only = self.unreadable_only = False
+        self.unread_only = self.checked_only = self.failed_only = self.unreadable_only = self.archive_only = False
 
     def update(self, **kw):
         for k, v in kw.items():
@@ -260,8 +263,10 @@ class ReviewFilter(QSortFilterProxyModel):
         it = model.items[row]
         if self.action and it.action.value != self.action:
             return False
-        # A book the user sent to the trash stays visible even without differences.
-        if self.changes_only and not it.changes and it.action is not ReviewAction.TRASH:
+        # A book the user sent to the trash, or whose archive is unpacked, stays visible
+        # even without differences: Execute does something to it.
+        if (self.changes_only and not it.changes and it.action is not ReviewAction.TRASH
+                and not it.archives_to_unpack):
             return False
         if self.unread_only and it.found is not None:
             return False
@@ -270,6 +275,8 @@ class ReviewFilter(QSortFilterProxyModel):
         if self.failed_only and not it.status.startswith("FAILED"):
             return False
         if self.unreadable_only and not it.bad_formats:
+            return False
+        if self.archive_only and not it.archives:
             return False
         if self.terms:
             hay = strip_accents(" ".join(model.text(it, c) for c in range(1, len(model.HEADERS)))).casefold()
@@ -314,12 +321,13 @@ class TwoLineDelegate(QStyledItemDelegate):
 
 
 # --- workers --------------------------------------------------------------------
-class ScanWorker(QThread):
+class ScanWorker(QThread, UnpackQuestion):
     progress = Signal(int, int, str)
     items_ready = Signal(object)
     finished_ok = Signal(object)
     failed = Signal(str)
     ai_down = Signal(str, bool)
+    unpack_asked = Signal(str, str, str)
     BATCH_SECONDS = 0.3
 
     def __init__(self, settings: Settings, library: str, trash: str):
@@ -328,6 +336,7 @@ class ScanWorker(QThread):
         self.cancel = threading.Event()
         self._answered = threading.Event()
         self._choice = AI_OFF
+        self._init_unpack()
 
     def ask(self, message: str, image: bool) -> str:
         """See main_window.AnalyzeWorker.ask."""
@@ -361,7 +370,7 @@ class ScanWorker(QThread):
                     sent = time.monotonic()
 
             result = scan_library(self.library, self.trash, reviewer, self.progress.emit, self.cancel, on_item,
-                                  skip_reviewed=self.settings.review_skip_reviewed)
+                                  skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack)
             if batch:
                 self.items_ready.emit(batch.copy())
             self.finished_ok.emit(result)
@@ -455,7 +464,7 @@ class ReviewWindow(QMainWindow):
         ai_row.addWidget(settings_btn)
 
         # actions
-        self.scan_btn = QPushButton("1. Scan with AI")
+        self.scan_btn = QPushButton("1. Analyze (dry run)")
         self.execute_btn = QPushButton("2. Execute checked")
         self.stop_btn = QPushButton("Stop")
         self.scan_btn.setStyleSheet(button_css(*BLUE))
@@ -471,8 +480,8 @@ class ReviewWindow(QMainWindow):
         self.skip_reviewed = QCheckBox(f"Skip books tagged {REVIEWED_TAG}")
         self.skip_reviewed.setChecked(settings.review_skip_reviewed)
         self.skip_reviewed.setToolTip(
-            f"On Execute, every book of the scan is tagged {REVIEWED_TAG} (updated or not):\n"
-            "the next scan leaves them out, also on another computer.\n"
+            f"On Execute, every book of the analysis is tagged {REVIEWED_TAG} (updated or not):\n"
+            "the next analysis leaves them out, also on another computer.\n"
             "To review a book again, remove the tag in Calibre.")
         btn_row.addSpacing(16)
         btn_row.addWidget(self.skip_reviewed)
@@ -517,6 +526,7 @@ class ReviewWindow(QMainWindow):
              "Books with files Calibre can't open (a format it doesn't read, a fake PDF, a file that fails to\n"
              "open). Only such files: proposed for the trash. Some: the whole record is copied to the trash\n"
              "library as it is, then those files are removed from the book (right-click to keep them)."),
+            ("archive_only", "Archives", ARCHIVES_TIP),
         ]:
             box = QCheckBox(label)
             box.setToolTip(tip)
@@ -696,7 +706,7 @@ class ReviewWindow(QMainWindow):
         finishing = not busy and self.worker is not None
         scanning = self.worker is not None and self._operation == "scan"
         self.scan_btn.setEnabled(not busy and self.worker is None)
-        self.scan_btn.setText(("Finishing…" if finishing else "Scanning…") if scanning else "1. Scan with AI")
+        self.scan_btn.setText(("Finishing…" if finishing else "Analyzing…") if scanning else "1. Analyze (dry run)")
         set_running(self.scan_btn, scanning)
         self.stop_btn.setText("Stopping…" if busy and self._stopping else "Stop")
         set_running(self.stop_btn, busy and self._stopping)
@@ -713,15 +723,16 @@ class ReviewWindow(QMainWindow):
         """Ticks and actions: when idle and while scanning, never while executing."""
         return not self.model.locked and (not self._busy or self._operation == "scan")
 
-    def _counts(self) -> tuple[int, int, int, int]:
+    def _counts(self) -> tuple[int, int, int, int, int]:
         """(updates, trashes, books only tagged as reviewed, books losing unreadable
-        formats) that Execute would do."""
+        formats, books whose archive is unpacked) that Execute would do."""
         actions = review_actions(self.model.items, self.fields_on)
         updates = sum(1 for a in actions if a["op"] == "set")
         trashes = sum(1 for a in actions if a["op"] == "trash")
         tags = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag")
         formats = sum(1 for a in actions if a.get("trash_formats"))
-        return updates, trashes, tags, formats
+        unpacks = sum(1 for a in actions if a.get("unpack"))
+        return updates, trashes, tags, formats, unpacks
 
     def _update_summary(self):
         items = self.model.items
@@ -738,16 +749,17 @@ class ReviewWindow(QMainWindow):
             f"<b style='color:{ACTION_COLORS[ReviewAction.UPDATE]}'>{changed} with differences</b> · "
             f"<b style='color:#e65100'>{unread} not read</b> · {len(items)} books"
             + (f" · {skipped} already {REVIEWED_TAG}" if skipped else ""))
-        updates, trashes, tags, formats = self._counts()
+        updates, trashes, tags, formats, unpacks = self._counts()
         self.checked_label.setText(f"{updates} to update · {trashes} to trash · "
                                    + (f"{formats} losing unreadable formats · " if formats else "")
+                                   + (f"{unpacks} archives to unpack · " if unpacks else "")
                                    + f"{updates + tags} to tag {REVIEWED_TAG}")
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
                                  else f"2. Execute and mark reviewed ({updates + trashes + tags})")
         set_running(self.execute_btn, executing)
         self.execute_btn.setEnabled(not self._busy and self.worker is None and self.result is not None
-                                    and bool(updates + trashes + tags + formats))
+                                    and bool(updates + trashes + tags + formats + unpacks))
 
     # --- table interaction ------------------------------------------------------------------
     def _visible_items(self) -> list[ReviewItem]:
@@ -817,6 +829,7 @@ class ReviewWindow(QMainWindow):
                     act = menu.addAction(f"{label} ({len(fits)})" if len(items) > 1 else label)
                     act.setEnabled(bool(fits))
                     act.triggered.connect(lambda _=False, v=value, f=fits: self._set_trash_bad(f, v))
+            add_unpack_actions(menu, items, self._set_unpack)
             menu.addSeparator()
             for name in FIELDS:
                 having = [i for i in items if name in i.changes]
@@ -837,6 +850,13 @@ class ReviewWindow(QMainWindow):
     def _set_trash_bad(self, items: list[ReviewItem], value: bool):
         for it in items:
             it.trash_bad = value
+        self.model.refresh()
+
+    def _set_unpack(self, items: list[ReviewItem], value: bool):
+        for it in items:
+            for u in it.archives:
+                if not u.problem:
+                    u.unpack = value
         self.model.refresh()
 
     def _exclude(self, items: list[ReviewItem], name: str, exclude: bool):
@@ -884,7 +904,7 @@ class ReviewWindow(QMainWindow):
         if not problems:
             return True
         return QMessageBox.question(
-            self, "Before scanning", "\n\n".join(f"• {p}" for p in problems) + "\n\nScan anyway?"
+            self, "Before analyzing", "\n\n".join(f"• {p}" for p in problems) + "\n\nAnalyze anyway?"
         ) == QMessageBox.Yes
 
     def _scan(self):
@@ -902,6 +922,7 @@ class ReviewWindow(QMainWindow):
         worker.finished_ok.connect(self._scan_done)
         worker.failed.connect(self._worker_failed)
         worker.ai_down.connect(self._on_ai_down)
+        worker.unpack_asked.connect(self._on_unpack_asked)
         self._start(worker, "scan")
         log.info("Review started")
 
@@ -940,6 +961,15 @@ class ReviewWindow(QMainWindow):
         for reason in result.ai_down:
             log.warning("Review: %s", reason)
 
+    def _on_unpack_asked(self, label: str, fmt: str, summary: str):
+        worker = self.worker
+        if not isinstance(worker, ScanWorker):
+            return
+        if self._close_pending:
+            worker.answer_unpack(False, True)
+            return
+        worker.answer_unpack(*ask_unpack(self, label, fmt, summary))
+
     def _on_ai_down(self, message: str, image: bool):
         worker = self.worker
         if not isinstance(worker, ScanWorker):
@@ -965,8 +995,8 @@ class ReviewWindow(QMainWindow):
             return
         self._sync_settings()
         self.result.trash_library = self._library("trash")
-        updates, trashes, tags, formats = self._counts()
-        if (trashes or formats) and not self.result.trash_library:
+        updates, trashes, tags, formats, unpacks = self._counts()
+        if (trashes or formats or unpacks) and not self.result.trash_library:
             QMessageBox.warning(self, "No trash library", "Choose a trash library to move books to it.")
             return
         fields = ", ".join(FIELD_LABELS[f].lower() for f in FIELDS if f in self.fields_on) or "none"
@@ -978,10 +1008,13 @@ class ReviewWindow(QMainWindow):
                 f"{trashes} books will be moved to the trash library; after a verified copy, each is "
                 f"{where} in the reviewed library.\n"
                 + (f"{formats} books have formats Calibre can't open: each whole record is copied to the trash "
-                   "library, then those formats are removed from the book.\n" if formats else "") +
+                   "library, then those formats are removed from the book.\n" if formats else "")
+                + (f"{unpacks} books have their archive unpacked: the formats they lack are added, and the "
+                   "archive goes to the trash library inside a copy of the whole record.\n" if unpacks else "") +
                 f"The {updates} updated books and {tags} more (unchecked or nothing to change) will be tagged "
-                f"{REVIEWED_TAG}: the next scan skips them.\n"
-                + (f"The {unread} books the AI could not read are not tagged: the next scan tries them again.\n"
+                f"{REVIEWED_TAG}: the next analysis skips them. The updated books are also tagged "
+                f"{AI_UPDATED_TAG}.\n"
+                + (f"The {unread} books the AI could not read are not tagged: the next analysis tries them again.\n"
                    if unread else "")
                 + "\nContinue?") != QMessageBox.Yes:
             return

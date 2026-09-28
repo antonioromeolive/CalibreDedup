@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
+import os
 import posixpath
 import re
 import subprocess
-import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -46,9 +47,12 @@ from pathlib import Path
 from urllib.parse import unquote
 from xml.etree import ElementTree
 
+from . import archive_tool
 from .calibre_env import CREATE_NO_WINDOW, tool
+from .tempdirs import RunDir
 
 log = logging.getLogger(__name__)
+ARCHIVE_TOOL = Path(archive_tool.__file__)
 
 # Formats whose own cover can be read, best first.
 EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
@@ -148,7 +152,8 @@ class TextExtractor:
         self._covers: dict[str, bytes | None] = {}  # path -> cover inside the file
         # path -> why its text could not be read (corrupt, DRM, no Calibre reader...)
         self.failed: dict[str, str] = {}
-        self._tmp = tempfile.TemporaryDirectory(prefix="cdr_")
+        self._tmp = RunDir("read_")
+        self._archives: list[str] = []  # folders of the archives extracted for this run
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -262,6 +267,42 @@ class TextExtractor:
             self._converted[path] = _clean(out.read_text(encoding="utf-8", errors="replace"))
             out.unlink(missing_ok=True)
         return self._converted[path]
+
+    # --- archives (RAR, ZIP, 7Z; see archives.py) ------------------------------------
+    def archive_members(self, fmt: str, path: str) -> list[dict]:
+        """The archive's files: [{"name", "size"}]. ZIP directly; RAR and 7Z with Calibre."""
+        if fmt == "ZIP":
+            return archive_tool.members(fmt, path)
+        return self._archive_tool("list", fmt, path)
+
+    def extract_archive(self, fmt: str, path: str, u) -> dict[str, str]:
+        """Extract the archive into this run's temporary folder: format -> extracted file,
+        for the files `u` (an archives.Unpack) adds. Each file gets the archive's date, so
+        the AI's answers about it are found again at the next analysis."""
+        folder = Path(self._tmp.name) / f"archive{len(self._archives)}"
+        self._archives.append(str(folder))
+        if fmt == "ZIP":
+            archive_tool.extract(fmt, path, str(folder))
+        else:
+            self._archive_tool("extract", fmt, path, str(folder))
+        files = {}
+        for f, name in u.add.items():
+            file = archive_tool.member_path(str(folder), name)
+            if file is None or not Path(file).is_file():
+                raise RuntimeError(f"{name} not found after extracting")
+            os.utime(file, (u.mtime, u.mtime))
+            files[f] = file
+        return files
+
+    def _archive_tool(self, *args: str):
+        out = self._run("calibre-debug", [str(ARCHIVE_TOOL), *args], timeout=600).decode("utf-8", "replace")
+        line = next((x for x in reversed(out.splitlines()) if x.startswith(archive_tool.MARK)), None)
+        if line is None:
+            raise RuntimeError(f"no answer from archive_tool: {out[-300:]}")
+        result = json.loads(line[len(archive_tool.MARK):])
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(result["error"])
+        return result
 
     def _run(self, name: str, args: list[str], timeout: int = 120) -> bytes:
         proc = subprocess.run(

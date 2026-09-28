@@ -43,11 +43,11 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTableView, QVBoxLayout, QWidget,
 )
 
-from .. import perf
+from .. import perf, tempdirs
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
 from ..eta import Eta
-from ..executor import execute_plan
+from ..executor import AI_UPDATED_TAG, execute_plan, plan_actions
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
 from ..normalize import strip_accents
@@ -138,6 +138,50 @@ def ask_ai_down(parent, message: str, what: str, more_help: str) -> str | None:
     return choice
 
 
+def ask_unpack(parent, label: str, fmt: str, summary: str) -> tuple[bool, bool]:
+    """The "Unpack this archive?" question: (unpack, do this for all books)."""
+    box = QMessageBox(QMessageBox.Question, f"Unpack the {fmt} file?",
+                      f"{label}\n\nThis book is stored as a {fmt} archive. Unpack it?", parent=parent)
+    box.setInformativeText(
+        f"{summary}\n\nNothing is written now: the book is analyzed with the files inside, and the "
+        "archive is unpacked on Execute. Right-click the book to change your mind.")
+    yes = box.addButton("Unpack", QMessageBox.YesRole)
+    box.addButton("Keep the archive", QMessageBox.NoRole)
+    for_all = QCheckBox("Do this for all books (this analysis only)")
+    box.setCheckBox(for_all)
+    box.setDefaultButton(yes)
+    box.exec()
+    return box.clickedButton() is yes, for_all.isChecked()
+
+
+class UnpackQuestion:
+    """Mixed into the analysis workers: asks the window whether to unpack a book's archive
+    (the worker waits), and remembers "Do this for all books" for this analysis only."""
+    unpack_asked: Signal  # book, archive format, what unpacking would do
+
+    def _init_unpack(self) -> None:
+        self._unpack_all: bool | None = None
+        self._unpack_yes = False
+        self._unpack_answered = threading.Event()
+
+    def ask_unpack(self, book, u) -> bool:
+        if self._unpack_all is not None:
+            return self._unpack_all
+        self._unpack_answered.clear()
+        self._unpack_yes = False
+        self.unpack_asked.emit(book.label(), u.format, u.summary)
+        while not self._unpack_answered.wait(0.2):
+            if self.cancel.is_set():  # Stop, or the window is closing
+                return False
+        return self._unpack_yes
+
+    def answer_unpack(self, yes: bool, for_all: bool) -> None:
+        self._unpack_yes = yes
+        if for_all:
+            self._unpack_all = yes
+        self._unpack_answered.set()
+
+
 def configure_logging(handler: QtLogHandler, filename: str) -> None:
     """Log to the window and to a rotating file in the data folder; the AI's
     performance to its own file beside it (calibre_dedup.log -> calibre_dedup_perf.log)."""
@@ -153,6 +197,7 @@ def configure_logging(handler: QtLogHandler, filename: str) -> None:
     root.addHandler(file_handler)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     log.info("Logging configured at %s", logging.getLevelName(level))
+    tempdirs.sweep()  # folders left by a run that was killed
 
 
 def open_file(path: str) -> None:
@@ -381,7 +426,7 @@ class PlanFilter(QSortFilterProxyModel):
         self.terms: list[str] = []
         self.action = ""
         self.ai_only = self.formats_only = self.checked_only = self.failed_only = self.reduced_only = False
-        self.cover_only = self.unreadable_only = False
+        self.cover_only = self.unreadable_only = self.archive_only = False
         self.hide_unique = True
 
     def update(self, **kw):
@@ -412,6 +457,8 @@ class PlanFilter(QSortFilterProxyModel):
             return False
         if self.unreadable_only and not it.bad_formats:
             return False
+        if self.archive_only and not it.archives:
+            return False
         # Same library: books with no duplicate are usually most of the list.
         if self.hide_unique and model.plan is not None and (
                 skipped_no_series(it) or (model.plan.same_library and has_no_duplicate(it))):
@@ -428,7 +475,34 @@ def _formats_text(it: PlanItem) -> str:
     if it.bad_formats and not it.unreadable:
         bad = ", ".join(sorted(it.bad_formats))
         parts.append(f"{bad} to trash" if it.trash_bad else f"{bad} unreadable, kept")
+    parts += archive_texts(it.archives)
     return " · ".join(parts)
+
+
+ARCHIVES_TIP = ("Books stored as an archive (RAR, ZIP, 7Z). The Formats column says what Execute does:\n"
+                "unpack (the new formats are added, the archive goes to the trash library inside a copy\n"
+                "of the record), kept, or unclear (several books, nothing readable, password…: left as it\n"
+                "is). Right-click to unpack or keep.")
+
+
+def archive_texts(archives: list) -> list[str]:
+    """What happens to each archive on Execute, for the list."""
+    return [f"{u.format}: unclear, kept" if u.problem
+            else f"{u.format}: unpack ({', '.join(sorted(u.add)) or 'nothing new'})" if u.unpack
+            else f"{u.format}: kept" for u in archives]
+
+
+def add_unpack_actions(menu: QMenu, items: list, set_unpack) -> None:
+    """Right-click: unpack the selected books' clear archives on Execute, or keep them."""
+    clear = [i for i in items if any(not u.problem for u in i.archives)]
+    if not clear:
+        return
+    menu.addSeparator()
+    for value, label in ((True, "Unpack the archive on Execute"), (False, "Keep the archive")):
+        n = sum(1 for i in clear if any(u.unpack != value for u in i.archives if not u.problem))
+        act = menu.addAction(f"{label} ({n})" if len(items) > 1 else label)
+        act.setEnabled(n > 0)
+        act.triggered.connect(lambda _=False, v=value: set_unpack(clear, v))
 
 
 def skipped_no_series(it: PlanItem) -> bool:
@@ -455,12 +529,13 @@ class PlanTable(QTableView):
 
 
 # --- workers --------------------------------------------------------------------
-class AnalyzeWorker(QThread):
+class AnalyzeWorker(QThread, UnpackQuestion):
     progress = Signal(int, int, str)
     items_ready = Signal(object)  # list of books just decided, for the live table
     finished_ok = Signal(object)
     failed = Signal(str)
     ai_down = Signal(str, bool)  # message, image AI: the GUI asks the user, then calls answer()
+    unpack_asked = Signal(str, str, str)  # the GUI asks, then calls answer_unpack()
     BATCH_SECONDS = 0.3  # books with no duplicate go by by the thousand: send them in batches
 
     def __init__(self, settings: Settings, source: str, target: str, trash: str):
@@ -469,6 +544,7 @@ class AnalyzeWorker(QThread):
         self.cancel = threading.Event()
         self._answered = threading.Event()
         self._choice = AI_OFF
+        self._init_unpack()
 
     def ask(self, message: str, image: bool) -> str:
         """Called on the worker thread when an AI keeps failing: wait for the user.
@@ -511,7 +587,7 @@ class AnalyzeWorker(QThread):
                               author_variants=self.settings.author_variants,
                               trash_unreadable=self.settings.trash_unreadable,
                               cleanup_only=self.settings.cleanup_only,
-                              on_item=on_item)
+                              on_item=on_item, unpack=self.ask_unpack)
             if batch:
                 self.items_ready.emit(batch.copy())
             self.finished_ok.emit(plan)
@@ -662,10 +738,11 @@ class MainWindow(QMainWindow):
         for attr, label in [("ai_only", "AI used"), ("formats_only", "Adds formats"),
                             ("checked_only", "Only checked"), ("failed_only", "Only failed"),
                             ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover"),
-                            ("unreadable_only", "Unreadable files")]:
+                            ("unreadable_only", "Unreadable files"), ("archive_only", "Archives")]:
             box = QCheckBox(label)
             box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
             self.toggles[attr] = box
+        self.toggles["archive_only"].setToolTip(ARCHIVES_TIP)
         self.toggles["reduced_only"].setToolTip(
             "Books decided with fewer checks than the settings ask for: the cover check or year re-check\n"
             "could not run (no Image AI, AI off), or an AI stopped responding during the analysis.\n"
@@ -1130,6 +1207,7 @@ class MainWindow(QMainWindow):
                 act = menu.addAction(f"{label} ({n})" if len(items) > 1 else label)
                 act.setEnabled(n > 0)
                 act.triggered.connect(lambda _=False, v=value: self._set_trash_bad(partial, v))
+        add_unpack_actions(menu, items, self._set_unpack)
         menu.addSeparator()
         n = sum(1 for i in items if i.manual)
         act = menu.addAction(f"Revert to analysis decision ({n})" if len(items) > 1 else "Revert to analysis decision")
@@ -1151,6 +1229,14 @@ class MainWindow(QMainWindow):
     def _set_trash_bad(self, items: list[PlanItem], value: bool):
         for it in items:
             it.trash_bad = value
+        self.model.refresh()
+
+    def _set_unpack(self, items: list, value: bool):
+        """Unpack the books' clear archives on Execute, or keep them."""
+        for it in items:
+            for u in it.archives:
+                if not u.problem:
+                    u.unpack = value
         self.model.refresh()
 
     def _revert(self, items: list[PlanItem]):
@@ -1241,6 +1327,16 @@ class MainWindow(QMainWindow):
             self._stop()
         worker.answer(choice or AI_OFF)
 
+    def _on_unpack_asked(self, label: str, fmt: str, summary: str):
+        """The worker waits for this answer (see UnpackQuestion)."""
+        worker = self.worker
+        if not isinstance(worker, AnalyzeWorker):
+            return
+        if self._close_pending:
+            worker.answer_unpack(False, True)
+            return
+        worker.answer_unpack(*ask_unpack(self, label, fmt, summary))
+
     def _analyze(self):
         self._sync_settings()
         if not self._preflight_ok():
@@ -1261,6 +1357,7 @@ class MainWindow(QMainWindow):
         worker.finished_ok.connect(self._analysis_done)
         worker.failed.connect(self._analysis_failed)
         worker.ai_down.connect(self._on_ai_down)
+        worker.unpack_asked.connect(self._on_unpack_asked)
         self._start(worker, "analyze")
         log.info("Analysis started")
 
@@ -1348,6 +1445,8 @@ class MainWindow(QMainWindow):
         no_copy = sum(1 for i in main if i.action is Action.TRASH and i.match is None) - unreadable
         trashed_whole = {id(i) for i in main if i.action is Action.TRASH}
         bad = sum(1 for i in todo if i.bad_formats_to_trash and id(i) not in trashed_whole)
+        filled = sum(1 for a in plan_actions(p, self.settings.update_metadata) if a.get("updated_tag"))
+        unpacked = sum(1 for i in todo if i.archives_to_unpack)
         answer = QMessageBox.question(
             self, "Execute checked books",
             f"{moves} books will be moved to the target library.\n"
@@ -1356,7 +1455,11 @@ class MainWindow(QMainWindow):
             + (f"   {no_copy} of them (forced) have no copy in the target: "
                "they will only be in the trash library.\n" if no_copy else "")
             + (f"{bad} books have formats Calibre can't open: each whole record is copied to the trash "
-               "library, then those formats are removed from the source.\n" if bad else "") +
+               "library, then those formats are removed from the source.\n" if bad else "")
+            + (f"Up to {filled} books get the values the AI read in their empty fields; each book changed "
+               f"is tagged {AI_UPDATED_TAG}.\n" if filled else "")
+            + (f"{unpacked} books have their archive unpacked: the formats they lack are added, and the "
+               "archive goes to the trash library inside a copy of the whole record.\n" if unpacked else "") +
             f"{len(p.items) - len(main)} books stay in the source library"
             + (f" (including {n_blocked} blocked)" if n_blocked else "") + ".\n\n"
             f"After a verified copy, each book is {where} in the source library.\n\nContinue?")

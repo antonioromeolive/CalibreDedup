@@ -556,14 +556,22 @@ class AICache:
         log.info("AI cache %s cleared: %d answers removed", path, removed)
         return removed
 
-    @staticmethod
-    def key(file_path: str, part: str, model: str | None = None) -> str:
+    # A file extracted from an archive for the analysis (temporary path) -> the name it is
+    # remembered by, "<archive>::<file inside>": the answers are found again next time.
+    aliases: dict[str, str] = {}
+
+    @classmethod
+    def alias(cls, file_path: str, name: str) -> None:
+        cls.aliases[file_path] = name
+
+    @classmethod
+    def key(cls, file_path: str, part: str, model: str | None = None) -> str:
         try:
             st = Path(file_path).stat()
             stamp = f"{st.st_size}:{int(st.st_mtime)}"
         except OSError:
             stamp = "?"
-        token = f"{file_path}|{stamp}|{part}"
+        token = f"{cls.aliases.get(file_path, file_path)}|{stamp}|{part}"
         return hashlib.sha1(token.encode()).hexdigest()
 
     @classmethod

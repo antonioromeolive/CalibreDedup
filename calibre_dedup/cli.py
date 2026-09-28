@@ -28,7 +28,7 @@ import argparse
 import logging
 import sys
 
-from . import perf
+from . import perf, tempdirs
 from .ai import AICache
 from .config import Settings, config_dir
 from .executor import execute_plan
@@ -55,6 +55,8 @@ def run(argv: list[str]) -> int:
                          "copy nothing to the target (default: as set in the GUI)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
+    ap.add_argument("--unpack", action="store_true",
+                    help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are left as they are)")
     ap.add_argument("--report", help="write the plan as CSV to this file")
     ap.add_argument("--execute", action="store_true", help="perform the moves (default: dry run)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -63,6 +65,7 @@ def run(argv: list[str]) -> int:
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     perf.configure("calibre_dedup_perf.log")
+    tempdirs.sweep()
     if args.text_profile:
         settings.text_profile = args.text_profile
     if args.image_profile is not None:
@@ -83,7 +86,8 @@ def run(argv: list[str]) -> int:
                           similar_titles=settings.similar_titles, always_cover=settings.always_cover,
                           author_variants=settings.author_variants,
                           trash_unreadable=settings.trash_unreadable,
-                          cleanup_only=settings.cleanup_only if args.cleanup_only is None else True)
+                          cleanup_only=settings.cleanup_only if args.cleanup_only is None else True,
+                          unpack=(lambda book, archive: True) if args.unpack else None)
         print(file=sys.stderr)
     finally:
         if resolver:

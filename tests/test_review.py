@@ -132,7 +132,7 @@ def test_only_checked_fields_that_are_on_and_not_excluded_are_written():
     actions = review_actions([it, trash, kept, nothing], {"title", "series"})
     assert actions == [
         {"src_id": 1, "title": "Il nome della rosa", "op": "set", "set": {"series": "Oscar", "series_index": 3},
-         "tag": "AIReviewed"},
+         "tag": "AIReviewed", "updated_tag": "AIUpdated"},
         {"src_id": 2, "title": "Il nome della rosa", "op": "trash", "no_target": True},
         {"op": "tag", "src_ids": [3, 4], "tag": "AIReviewed"},
     ]

@@ -117,6 +117,9 @@ class PlanItem:
     bad_formats: dict[str, str] = field(default_factory=dict)
     trash_bad: bool = False
     planned_trash_bad: bool = False  # the analysis' own choice (the setting)
+    # The book's archives (RAR, ZIP, 7Z) as archives.Unpack: unpacked on Execute when
+    # their `unpack` is on, ticked or not (like the unreadable formats).
+    archives: list = field(default_factory=list)
     status: str = ""  # filled during execution
     selected: bool = True  # user wants this item executed (meaningless for LEAVE)
     manual: bool = False  # action overridden by the user
@@ -141,6 +144,10 @@ class PlanItem:
     def bad_formats_to_trash(self) -> list[str]:
         """The formats to take out of the source on Execute (some formats bad, box ticked)."""
         return sorted(self.bad_formats) if self.trash_bad and not self.unreadable else []
+
+    @property
+    def archives_to_unpack(self) -> list:
+        return [u for u in self.archives if u.unpack and not u.problem]
 
 
 @dataclass

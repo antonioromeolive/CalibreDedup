@@ -32,9 +32,12 @@ Output: one line per action, prefixed with "@@CDR " and followed by JSON.
 Creating "<plan.json>.stop" stops execution before the next action.
 """
 
+import importlib.util
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime
@@ -43,7 +46,19 @@ from calibre.db.copy_to_library import copy_one_book
 from calibre.library import db as open_db
 from calibre.utils.date import as_local_time, local_tz
 
-UNKNOWN = {"", "unknown", "sconosciuto", "inconnu", "unbekannt", "desconocido", "desconhecido", "onbekend"}
+
+def _load_archive_tool():
+    """archive_tool.py, beside this script (run by calibre-debug, not as a package)."""
+    spec = importlib.util.spec_from_file_location(
+        "archive_tool", os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive_tool.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+archive_tool = _load_archive_tool()
+
+UNKNOWN ={"", "unknown", "sconosciuto", "inconnu", "unbekannt", "desconocido", "desconhecido", "onbekend"}
 
 
 def emit(**kw):
@@ -67,15 +82,55 @@ def copy_verified(src, book_id, dest):
     return new_id
 
 
-def trash_formats(src, book_id, trash, formats):
-    """Copy the whole record, as it is, to the trash library, then remove `formats`
-    (files Calibre can't open) from the source record, which keeps its other formats."""
-    new_id = copy_verified(src, book_id, trash)
-    src.remove_formats({book_id: list(formats)})
-    left = set(formats) & set(src.formats(book_id))
-    if left:
-        raise RuntimeError(f"could not remove {', '.join(sorted(left))} from the source")
-    return f"record copied to trash (id {new_id}); {', '.join(formats)} removed from source"
+def take_out(src, book_id, trash, action, tmp):
+    """Before the book's own action: unpack its archives ("unpack") and take out the
+    formats Calibre can't open ("trash_formats"). The whole record is first copied, as
+    it is, to the trash library; then the archives' files are added (formats the book
+    already has are skipped); then the formats and archives are removed from the book.
+    Returns what was done."""
+    unpack = action.get("unpack") or []
+    gone = list(action.get("trash_formats") or []) + [u["format"] for u in unpack if u["remove"]]
+    folders = [os.path.join(tmp, f"unpack_{book_id}_{u['format']}") for u in unpack]
+    notes = []
+    try:
+        ready = [extract_checked(src, book_id, u, folder) for u, folder in zip(unpack, folders)]
+        if gone:
+            new_id = copy_verified(src, book_id, trash)
+            notes.append(f"record copied to trash (id {new_id})")
+        for u, files in zip(unpack, ready):
+            have = set(src.formats(book_id))
+            added = [fmt for fmt, file in files.items() if fmt not in have]
+            for fmt in added:
+                src.add_format(book_id, fmt, files[fmt], replace=False)
+            notes.append(f"{u['format']} unpacked: added {', '.join(added) or 'nothing new'}")
+    finally:
+        for folder in folders:
+            shutil.rmtree(folder, ignore_errors=True)
+    if gone:
+        src.remove_formats({book_id: gone})
+        left = set(gone) & set(src.formats(book_id))
+        if left:
+            raise RuntimeError(f"could not remove {', '.join(sorted(left))} from the source")
+        notes.append(f"{', '.join(gone)} removed from source")
+    return "; ".join(notes)
+
+
+def extract_checked(db, book_id, u, folder):
+    """Extract the book's archive and check it is the one analyzed: format -> file to add."""
+    path = db.format_abspath(book_id, u["format"])
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"the {u['format']} file is missing")
+    st = os.stat(path)
+    if st.st_size != u["size"] or int(st.st_mtime) != u["mtime"]:
+        raise RuntimeError(f"the {u['format']} file changed since the analysis; re-run the analysis")
+    archive_tool.extract(u["format"], path, folder)
+    files = {}
+    for fmt, name in u["add"].items():
+        file = archive_tool.member_path(folder, name)
+        if file is None or not os.path.isfile(file) or os.path.getsize(file) != u["sizes"][fmt]:
+            raise RuntimeError(f"{name} is not in the {u['format']} file as listed by the analysis")
+        files[fmt] = file
+    return files
 
 
 def cleanup_empty_dirs(root, folders, attempts=3):
@@ -167,8 +222,18 @@ def set_metadata(db, book_id, values):
     return changed, db.field_for("path", book_id), formats
 
 
+def tag_updated(db, book_id, changed, action):
+    """The action's "updated_tag" on a book whose metadata was just written: "; tagged …"
+    for the result message, "" when nothing changed (or no tag asked)."""
+    tag = action.get("updated_tag")
+    if not (tag and changed):
+        return ""
+    add_tag(db, [book_id], tag)
+    return f"; tagged {tag}"
+
+
 def add_tag(db, book_ids, tag):
-    """Add `tag` to these books (calibre-review's "reviewed" mark), keeping their other tags."""
+    """Add `tag` to these books (calibre-review's "reviewed" mark, "AIUpdated"), keeping their other tags."""
     values = {}
     for book_id in book_ids:
         tags = tuple(db.field_for("tags", book_id) or ())
@@ -214,10 +279,11 @@ def main(plan_path):
                 if src.field_for("title", sid) != action["title"]:
                     raise RuntimeError("book changed since the analysis; re-run the analysis")
                 done = ""  # what was done before the action itself
-                if action.get("trash_formats"):
-                    done = trash_formats(src, sid, trash, action["trash_formats"]) + "; "
-                if action["op"] == "trash_formats":  # nothing else to do for this book
-                    emit(event="result", src_id=sid, ok=True, msg=done[:-2])
+                if action.get("trash_formats") or action.get("unpack"):
+                    done = take_out(src, sid, trash, action, plan.get("tmp") or tempfile.gettempdir()) + "; "
+                if action["op"] in ("trash_formats", "unpack"):  # nothing else to do for this book
+                    formats = {fmt: src.format_abspath(sid, fmt) for fmt in src.formats(sid)}
+                    emit(event="result", src_id=sid, ok=True, msg=done[:-2], formats=formats)
                     continue
 
                 if action["op"] == "move":
@@ -226,20 +292,23 @@ def main(plan_path):
                     moved[sid] = new_id
                     msg = f"moved to target (id {new_id})"
                     if changed:
-                        msg += f"; filled {', '.join(changed)}"
+                        msg += f"; filled {', '.join(changed)}" + tag_updated(tgt, new_id, changed, action)
                 elif action["op"] == "update":  # the book stays in the source
                     changed = fill_metadata(src, sid, action.get("set") or {})
                     msg = f"updated metadata in source"
                     if changed:
-                        msg += f"; filled {', '.join(changed)}"
+                        msg += f"; filled {', '.join(changed)}" + tag_updated(src, sid, changed, action)
                     emit(event="result", src_id=sid, ok=True, msg=done + msg)
                     continue
                 elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes
                     changed, path, formats = set_metadata(src, sid, action["set"])
                     if action.get("tag"):  # only once the update is written
                         add_tag(src, [sid], action["tag"])
-                    msg = f"updated {', '.join(changed) or 'nothing'}" + (f"; tagged {action['tag']}"
-                                                                          if action.get("tag") else "")
+                    tags = [action["tag"]] if action.get("tag") else []
+                    if tag_updated(src, sid, changed, action):
+                        tags.append(action["updated_tag"])
+                    msg = f"updated {', '.join(changed) or 'nothing'}" + (f"; tagged {', '.join(tags)}"
+                                                                          if tags else "")
                     emit(event="result", src_id=sid, ok=True, msg=done + msg, path=path, formats=formats)
                     continue
                 elif action["op"] == "trash" and action.get("no_target"):

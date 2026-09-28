@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import perf
+from .archives import Unpack, prepare as unpack_archives
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
@@ -553,6 +554,7 @@ def build_plan(
     trash_unreadable: bool = False,
     cleanup_only: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
+    unpack: Callable[[Book, Unpack], bool] | None = None,
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
     Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
@@ -565,7 +567,10 @@ def build_plan(
     _decide_similar). `always_cover`: compare covers also when the metadata says
     the books differ; the same cover (inside the files too) makes a duplicate.
     `author_variants`: with no candidate, books of the same title whose authors
-    are the same person written differently (see _author_variant_candidates)."""
+    are the same person written differently (see _author_variant_candidates).
+    `unpack(book, archive)`: asked for each book's clear archive (RAR, ZIP, 7Z) whether
+    to unpack it (see archives.py); None: archives are left as they are. Needs the AI's
+    resolver (its extractor)."""
     check_libraries(source, target, trash)
     progress = progress or (lambda *_: None)
     source_books = read_books(source)
@@ -623,14 +628,19 @@ def build_plan(
         perf.book(n)
         progress(n - 1, total, f"Analyzing {sb.label()}")
         book = sb  # as the analysis sees it: without the formats Calibre can't open
+        seen = sb  # with the files of an archive the user unpacks, instead of the archive
+        archives: list = []
         kept = False  # cleanup: a book not in the target, kept in the source (its copies are trashed)
         try:
-            bad = dict(unreadable[id(sb)]) if id(sb) in unreadable else unreadable_formats(sb.formats)
-            if bad and set(bad) >= set(sb.formats):
+            if unpack is not None and resolver is not None:
+                seen, archives = unpack_archives(sb, resolver.extractor, unpack)
+            bad = (dict(unreadable[id(sb)]) if id(sb) in unreadable and seen is sb
+                   else unreadable_formats(seen.formats))
+            if bad and set(bad) >= set(seen.formats):
                 item = _unreadable_item(sb, bad, trash_unreadable, same_series)
             else:
                 # Decided on the formats Calibre can open: a fake PDF is never merged into a match.
-                book = replace(sb, formats={f: p for f, p in sb.formats.items() if f not in bad}) if bad else sb
+                book = replace(seen, formats={f: p for f, p in seen.formats.items() if f not in bad}) if bad else seen
                 item = _plan_one(book, index, main_index, resolver, ignore_subtitle, same_library,
                                  similar_matching, cover_check, recheck_years, same_series, stats, similar,
                                  always_cover, by_title)
@@ -638,12 +648,15 @@ def build_plan(
                 extractor = getattr(resolver, "extractor", None)
                 if hasattr(extractor, "failed_formats"):  # files that failed to open while deciding
                     bad.update(extractor.failed_formats(book.formats))
-                if bad and set(bad) >= set(sb.formats):
+                if bad and set(bad) >= set(seen.formats):
                     item = _unreadable_item(sb, bad, trash_unreadable, same_series)
                 elif bad:
                     item.bad_formats = bad
                     item.trash_bad = item.planned_trash_bad = trash_unreadable
                     item.reason = item.planned_reason = _join(item.reason, [_bad_note(bad)])
+            if archives:
+                item.archives = archives
+                item.reason = item.planned_reason = _join(item.reason, [u.note for u in archives])
             if cleanup:
                 kept = _cleanup_only(item)
         except OSError as e:
