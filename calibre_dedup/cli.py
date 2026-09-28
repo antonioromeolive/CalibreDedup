@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -28,6 +28,7 @@ import argparse
 import logging
 import sys
 
+from . import perf
 from .ai import AICache
 from .config import Settings, config_dir
 from .executor import execute_plan
@@ -61,6 +62,7 @@ def run(argv: list[str]) -> int:
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
+    perf.configure("calibre_dedup_perf.log")
     if args.text_profile:
         settings.text_profile = args.text_profile
     if args.image_profile is not None:

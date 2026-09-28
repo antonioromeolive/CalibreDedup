@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -533,8 +533,8 @@ class ReviewWindow(QMainWindow):
         filter_row.addWidget(clear)
 
         # bulk selection
-        self.check_btn = QPushButton("Check shown rows")
-        self.uncheck_btn = QPushButton("Uncheck shown rows")
+        self.check_btn = QPushButton("Check visible")
+        self.uncheck_btn = QPushButton("Uncheck visible")
         self.check_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), True))
         self.uncheck_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), False))
         self.checked_label = _elastic(QLabel())

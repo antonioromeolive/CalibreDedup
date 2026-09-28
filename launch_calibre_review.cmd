@@ -1,6 +1,6 @@
 @echo off
 REM Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-REM Author: Antonio Romeo
+REM Author: Antonio Romeo (with Claude Code et al.)
 REM SPDX-License-Identifier: MIT
 REM
 REM Permission is hereby granted, free of charge, to any person obtaining a copy

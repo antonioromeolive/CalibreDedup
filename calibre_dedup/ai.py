@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -42,6 +42,7 @@ from typing import Callable, TypeVar
 
 import requests
 
+from . import perf
 from .config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, config_dir
 
 log = logging.getLogger(__name__)
@@ -216,6 +217,18 @@ class Provider:
         return response
 
     def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+        """The model's reply; each request is timed for the performance log."""
+        self.last_info = {}
+        started = time.monotonic()
+        try:
+            reply = self._chat(system, user, images)
+        except Exception as e:
+            perf.call(self, time.monotonic() - started, system, user, images, self.last_info, e)
+            raise
+        perf.call(self, time.monotonic() - started, system, user, images, self.last_info)
+        return reply
+
+    def _chat(self, system: str, user: str, images: list[str] | None) -> str:
         raise NotImplementedError
 
     def _json(self, r: requests.Response) -> dict:
@@ -234,7 +247,9 @@ class Provider:
         """Reply text of an OpenAI-style chat completion (OpenAI, Azure)."""
         choice = (data.get("choices") or [{}])[0]
         usage = data.get("usage") or {}
-        self.last_info = {"finish": choice.get("finish_reason"), "output_tokens": usage.get("completion_tokens"),
+        self.last_info = {"finish": choice.get("finish_reason"), "input_tokens": usage.get("prompt_tokens"),
+                          "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                          "output_tokens": usage.get("completion_tokens"),
                           "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")}
         if choice.get("finish_reason") == "content_filter":  # the reply was filtered: not "nothing found"
             raise AIError(f"{self.profile.kind} content filter withheld the reply", filtered=True)
@@ -252,11 +267,16 @@ class Provider:
         return "red" in reply.lower(), reply
 
 
+# Ollama's timings (nanoseconds), as Provider.last_info names them in seconds.
+_OLLAMA_DURATIONS = (("load_seconds", "load_duration"), ("prompt_seconds", "prompt_eval_duration"),
+                     ("eval_seconds", "eval_duration"), ("server_seconds", "total_duration"))
+
+
 class OllamaProvider(Provider):
     def _url(self, path: str) -> str:
         return self.profile.base_url.rstrip("/") + path
 
-    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+    def _chat(self, system: str, user: str, images: list[str] | None) -> str:
         p = self.profile
         self._log_call(user, images)
         user_msg: dict = {"role": "user", "content": user}
@@ -281,7 +301,8 @@ class OllamaProvider(Provider):
         data = self._json(r)
         message = data.get("message", {})
         self.last_info = {"finish": data.get("done_reason"), "thinking_chars": len(message.get("thinking") or ""),
-                          "output_tokens": data.get("eval_count")}
+                          "input_tokens": data.get("prompt_eval_count"), "output_tokens": data.get("eval_count"),
+                          **{name: data[key] / 1e9 for name, key in _OLLAMA_DURATIONS if data.get(key)}}
         return self._log_response(message.get("content", ""))
 
     def list_models(self) -> list[str]:
@@ -307,7 +328,7 @@ def azure_endpoint(base_url: str, api_version: str) -> tuple[str, bool]:
 
 
 class AzureOpenAIProvider(Provider):
-    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+    def _chat(self, system: str, user: str, images: list[str] | None) -> str:
         p = self.profile
         self._log_call(user, images)
         if not p.base_url or not p.model:
@@ -343,7 +364,7 @@ class AzureOpenAIProvider(Provider):
 
 
 class OpenAIProvider(Provider):
-    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+    def _chat(self, system: str, user: str, images: list[str] | None) -> str:
         p = self.profile
         self._log_call(user, images)
         if not p.model:
@@ -375,7 +396,7 @@ class OpenAIProvider(Provider):
 
 
 class AnthropicProvider(Provider):
-    def chat(self, system: str, user: str, images: list[str] | None = None) -> str:
+    def _chat(self, system: str, user: str, images: list[str] | None) -> str:
         p = self.profile
         self._log_call(user, images)
         if not p.model:
@@ -408,8 +429,10 @@ class AnthropicProvider(Provider):
             raise AIError(f"Anthropic error {r.status_code}: {r.text[:500]}", status=r.status_code)
         data = self._json(r)
         blocks = data.get("content") or []
-        self.last_info = {"finish": data.get("stop_reason"),
-                          "output_tokens": (data.get("usage") or {}).get("output_tokens")}
+        usage = data.get("usage") or {}
+        self.last_info = {"finish": data.get("stop_reason"), "input_tokens": usage.get("input_tokens"),
+                          "cached_tokens": usage.get("cache_read_input_tokens"),
+                          "output_tokens": usage.get("output_tokens")}
         if data.get("stop_reason") == "refusal":
             raise AIError("Anthropic refused the request", filtered=True)
         return self._log_response("\n".join(block.get("text", "") for block in blocks if block.get("type") == "text"))

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy

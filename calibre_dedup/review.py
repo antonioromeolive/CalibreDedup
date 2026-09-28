@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -40,6 +40,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from . import perf
 from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadata
 from .executor import ExecutionError, run_bridge
 from .calibre_env import calibre_is_running
@@ -370,11 +371,13 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     result = ReviewResult(library, trash, total_books=len(books), skipped=skipped)
     log.info("Reviewing %d books of %s%s", len(books), library,
              f" ({skipped} tagged {REVIEWED_TAG} skipped)" if skipped else "")
+    perf.run_start("review", len(books), reviewer.provider, reviewer.vision)
     for n, book in enumerate(books):
         if cancel is not None and cancel.is_set():
             result.stopped = True
             log.info("Review stopped after %d of %d books", n, len(books))
             break
+        perf.book(n + 1)
         if progress:
             progress(n, len(books), f"Reading {book.label()}")
         item = _review_book(reviewer, book)
@@ -385,6 +388,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
         result.items.append(item)
         if on_item:
             on_item(item)
+    perf.run_end(len(result.items), result.stopped)
     if progress:
         progress(len(result.items), len(books), "Done")
     result.stats = dict(reviewer.stats)

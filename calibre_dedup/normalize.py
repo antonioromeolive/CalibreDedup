@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -348,16 +348,32 @@ def similar_authors_keys(authors: list[str]) -> list[tuple[str, ...]]:
     return list(dict.fromkeys(k for k in keys if k))
 
 
+def _publisher_words(publisher: str) -> list[str]:
+    # A dotted abbreviation is one word: "S.r.l." -> "srl", "S.p.A." -> "spa" (stopwords).
+    text = re.sub(r"\b(?:\w\.){2,}", lambda m: m.group().replace(".", ""), publisher)
+    return [t for t in _tokens(text) if t not in _PUBLISHER_STOPWORDS]
+
+
 def publisher_tokens(publisher: str) -> frozenset[str]:
-    return frozenset(t for t in _tokens(publisher) if t not in _PUBLISHER_STOPWORDS)
+    return frozenset(_publisher_words(publisher))
 
 
 def same_publisher(a: str, b: str) -> bool:
-    ta, tb = publisher_tokens(a), publisher_tokens(b)
-    if not ta or not tb:
+    """"Mondadori" = "Arnoldo Mondadori Editore" = "A. Mondadori";
+    "DeAgostini Periodici S.r.l." = "De Agostini periodici"."""
+    wa, wb = _publisher_words(a), _publisher_words(b)
+    if not wa or not wb:
         # Nothing left after removing stopwords: compare the raw token lists.
         return _tokens(a) == _tokens(b)
-    return ta <= tb or tb <= ta
+    if "".join(wa) == "".join(wb):  # written with or without spaces
+        return True
+    ta, tb = set(wa), set(wb)
+
+    def covered(xs: set[str], ys: set[str]) -> bool:  # each word of xs in ys, or its initial
+        return all(x in ys or (len(x) == 1 and any(y.startswith(x) for y in ys)) for x in xs)
+
+    # A shared full word, not only initials ("A." is not "Adelphi").
+    return any(len(t) > 1 for t in ta & tb) and (covered(ta, tb) or covered(tb, ta))
 
 
 def normalize_isbn(raw: str | None) -> str | None:

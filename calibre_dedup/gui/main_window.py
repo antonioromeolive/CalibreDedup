@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter, QTableView, QVBoxLayout, QWidget,
 )
 
+from .. import perf
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
 from ..eta import Eta
@@ -138,7 +139,9 @@ def ask_ai_down(parent, message: str, what: str, more_help: str) -> str | None:
 
 
 def configure_logging(handler: QtLogHandler, filename: str) -> None:
-    """Log to the window and to a rotating file in the data folder."""
+    """Log to the window and to a rotating file in the data folder; the AI's
+    performance to its own file beside it (calibre_dedup.log -> calibre_dedup_perf.log)."""
+    perf.configure(Path(filename).stem + "_perf.log")
     file_handler = RotatingFileHandler(config_dir() / filename, maxBytes=5_000_000,
                                        backupCount=3, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
@@ -692,9 +695,9 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(clear)
 
         # bulk selection
-        self.check_btn = QPushButton("Check shown rows")
-        self.uncheck_btn = QPushButton("Uncheck shown rows")
-        self.invert_btn = QPushButton("Invert shown rows")
+        self.check_btn = QPushButton("Check visible")
+        self.uncheck_btn = QPushButton("Uncheck visible")
+        self.invert_btn = QPushButton("Invert visible")
         self.check_btn.setToolTip("Check rows currently shown after filtering")
         self.uncheck_btn.setToolTip("Uncheck rows currently shown after filtering")
         self.invert_btn.setToolTip("Invert checks for rows currently shown after filtering")

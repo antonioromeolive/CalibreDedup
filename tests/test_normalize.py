@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -78,6 +78,14 @@ def test_same_publisher():
     assert same_publisher("The MIT Press", "MIT Press")
     assert same_publisher("Mondadori", "Arnoldo Mondadori Editore")
     assert not same_publisher("Penguin", "HarperCollins")
+
+
+def test_same_publisher_written_differently():
+    assert same_publisher("DeAgostini Periodici S.r.l.", "De Agostini periodici")
+    assert same_publisher("Arnoldo Mondadori Editore", "A. Mondadori")
+    assert same_publisher("Giulio Einaudi editore S.p.A.", "Einaudi")
+    assert not same_publisher("A. Mondadori", "Adelphi")
+    assert not same_publisher("B. Mondadori", "Arnoldo Mondadori")
 
 
 def test_normalize_isbn():

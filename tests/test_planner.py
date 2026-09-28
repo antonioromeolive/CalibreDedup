@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -786,13 +786,22 @@ def test_always_cover_same_cover_overrides_the_metadata_as_trash_only(libs):
     assert "metadata differs: different year (2011 vs 1986)" in item.reason
 
 
-def test_always_cover_needs_the_covers_inside_the_files_too(libs):
+def test_always_cover_same_title_needs_no_cover_inside_the_files(libs):
     src, tgt, trash = libs(**YEARS_DIFFER)
     for inside in (False, None):
         item = build_plan(src, tgt, trash, InsideCoverResolver(True, inside), always_cover=True).items[0]
-        assert item.action is Action.MOVE and not item.by_cover
+        assert item.action is Action.TRASH and item.by_cover and item.add_formats == []
     item = build_plan(src, tgt, trash, InsideCoverResolver(False, True), always_cover=True).items[0]
     assert item.action is Action.MOVE
+
+
+@pytest.mark.parametrize("inside", [True, False, None])
+def test_always_cover_similar_title_needs_the_covers_inside_the_files_too(libs, inside):
+    item = _similar(libs, [{"title": "1 Haunted London", "authors": ["Walter Thornbury"], "publisher": "Gutenberg",
+                            "cover": True}],
+                    [{"title": "Haunted London", "authors": ["Walter Thornbury"], "publisher": "Oscar", "cover": True}],
+                    resolver=InsideCoverResolver(True, inside), always_cover=True)
+    assert (item.action is Action.TRASH and item.by_cover) == bool(inside)
 
 
 def test_without_always_cover_different_metadata_is_not_compared(libs):

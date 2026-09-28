@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -49,6 +49,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
+from . import perf
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
@@ -614,10 +615,12 @@ def build_plan(
     stats: Counter[str] = Counter()
     down = {"text AI": 0, "image AI": 0}  # the book at which that AI was turned off
 
+    perf.run_start("dedup", total, getattr(resolver, "provider", None), getattr(resolver, "vision", None))
     for n, sb in enumerate(analysis_books, 1):
         if cancel is not None and cancel.is_set():
             plan.stopped = True  # keep what was analyzed so far
             break
+        perf.book(n)
         progress(n - 1, total, f"Analyzing {sb.label()}")
         book = sb  # as the analysis sees it: without the formats Calibre can't open
         kept = False  # cleanup: a book not in the target, kept in the source (its copies are trashed)
@@ -678,6 +681,7 @@ def build_plan(
             on_item(item)
         if resolver and n % 10 == 0:
             resolver.cache.save()
+    perf.run_end(len(plan.items), plan.stopped)
     if resolver:
         resolver.cache.save()
         stats.update(resolver.stats)
@@ -920,7 +924,7 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
             ai_used = ai_used or called
             if same:
                 by_cover, override = True, comp.verdict is Verdict.DISTINCT
-                why = f"same cover, also inside the files; metadata differs: {comp.reason}" if override else "same cover"
+                why = f"same cover; metadata differs: {comp.reason}" if override else "same cover"
                 decision = Decision(Verdict.DUPLICATE, why, i)
                 break
 
@@ -980,16 +984,17 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
 
 
 def _cover_decides(resolver: AIResolver, sb: Book, other: Book, comp, notes: list[str],
-                   skipped: list[str]) -> tuple[bool, bool]:
-    """Whether the covers prove the same book: (same, model called). When the
-    metadata says the books differ (the "always compare covers" option), Calibre's
-    cover.jpg alone isn't trusted: it may be a downloaded picture shared by two
-    editions, so the covers inside the files must match too."""
+                   skipped: list[str], confirm_inside: bool = False) -> tuple[bool, bool]:
+    """Whether the covers prove the same book: (same, model called). With the same
+    title and authors, the same cover is enough, whatever year or publisher the
+    metadata says. `confirm_inside` (similar titles only): when the metadata says
+    the books differ, Calibre's cover.jpg alone isn't trusted there (it may be a
+    downloaded picture), so the covers inside the files must match too."""
     same, note, called = resolver.same_cover(sb, other)
     notes.append(note)
     if note and note == resolver.image_disabled_reason:
         skipped.append(SKIP_IMAGE_AI)
-    if not same or comp.verdict is not Verdict.DISTINCT:
+    if not same or not confirm_inside or comp.verdict is not Verdict.DISTINCT:
         return same, called
     same, note, called_inside = resolver.same_embedded_cover(sb, other)
     notes.append(note)
@@ -1024,7 +1029,7 @@ def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, s
                 notes.append(f"cover check skipped: {'AI is off' if resolver is None else 'no Image AI'}")
                 skipped.append(SKIP_COVER)
             else:
-                same, called = _cover_decides(resolver, sb, c.book, comp, notes, skipped)
+                same, called = _cover_decides(resolver, sb, c.book, comp, notes, skipped, confirm_inside=True)
                 ai_used = ai_used or called
                 if same:
                     proof, by_cover = "same cover", True

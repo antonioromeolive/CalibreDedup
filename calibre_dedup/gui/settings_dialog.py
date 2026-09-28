@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
-# Author: Antonio Romeo
+# Author: Antonio Romeo (with Claude Code et al.)
 # SPDX-License-Identifier: MIT
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -439,9 +439,9 @@ class SettingsDialog(QDialog):
         self.a_always_cover.setToolTip(
             "Covers are also compared when the metadata says the books are different (e.g. only the\n"
             "years differ, 2011 vs 1986). The same cover makes a duplicate, proposed as Trash only (no\n"
-            "formats are copied into the other book). Because Calibre's cover can be a downloaded\n"
-            "picture, the covers inside the book files must match too. Needs an Image AI; costs more\n"
-            "AI calls. List these books with the 'Decided by cover' filter.")
+            "formats are copied into the other book). For similar titles only, the covers inside the\n"
+            "book files must match too (Calibre's cover can be a downloaded picture). Needs an Image\n"
+            "AI; costs more AI calls. List these books with the 'Decided by cover' filter.")
         self.a_always_cover.setChecked(s.always_cover)
         self.a_years = QCheckBox("Re-check year differences by reading both books (AI)")
         self.a_years.setToolTip("Calibre's publication date is often the original publication, not this "
