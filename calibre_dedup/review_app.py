@@ -38,7 +38,7 @@ def run_cli(argv: list[str]) -> int:
     from .config import config_dir, load_review_settings
     from .review import (
         FIELDS, REVIEW_CACHE_FILE, ReviewAction, Reviewer, current_value, execute_review, format_value,
-        review_cache, scan_library, summary,
+        review_cache, scan_library, summary, write_run_csv,
     )
     from .session import make_resolver, require_calibre_dir
 
@@ -58,6 +58,9 @@ def run_cli(argv: list[str]) -> int:
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer of the review first (review_cache.json)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="don't use the AI cache (for tests): every question goes to the AI, "
+                         "review_cache.json is neither read nor written")
     ap.add_argument("--unpack", action="store_true",
                     help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are read as they are)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -74,7 +77,7 @@ def run_cli(argv: list[str]) -> int:
     if args.clear_cache:
         removed = AICache.clear(config_dir() / REVIEW_CACHE_FILE)
         print(f"AI cache cleared: {removed:,} answers removed", file=sys.stderr)
-    reviewer = make_resolver(settings, cls=Reviewer, cache=review_cache())
+    reviewer = make_resolver(settings, cls=Reviewer, cache=review_cache(args.no_cache))
     if reviewer is None:
         print("The review needs an AI: set a text profile.", file=sys.stderr)
         return 2
@@ -83,11 +86,13 @@ def run_cli(argv: list[str]) -> int:
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
         result = scan_library(args.library, args.trash, reviewer, progress,
                               skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed,
-                              unpack=(lambda book, archive: True) if args.unpack else None)
+                              unpack=(lambda n: True) if args.unpack else None)
         print(file=sys.stderr)
     finally:
         reviewer.cache.save()
         reviewer.extractor.close()
+    if args.no_cache:  # the answers aren't kept: save the run's results
+        print(f"Analysis written to {write_run_csv(result)}", file=sys.stderr)
 
     for item in result.items:
         if item.found is None:

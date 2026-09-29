@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from collections import Counter, defaultdict
@@ -50,7 +51,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import perf
-from .archives import Unpack, prepare as unpack_archives
+from .archives import ask_once, prepare as unpack_archives
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
@@ -59,8 +60,9 @@ from .library import read_books
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
 from .normalize import (
-    authors_key, contains_title, initials_match, is_unknown, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number,
-    series_key, similar_authors_keys, title_key, title_variants,
+    MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, initials_match, is_unknown,
+    looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number, series_key,
+    similar_authors_keys, surname_match, title_key, title_variants,
 )
 from .selection import action_label
 
@@ -438,6 +440,81 @@ def _author_keys(ident: Identity, similar: bool) -> list:
     return [a] if a else []
 
 
+SWAPPED_NOTE = "title and author were swapped"
+PERSON_TITLE_NOTE = "authors not compared by AI: the title is a person's name (title and author swapped?)"
+
+
+class SwapDetector:
+    """Books whose title and author are swapped ("Kingston — The Log House by the Lake"), usually
+    from file names ("Kingston - The Log House by the Lake.epub") that Calibre read as "Title - Author".
+    From metadata only, over both libraries: the title is the name of a person who is the
+    author of other books, written as a name; the author field is not an author of any other
+    book, and reads as a title (a single capitalized word needs a person with at least
+    two other books). Books named after a person ("Ruskin — Walter Thornbury", a
+    biography "Rousseau — John Morley") keep their metadata: their author field is a name."""
+
+    MIN_SUPPORT_SINGLE_WORD = 2
+
+    def __init__(self, books: list[Book]):
+        self.by_author: dict[tuple, set[int]] = defaultdict(set)  # author key -> id(book)
+        self.by_part: dict[str, set[tuple]] = defaultdict(set)  # name part -> author keys
+        self.by_title: dict[str, set[int]] = defaultdict(set)  # title key -> id(book)
+        for b in books:
+            self.by_title[title_key(b.title)].add(id(b))
+            for a in b.authors:
+                k = author_key(a)
+                if is_unknown(a) or not looks_like_name(a) or not k or k == VARIOUS_AUTHORS_KEY:
+                    continue  # a swapped book's "author" is a title: not a person
+                self.by_author[k].add(id(b))
+                for part in k:
+                    if len(part) >= MIN_SURNAME_LENGTH:
+                        self.by_part[part].add(k)
+
+    def _others(self, key: tuple, title: str) -> set[int]:
+        """Books by `key`, other than those with this title (the swapped copies themselves)."""
+        return self.by_author.get(key, set()) - self.by_title.get(title_key(title), set())
+
+    def person(self, title: str) -> tuple | None:
+        """The author key of the person `title` names, if a known author of other books:
+        the whole name, or a surname alone that only one author has."""
+        if is_unknown(title) or not looks_like_name(title):
+            return None
+        k = author_key(title)
+        if not k or k == VARIOUS_AUTHORS_KEY:
+            return None
+        if self._others(k, title):
+            return k
+        if len(k) == 1:
+            found = [x for x in self.by_part.get(k[0], ()) if self._others(x, title)]
+            if len(found) == 1:
+                return found[0]
+        return None
+
+    def swap(self, book: Book) -> Book | None:
+        """The book with title and authors put right, or None if they look right."""
+        authors = [a for a in book.authors if not is_unknown(a)]
+        person = self.person(book.title) if authors else None
+        if person is None:
+            return None
+        if any(self._others(author_key(a), book.title) for a in authors):
+            return None  # its author has other books: a book named after a person
+        text = " & ".join(authors)
+        tokens = set(author_key(text))
+        if any(len(k) > 1 and set(k) <= tokens and self._others(k, book.title)
+               for k in self.by_author if k[0] in tokens):
+            return None  # names a known person ("Jean-Jacques Rousseau (ed.)")
+        words = re.findall(r"[^\W\d_]+|\d+", text)
+        if (not words or not (words[0][0].isupper() or words[0].isdigit())
+                or re.search(r"[^\W\d_]\d|\d[^\W\d_]", text)):
+            return None  # junk ("* * *", "ab01234", "a cura di ..."): the title is no better
+        if all(looks_like_name(a) for a in authors):
+            if any(len(re.findall(r"[^\W\d_]+", a)) > 1 for a in authors):
+                return None  # a person's name: a book about someone
+            if len(self._others(person, book.title)) < self.MIN_SUPPORT_SINGLE_WORD:
+                return None
+        return replace(book, title=text, authors=[book.title])
+
+
 @dataclass
 class _SimilarIndex:
     by_author: dict  # author key -> candidates
@@ -551,10 +628,11 @@ def build_plan(
     similar_titles: bool = False,
     always_cover: bool = False,
     author_variants: bool = False,
+    fix_swapped: bool = False,
     trash_unreadable: bool = False,
     cleanup_only: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
-    unpack: Callable[[Book, Unpack], bool] | None = None,
+    unpack: Callable[[int], bool] | None = None,
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
     Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
@@ -568,12 +646,15 @@ def build_plan(
     the books differ; the same cover (inside the files too) makes a duplicate.
     `author_variants`: with no candidate, books of the same title whose authors
     are the same person written differently (see _author_variant_candidates).
-    `unpack(book, archive)`: asked for each book's clear archive (RAR, ZIP, 7Z) whether
-    to unpack it (see archives.py); None: archives are left as they are. Needs the AI's
-    resolver (its extractor)."""
+    `fix_swapped`: books whose title and author are swapped (see SwapDetector) are
+    analyzed, and matched, with them put right (PlanItem.swapped).
+    `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
+    (RAR, ZIP, 7Z) of the n books that have one (see archives.ask_once); None: archives
+    are left as they are. Needs the AI's resolver (its extractor)."""
     check_libraries(source, target, trash)
     progress = progress or (lambda *_: None)
     source_books = read_books(source)
+    unpack = ask_once(source_books, unpack) if resolver is not None else None
     same_library = str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
     target_books = read_books(target) if Path(target, "metadata.db").is_file() else []
     plan = Plan(source, target, trash, total_books=len(source_books), same_library=same_library)
@@ -584,6 +665,13 @@ def build_plan(
     similar = _SimilarIndex(defaultdict(list), _collection_words(source_books + target_books)) \
         if similar_titles else None
     by_title: dict[str, list[_Candidate]] | None = defaultdict(list) if author_variants else None
+    swaps = SwapDetector(source_books + target_books) if fix_swapped or author_variants else None
+
+    def put_right(b: Book) -> Book | None:
+        fixed = swaps.swap(b) if fix_swapped and swaps is not None else None
+        if fixed is not None:
+            log.info("%s: %s, analyzed as %s", b.label(), SWAPPED_NOTE, fixed.label())
+        return fixed
 
     def add_to_index(c: _Candidate) -> None:
         for k in _keys(c.identity, ignore_subtitle, similar_matching):
@@ -598,6 +686,7 @@ def build_plan(
 
     if not same_library:
         for tb in target_books:
+            tb = put_right(tb) or tb
             add_to_index(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
 
     total = len(source_books)
@@ -632,7 +721,7 @@ def build_plan(
         archives: list = []
         kept = False  # cleanup: a book not in the target, kept in the source (its copies are trashed)
         try:
-            if unpack is not None and resolver is not None:
+            if unpack is not None:
                 seen, archives = unpack_archives(sb, resolver.extractor, unpack)
             bad = (dict(unreadable[id(sb)]) if id(sb) in unreadable and seen is sb
                    else unreadable_formats(seen.formats))
@@ -641,10 +730,17 @@ def build_plan(
             else:
                 # Decided on the formats Calibre can open: a fake PDF is never merged into a match.
                 book = replace(seen, formats={f: p for f, p in seen.formats.items() if f not in bad}) if bad else seen
+                fixed = put_right(book)
+                book = fixed or book
                 item = _plan_one(book, index, main_index, resolver, ignore_subtitle, same_library,
                                  similar_matching, cover_check, recheck_years, same_series, stats, similar,
-                                 always_cover, by_title)
+                                 always_cover, by_title, swaps)
                 item.source = sb  # the record itself (the executor acts on it)
+                if fixed is not None:
+                    item.swapped = True
+                    stats["swapped"] += 1
+                    item.reason = item.planned_reason = _join(
+                        item.reason, [f"{SWAPPED_NOTE} (was {sb.title!r} by {' & '.join(sb.authors)!r})"])
                 extractor = getattr(resolver, "extractor", None)
                 if hasattr(extractor, "failed_formats"):  # files that failed to open while deciding
                     bad.update(extractor.failed_formats(book.formats))
@@ -737,6 +833,8 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
         parts.append(f"{s.get('author', 0)} author names checked by AI ({s.get('author_cached', 0)} cached)")
     if s.get("year_rechecks"):
         parts.append(f"{s['year_rechecks']} year re-checks")
+    if s.get("swapped"):
+        parts.append(f"{s['swapped']} books with title and author swapped")
     counts = Counter(k for it in plan.items for k in it.skipped)
     warnings = list(plan.ai_down)
     warnings += [f"{n} book(s): {SKIP_EXPLAINED[k]}" for k, n in counts.items()]
@@ -815,13 +913,15 @@ def _plan_one(sb: Book, index, main_index, resolver: AIResolver | None,
               similar_matching: bool = False, cover_check: bool = False,
               recheck_years: bool = False, same_series: bool = False,
               stats: Counter[str] | None = None, similar: _SimilarIndex | None = None,
-              always_cover: bool = False, by_title: dict | None = None) -> PlanItem:
+              always_cover: bool = False, by_title: dict | None = None,
+              persons: SwapDetector | None = None) -> PlanItem:
     """`similar` turns on similar-title matching; `by_title` (title key -> books)
-    the check for authors written differently."""
+    the check for authors written differently; `persons`: what tells a title that is a
+    person's name (no AI question about it)."""
     skipped: list[str] = []
     item = _decide_one(sb, index, main_index, resolver, ignore_subtitle, same_library, similar_matching,
                        cover_check, recheck_years, same_series, Counter() if stats is None else stats, skipped,
-                       similar, always_cover, by_title)
+                       similar, always_cover, by_title, persons)
     item.skipped = list(dict.fromkeys(skipped))
     return item
 
@@ -830,7 +930,7 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
                 same_library: bool, similar_matching: bool, cover_check: bool, recheck_years: bool,
                 same_series: bool, stats: Counter[str], skipped: list[str],
                 similar: _SimilarIndex | None = None, always_cover: bool = False,
-                by_title: dict | None = None) -> PlanItem:
+                by_title: dict | None = None, persons: SwapDetector | None = None) -> PlanItem:
     """`skipped` collects the checks wanted for this book that could not run."""
     ident = metadata_identity(sb, same_series)
     if same_series and ident.series is None:
@@ -863,7 +963,7 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
         return PlanItem(sb, Action.LEAVE, "title/authors unusable after normalization", ident, ai_used=ai_used)
     candidates = _lookup(index, keys)
     if not candidates and by_title is not None:
-        candidates, n, called = _author_variant_candidates(sb, ident, by_title, resolver, ignore_subtitle)
+        candidates, n, called = _author_variant_candidates(sb, ident, by_title, resolver, ignore_subtitle, persons)
         notes += n
         ai_used = ai_used or called
 
@@ -966,15 +1066,19 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
 
 
 def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolver: AIResolver | None,
-                               ignore_subtitle: bool) -> tuple[list[_Candidate], list[str], bool]:
+                               ignore_subtitle: bool, persons: SwapDetector | None = None,
+                               ) -> tuple[list[_Candidate], list[str], bool]:
     """Books with the same title whose authors are the same person written
     differently: one letter apart in a name ("Frederickk Marryat" / "Frederick Marryat"),
-    first names as initials ("E. Marshall" / "Marshall, Emma"), or else the same
-    person according to the text AI, told the shared title (typos,
-    transliterations, pen names). They are then compared like any book with the same title and authors.
-    Returns (candidates, notes, model called)."""
+    first names as initials ("E. Marshall" / "Marshall, Emma"), the surname alone
+    ("Kingston" / "William Henry Giles Kingston"), or else the same person according to the text AI,
+    told the shared title (typos, transliterations, pen names). They are then compared
+    like any book with the same title and authors. The AI is not asked when the title is
+    itself a person's name (`persons`): title and author are then swapped, and the
+    "authors" it would compare are book titles. Returns (candidates, notes, model called)."""
     found, notes, called = [], [], False
     mine = " & ".join(ident.authors)
+    ask_ai = resolver is not None and (persons is None or persons.person(ident.title) is None)
     for c in by_title.get(title_key(ident.title, ignore_subtitle), []):
         if c.book is sb:
             continue
@@ -983,12 +1087,16 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
             same, how = True, "one letter apart"
         elif any(initials_match(a, b) for a in ident.authors for b in c.identity.authors):
             same, how = True, "initials"
-        elif resolver is not None:
+        elif any(surname_match(a, b) for a in ident.authors for b in c.identity.authors):
+            same, how = True, "surname only"
+        elif ask_ai:
             same, how, asked = resolver.same_person(sb, mine, theirs, ident.title)
             called = called or asked
             if not same and how == resolver.disabled_reason:
                 notes.append(how)
         else:
+            if resolver is not None:
+                notes.append(PERSON_TITLE_NOTE)
             continue
         if same:
             found.append(c)

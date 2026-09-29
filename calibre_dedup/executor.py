@@ -34,7 +34,7 @@ from typing import Callable
 from .calibre_env import CREATE_NO_WINDOW, calibre_is_running, tool
 from .config import config_dir
 from .models import Action, Plan, PlanItem
-from .selection import actionable, blocked, runs_main_action
+from .selection import actionable, blocked, has_metadata_update, runs_main_action
 from .tempdirs import RunDir, lock, unlock
 
 log = logging.getLogger(__name__)
@@ -42,6 +42,8 @@ BRIDGE = Path(__file__).with_name("bridge_script.py")
 # Added to every book whose metadata is written from what the AI read in it (both programs),
 # only when a field actually changes: search it in Calibre to check the AI's work.
 AI_UPDATED_TAG = "AIUpdated"
+# Added to every book whose swapped title and author were put right.
+SWAPPED_TAG = "TitleAuthorSwapped"
 
 
 class ExecutionError(Exception):
@@ -94,6 +96,8 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
             a = {"op": "move", "src_id": item.source.id, "title": item.source.title}
             if update_metadata and item.identity.ai_fields:
                 a["set"], a["updated_tag"] = _ai_values(item), AI_UPDATED_TAG
+            if update_metadata and item.swapped:
+                a["swap"] = _swap_values(item)
         elif main and item.action is Action.TRASH:
             a = {"op": "trash", "src_id": item.source.id, "title": item.source.title,
                  "add_formats": item.add_formats}
@@ -105,9 +109,12 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
                 a["keep_src_id"] = item.match.id
             else:
                 a["target_id"] = item.match.id
-        elif main and item.action is Action.LEAVE and update_metadata and item.ai_used and item.identity.ai_fields:
-            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": _ai_values(item),
-                 "updated_tag": AI_UPDATED_TAG}
+        elif main and item.action is Action.LEAVE and update_metadata and has_metadata_update(item):
+            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": {}}
+            if item.ai_used and item.identity.ai_fields:
+                a["set"], a["updated_tag"] = _ai_values(item), AI_UPDATED_TAG
+            if item.swapped:
+                a["swap"] = _swap_values(item)
         trashed = bool(a and a["op"] == "trash")
         bad = item.bad_formats_to_trash if not trashed else []  # trashed whole anyway
         # Archives: their files are added first (a merge may need them); a book trashed
@@ -123,6 +130,13 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
         if a:
             actions.append(a)
     return actions
+
+
+def _swap_values(item: PlanItem) -> dict:
+    """Title and authors put right, for a book whose record had them swapped
+    (overwritten, unlike what the AI found; tagged SWAPPED_TAG)."""
+    return {"title": item.identity.title, "authors": item.identity.authors, "tag": SWAPPED_TAG,
+            "was_title": item.source.title, "was_authors": item.source.authors}
 
 
 def _ai_values(item: PlanItem) -> dict:

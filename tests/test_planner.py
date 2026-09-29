@@ -959,3 +959,83 @@ def test_cleanup_only_keeps_the_epub_copy(libs):
     assert mobi.match.id == 2 and "another copy (#2) stays in the source, but it lacks MOBI" in mobi.reason
     override(mobi, Action.TRASH)  # right-click Merge & Trash: its MOBI goes to the EPUB copy
     assert mobi.add_formats == ["MOBI"] and mobi.match_in_source and mobi.selected
+
+
+# --- title and author swapped ---------------------------------------------------------
+KINGSTON = dict(
+    source=[{"title": "Kingston", "authors": ["The Log House by the Lake"], "text": "A log house. "},
+            {"title": "The Boy who sailed with Blake", "authors": ["William Henry Giles Kingston"]}],
+    target=[{"title": "The Log House by the Lake", "authors": ["William Henry Giles Kingston"], "text": "A log house. "}],
+)
+
+
+def test_swapped_title_and_author_are_put_right(libs):
+    src, tgt, trash = libs(**KINGSTON)
+    resolver = FakeResolver({})
+    item = build_plan(src, tgt, trash, resolver, author_variants=True, fix_swapped=True).items[0]
+    assert item.swapped and item.identity.title == "The Log House by the Lake" and item.identity.authors == ["Kingston"]
+    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+    assert "(surname only)" in item.reason and "title and author were swapped" in item.reason
+    assert item.source.title == "Kingston"  # the record itself, as the executor finds it
+    assert resolver.person_calls == []
+
+
+def test_swapped_books_are_not_asked_to_the_ai(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Kingston", "authors": ["The Log House by the Lake"]},
+                {"title": "The Boy who sailed with Blake", "authors": ["William Henry Giles Kingston"]}],
+        target=[{"title": "Kingston", "authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]}],
+    )
+    resolver = FakeResolver({})
+    item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]  # not put right
+    assert resolver.person_calls == [] and not item.swapped
+    assert "the title is a person's name" in item.reason
+
+
+def test_a_book_named_after_a_person_is_not_swapped(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Rousseau", "authors": ["John Morley"]},  # a biography
+                {"title": "Ruskin", "authors": ["Walter Thornbury"]},  # a novel
+                {"title": "Müller", "authors": ["* * *"]}],  # junk: the title is no better
+        target=[{"title": "The Confessions of Jean Jacques Rousseau — Volume 02", "authors": ["Jean-Jacques Rousseau"]},
+                {"title": "The Confessions of Jean Jacques Rousseau — Volume 04", "authors": ["Rousseau, Jean-Jacques"]},
+                {"title": "Modern Painters, Volume 1 (of 5)", "authors": ["John Ruskin"]},
+                {"title": "Frondes Agrestes: Readings in 'Modern Painters'", "authors": ["John Ruskin"]},
+                {"title": "Auld lang syne. Second series", "authors": ["F. Max Müller"]}],
+    )
+    plan = build_plan(src, tgt, trash, fix_swapped=True)
+    assert [i.swapped for i in plan.items] == [False, False, False]
+
+
+@pytest.mark.parametrize("others,swapped", [(1, False), (2, True)])
+def test_a_single_word_author_needs_a_well_known_person(libs, others, swapped):
+    # "Underwoods" could be a name: put right only for a person with at least two other books
+    src, tgt, trash = libs(source=[{"title": "Kingston", "authors": ["Underwoods"]}],
+                           target=[{"title": f"Book {n}", "authors": ["William Henry Giles Kingston"]} for n in range(others)])
+    assert build_plan(src, tgt, trash, fix_swapped=True).items[0].swapped is swapped
+
+
+def test_swap_is_written_on_execute(libs):
+    from calibre_dedup.executor import plan_actions
+    from calibre_dedup.selection import checkable
+    src, tgt, trash = libs(
+        source=[{"title": "Kingston", "authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]},  # not in target: moved, put right
+                {"title": "The Boy who sailed with Blake", "authors": ["William Henry Giles Kingston"]}],
+        target=[{"title": "The Log House by the Lake", "authors": ["William Henry Giles Kingston"]}],
+    )
+    plan = build_plan(src, tgt, trash, fix_swapped=True, author_variants=True)
+    moved = plan.items[0]
+    assert moved.action is Action.MOVE and moved.swapped
+    [a] = [a for a in plan_actions(plan, True) if a["src_id"] == moved.source.id]
+    assert a["swap"] == {"title": "Ben Hadden; or, Do Right Whatever Comes Of It", "authors": ["Kingston"], "tag": "TitleAuthorSwapped",
+                         "was_title": "Kingston", "was_authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]}
+    assert all("swap" not in a for a in plan_actions(plan, False))  # "Write found metadata" off
+
+    # One library: a book left in place is put right only when ticked
+    plan = build_plan(src, src, trash, fix_swapped=True)
+    left = plan.items[0]
+    assert left.action is Action.LEAVE and left.swapped and checkable(left) and not left.selected
+    assert plan_actions(plan, True) == []
+    left.selected = True
+    [a] = plan_actions(plan, True)
+    assert a["op"] == "update" and a["swap"]["title"] == "Ben Hadden; or, Do Right Whatever Comes Of It" and "updated_tag" not in a

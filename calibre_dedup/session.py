@@ -153,6 +153,7 @@ ANALYSIS_SETTINGS = {
     "cover_check": "cover check", "recheck_years": "year re-check", "same_series": "same series",
     "similar_titles": "similar titles", "always_cover": "always compare covers",
     "author_variants": "authors written differently",
+    "fix_swapped": "title and author swapped",
     "trash_unreadable": "move unreadable files to the trash library",
     "cleanup_only": "cleanup source only",
 }

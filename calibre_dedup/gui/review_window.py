@@ -54,12 +54,13 @@ from ..normalize import strip_accents
 from ..review import (
     ACTION_LABELS, FIELD_LABELS, FIELDS, ReviewAction, ReviewItem, ReviewResult, Reviewer, book_cover_file,
     REVIEW_CACHE_FILE, REVIEWED_TAG, current_value, execute_review, format_value, is_reviewed, review_actions,
-    review_cache, scan_library, summary,
+    review_cache, scan_library, summary, write_run_csv,
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from .main_window import (
     AI_LOG_COLOR, ARCHIVES_TIP, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
-    add_unpack_actions, archive_texts, ask_ai_down, ask_unpack, configure_logging, open_file, with_eta,
+    add_unpack_actions, archive_texts, ask_ai_down, ask_unpack, configure_logging, no_cache_box, open_file,
+    with_eta,
 )
 from ..planner import AI_OFF
 from .cover_preview import CoverPreview
@@ -327,12 +328,13 @@ class ScanWorker(QThread, UnpackQuestion):
     finished_ok = Signal(object)
     failed = Signal(str)
     ai_down = Signal(str, bool)
-    unpack_asked = Signal(str, str, str)
+    unpack_asked = Signal(int)
     BATCH_SECONDS = 0.3
 
-    def __init__(self, settings: Settings, library: str, trash: str):
+    def __init__(self, settings: Settings, library: str, trash: str, no_cache: bool = False):
         super().__init__()
         self.settings, self.library, self.trash = settings, library, trash
+        self.no_cache = no_cache
         self.cancel = threading.Event()
         self._answered = threading.Event()
         self._choice = AI_OFF
@@ -355,7 +357,8 @@ class ScanWorker(QThread, UnpackQuestion):
     def run(self):
         reviewer = None
         try:
-            reviewer = make_resolver(self.settings, on_down=self.ask, cls=Reviewer, cache=review_cache())
+            reviewer = make_resolver(self.settings, on_down=self.ask, cls=Reviewer,
+                                     cache=review_cache(self.no_cache))
             if reviewer is None:
                 raise RuntimeError("The review needs an AI: choose a Text AI (or an Image AI).")
             batch: list = []
@@ -373,6 +376,8 @@ class ScanWorker(QThread, UnpackQuestion):
                                   skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack)
             if batch:
                 self.items_ready.emit(batch.copy())
+            if self.no_cache:  # the answers aren't kept: save the run's results
+                write_run_csv(result)
             self.finished_ok.emit(result)
         except Exception as e:
             log.exception("Review failed")
@@ -461,6 +466,8 @@ class ReviewWindow(QMainWindow):
         ai_row.addWidget(self.text_box, 1)
         ai_row.addWidget(QLabel("Image AI (reads the cover):"))
         ai_row.addWidget(self.image_box, 1)
+        self.no_cache = no_cache_box()
+        ai_row.addWidget(self.no_cache)
         ai_row.addWidget(settings_btn)
 
         # actions
@@ -916,7 +923,7 @@ class ReviewWindow(QMainWindow):
         self._eta.reset()
         self.model.locked = False
         self.model.reset([])
-        worker = ScanWorker(replace(self.settings), library, trash)
+        worker = ScanWorker(replace(self.settings), library, trash, self.no_cache.isChecked())
         worker.progress.connect(self._on_progress)
         worker.items_ready.connect(self._on_items)
         worker.finished_ok.connect(self._scan_done)
@@ -961,14 +968,14 @@ class ReviewWindow(QMainWindow):
         for reason in result.ai_down:
             log.warning("Review: %s", reason)
 
-    def _on_unpack_asked(self, label: str, fmt: str, summary: str):
+    def _on_unpack_asked(self, count: int):
         worker = self.worker
         if not isinstance(worker, ScanWorker):
             return
         if self._close_pending:
-            worker.answer_unpack(False, True)
+            worker.answer_unpack(False)
             return
-        worker.answer_unpack(*ask_unpack(self, label, fmt, summary))
+        worker.answer_unpack(ask_unpack(self, count))
 
     def _on_ai_down(self, message: str, image: bool):
         worker = self.worker

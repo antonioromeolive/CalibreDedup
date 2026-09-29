@@ -375,3 +375,18 @@ def test_a_record_with_no_files_is_proposed_for_the_trash():
     assert (missing.action, missing.selected) == (ReviewAction.KEEP, False)
     actions = review_actions([empty, missing], set(FIELDS))
     assert actions == [{"src_id": 1, "title": "Il nome della rosa", "op": "trash", "no_target": True}]
+
+
+def test_a_run_without_cache_is_written_as_csv(tmp_path):
+    import csv
+    from calibre_dedup.review import ReviewResult, write_run_csv
+    wrong = ReviewItem(book(id=7, title="Il nome della rosaa"), meta())
+    unread = ReviewItem(book(id=8), None, "nothing to read")
+    path = write_run_csv(ReviewResult("C:/libs/loc-test", "", items=[wrong, unread]), tmp_path)
+    assert path.name.startswith("review_loc-test_")
+    rows = list(csv.DictReader(path.open(encoding="utf-8-sig")))
+    assert rows[0]["book_id"] == "7" and rows[0]["calibre_title"] == "Il nome della rosaa"
+    assert rows[0]["read_title"] == rows[0]["new_title"] == "Il nome della rosa"
+    assert rows[0]["calibre_authors"] == rows[0]["read_authors"] == "Umberto Eco"
+    assert rows[0]["new_authors"] == "" and rows[0]["action"] == "update"
+    assert rows[1]["read_title"] == "" and rows[1]["note"] == "nothing to read"

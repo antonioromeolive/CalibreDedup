@@ -202,3 +202,27 @@ def test_names_one_letter_apart():
 def test_initials_match(a, b, same):
     from calibre_dedup.normalize import initials_match
     assert initials_match(a, b) is same
+
+
+@pytest.mark.parametrize("text,name", [
+    ("F. Max Müller", True), ("Kingston", True), ("Rousseau, Jean-Jacques", True), ("A. B. Ellis", True),
+    ("Ursula K. Le Guin", True), ("De Kock, Paul", True),
+    ("Chasing the Sun", False), ("Volume 02", False), ("Il Nome Della Rosa", False),
+    ("The Antiquary", False), ("Kate Aylesford SCAN", False), ("uploader", False), ("", False),
+])
+def test_looks_like_name(text, name):
+    from calibre_dedup.normalize import looks_like_name
+    assert looks_like_name(text) is name
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("Muller", "F. Max Müller", True),
+    ("Rousseau, Jean-Jacques", "Rousseau", True),
+    ("Eco", "Umberto Eco", False),  # too short: too many others
+    ("Muller", "Müller", False),  # the same key: not this rule's case
+    ("Herbert", "James Herbert Wells", True),
+    ("Frank Herbert", "James Herbert", False),
+])
+def test_surname_match(a, b, same):
+    from calibre_dedup.normalize import surname_match
+    assert surname_match(a, b) is same

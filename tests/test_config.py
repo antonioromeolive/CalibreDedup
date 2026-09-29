@@ -123,3 +123,21 @@ def test_clearing_the_review_cache_does_not_bring_back_the_shared_answers(monkey
     assert AICache.clear(path) == 2
     assert review_cache().get("old") is None and AICache.size(path) == (0, 2)  # emptied, not copied again
     assert AICache().get("old") == {"title": "x"}  # the other program's cache is untouched
+
+
+def test_no_cache_ignores_the_saved_answers_and_leaves_the_files_as_they_are(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    from calibre_dedup.review import REVIEW_CACHE_FILE, review_cache
+    shared = AICache()
+    shared.put("old", {"title": "x"})
+    shared.save()
+    before = (config.config_dir() / "ai_cache.json").read_bytes()
+    for cache in (AICache(off=True), review_cache(off=True)):
+        assert cache.get("old") is None
+        cache.put("new", {"title": "y"})
+        assert cache.get("new") is None
+        cache.save()
+    assert (config.config_dir() / "ai_cache.json").read_bytes() == before
+    assert not (config.config_dir() / REVIEW_CACHE_FILE).exists()  # not even created as a copy
+    assert AICache().get("old") == {"title": "x"}

@@ -30,18 +30,20 @@ its metadata, keep it as it is, or move it to a trash library; the bridge
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import logging
 import re
 import shutil
 import threading
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
 from . import perf
-from .archives import Unpack, prepare as unpack_archives
+from .archives import ask_once, prepare as unpack_archives
 from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadata
 from .executor import AI_UPDATED_TAG, ExecutionError, run_bridge
 from .calibre_env import calibre_is_running
@@ -197,11 +199,14 @@ def format_value(name: str, value) -> str:
 REVIEW_CACHE_FILE = "review_cache.json"
 
 
-def review_cache() -> AICache:
+def review_cache(off: bool = False) -> AICache:
     """calibre-review's own AI cache, so that it can run with the duplicate remover
     (each writes its whole cache back). The first time it starts as a copy of the
-    shared ai_cache.json, which holds the answers of reviews made before the split."""
+    shared ai_cache.json, which holds the answers of reviews made before the split.
+    `off`: no cache (see AICache)."""
     path = config_dir() / REVIEW_CACHE_FILE
+    if off:
+        return AICache(path, off=True)
     shared = config_dir() / "ai_cache.json"
     if not path.exists() and shared.is_file():
         try:
@@ -370,10 +375,10 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  cancel: threading.Event | None = None,
                  on_item: Callable[[ReviewItem], None] | None = None,
                  skip_reviewed: bool = True,
-                 unpack: Callable[[Book, Unpack], bool] | None = None) -> ReviewResult:
+                 unpack: Callable[[int], bool] | None = None) -> ReviewResult:
     """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
-    `unpack(book, archive)`: asked for each clear archive whether to unpack it (see
-    archives.py); None: archives are read as they are."""
+    `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
+    of the n books that have one (see archives.ask_once); None: archives are read as they are."""
     check_libraries(library, trash)
     books = read_books(library)
     skipped = sum(1 for b in books if is_reviewed(b)) if skip_reviewed else 0
@@ -382,6 +387,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     result = ReviewResult(library, trash, total_books=len(books), skipped=skipped)
     log.info("Reviewing %d books of %s%s", len(books), library,
              f" ({skipped} tagged {REVIEWED_TAG} skipped)" if skipped else "")
+    unpack = ask_once(books, unpack)
     perf.run_start("review", len(books), reviewer.provider, reviewer.vision)
     for n, book in enumerate(books):
         if cancel is not None and cancel.is_set():
@@ -445,6 +451,39 @@ def summary(result: ReviewResult) -> str:
     skipped = f" · {result.skipped} already {REVIEWED_TAG}, skipped" if result.skipped else ""
     return (f"{head}: {changed} with differences, {failed} not read{skipped} · AI: {read} read, "
             f"{cached} from cache" + "".join(f" · {r}" for r in result.ai_down))
+
+
+RUNS_FOLDER = "review_runs"
+RUN_FIELDS = ("title", "authors", "publisher", "year", "series")
+
+
+def write_run_csv(result: ReviewResult, folder: Path | None = None) -> Path:
+    """The analysis as a CSV, one row per book read: Calibre's values, what the AI read, and
+    the proposed changes. Written after each analysis run without the AI cache (tests), whose
+    answers would otherwise be lost: review_runs/review_<library>_<date>.csv in the data folder."""
+    folder = folder or config_dir() / RUNS_FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"review_{Path(result.library).name}_{datetime.now():%Y%m%d_%H%M%S}.csv"
+
+    def cell(name: str, value) -> str:
+        return format_value(name, value)
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["book_id"] + [f"calibre_{n}" for n in RUN_FIELDS] + [f"read_{n}" for n in RUN_FIELDS]
+                   + [f"new_{n}" for n in RUN_FIELDS] + ["action", "note"])
+        for it in result.items:
+            b, m = it.book, it.found
+            calibre = [b.title, b.authors, b.publisher, b.pub_year,
+                       (b.series, b.series_index) if b.series else None]
+            read = ([m.title, m.authors, m.publisher, m.year, (m.series, m.series_index) if m.series else None]
+                    if m else [None] * len(RUN_FIELDS))
+            w.writerow([b.id] + [cell(n, v) for n, v in zip(RUN_FIELDS, calibre)]
+                       + [cell(n, v) for n, v in zip(RUN_FIELDS, read)]
+                       + [cell(n, it.changes.get(n)) for n in RUN_FIELDS]
+                       + [it.action.value, it.note])
+    log.info("Analysis written to %s", path)
+    return path
 
 
 # --- executing ---------------------------------------------------------------------------

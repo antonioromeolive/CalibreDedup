@@ -118,6 +118,7 @@ class Settings:
     same_series: bool = False  # same author + series + number (not 1) = same book, whatever the title
     always_cover: bool = False  # compare covers even when the metadata says different; same cover wins
     author_variants: bool = True  # same title, author written differently ("Frederickk"/"Frederick"; AI if on)
+    fix_swapped: bool = True  # title and author swapped ("Kingston — The Log House by the Lake"): analyzed put right
     similar_titles: bool = True  # same author, one title inside the other ("1 Dune" / "Dune"): needs proof
     # Tick books with files Calibre can't open (fake or unsupported formats): all bad, the book
     # goes to the trash library; some, its record is copied there and those formats leave the source.

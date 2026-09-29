@@ -465,6 +465,16 @@ class SettingsDialog(QDialog):
             "Text AI is asked (typos, transliterations, pen names; answers are cached). Those books are\n"
             "then compared as usual (ISBN, edition and publisher, EPUB text, cover).")
         self.a_author_variants.setChecked(s.author_variants)
+        self.a_swapped = QCheckBox("Title and author swapped (e.g. \"Kingston\" by \"The Log House by the Lake\"): "
+                                   "put them right")
+        self.a_swapped.setToolTip(
+            "Books whose title is the name of an author of other books, and whose author reads as a title,\n"
+            "usually from file names like \"Kingston - The Log House by the Lake.epub\". They are analyzed and\n"
+            "matched with title and author put right (filter: Title/author swapped). On Execute, with\n"
+            "\"Write AI-found … to moved books\" on, a moved book (or one you tick) gets them written,\n"
+            "tagged TitleAuthorSwapped. A book named after a person (\"Rousseau\" by \"John Morley\")\n"
+            "is left as it is: its author reads as a name.")
+        self.a_swapped.setChecked(s.fix_swapped)
         self.a_similar_titles = QCheckBox("Match similar titles by the same author (needs proof: ISBN, same text "
                                           "or same cover)")
         self.a_similar_titles.setToolTip(
@@ -515,6 +525,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.a_years)
         form.addRow(self.a_years_note)
         form.addRow(self.a_author_variants)
+        form.addRow(self.a_swapped)
         form.addRow(self.a_similar_titles)
         form.addRow(self.a_series)
         form.addRow(self.a_unreadable)
@@ -538,6 +549,7 @@ class SettingsDialog(QDialog):
             # Hidden, not left out: accept() still reads (and keeps) their values.
             for widget in (self.a_subtitle, self.a_similar, self.a_cover, self.a_cover_note, self.a_always_cover,
                            self.a_always_cover_note, self.a_years, self.a_years_note, self.a_author_variants,
+                           self.a_swapped,
                            self.a_similar_titles, self.a_series, self.a_unreadable, self.a_update, reset):
                 form.setRowVisible(widget, False)
             form.labelForField(self.a_pdf_pages).setText("PDF pages to read (from the start)")
@@ -633,6 +645,7 @@ class SettingsDialog(QDialog):
         s.same_series = self.a_series.isChecked()
         s.similar_titles = self.a_similar_titles.isChecked()
         s.author_variants = self.a_author_variants.isChecked()
+        s.fix_swapped = self.a_swapped.isChecked()
         s.trash_unreadable = self.a_unreadable.isChecked()
         s.update_metadata = self.a_update.isChecked()
         s.delete_permanently = self.a_permanent.isChecked()

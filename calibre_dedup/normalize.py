@@ -330,6 +330,43 @@ def initials_match(a: str, b: str) -> bool:
     return len(ta) == len(tb) and covered(ta, tb) and covered(tb, ta)
 
 
+MIN_SURNAME_LENGTH = 4  # a shorter name alone ("Poe", "Eco") matches too many others
+
+
+def surname_match(a: str, b: str) -> bool:
+    """Whether one name is only a word of the other, the surname alone: "Muller" /
+    "F. Max Müller", "Rousseau" / "Rousseau, Jean-Jacques". Like initials_match, only used
+    for books with the same title."""
+    ta, tb = similar_author_key(a), similar_author_key(b)
+    if len(ta) > len(tb):
+        ta, tb = tb, ta
+    return len(ta) == 1 < len(tb) and len(ta[0]) >= MIN_SURNAME_LENGTH and ta[0] in tb
+
+
+# Words that don't occur in a person's name (a title's), and articles, which don't
+# start one ("Le Guin", "De Kock" do contain them, after a first name or capitalized).
+_TITLE_WORDS = set(
+    "di del della dello dei degli delle da dal dalla il lo la le gli un uno una e ed a al alla in nel "
+    "nella per con su tra fra che non come the of and an to on for with de du des et der die das und "
+    "el los las y en".split())
+_ARTICLES = set("il lo la i gli le l un uno una the a an el los las der die das".split())
+
+
+def looks_like_name(text: str) -> bool:
+    """Whether `text` could be a person's name as a library writes it: one to four
+    capitalized words, initials allowed ("F. Max Müller", "Rousseau, Jean-Jacques",
+    "A. B. Ellis", "Kingston"), with no digits, no article in front and no lowercase
+    word such as "di", "the" ("Chasing the Sun", "Volume 02" are not)."""
+    words = re.findall(r"[^\W\d_]+|\d+", text)
+    if not words or len(words) > 4 or any(w.isdigit() for w in words):
+        return False
+    initial = re.match(r"\s*[^\W\d_]\.", text)  # "A. B. Ellis": "A" is an initial, not an article
+    if len(words) > 1 and ((words[0].casefold() in _ARTICLES and not initial)
+                           or any(w in _TITLE_WORDS for w in words[1:])):
+        return False
+    return not any(w.casefold().startswith("scan") for w in words) and all(w[0].isupper() for w in words)
+
+
 # Name parts ignored by "similar" author matching (from the Find Duplicates plugin).
 _IGNORE_AUTHOR_WORDS = {"von", "van", "jr", "sr", "i", "ii", "iii", "second", "third", "md", "phd"}
 

@@ -24,8 +24,8 @@
 """Books stored as an archive (RAR, ZIP, 7Z) holding the real files.
 
 During the analysis (read only) the archive's contents are listed and, if they are
-clear, the user is asked whether to unpack it. Yes: the files are extracted into the
-run's temporary folder and the book is analyzed with them instead of the archive.
+clear, unpacked if the user said so: asked once, before the first book, for all the
+books (see ask_once). Yes: the files are extracted into the run's temporary folder and the book is analyzed with them instead of the archive.
 Nothing is written then: on Execute the archive is extracted again, the formats the
 book doesn't have are added (exactly as they are), the whole record is copied to the
 trash library as it is, and the archive is removed from the book.
@@ -132,6 +132,18 @@ def plan_unpack(fmt: str, path: str, members: list[dict], book_formats) -> Unpac
         else:
             u.add[f], u.sizes[f] = m["name"], m["size"]
     return u
+
+
+def ask_once(books: list[Book], ask: Callable[[int], bool] | None) -> Callable[[Book, Unpack], bool] | None:
+    """The answer for every book's clear archive, from one question asked before the
+    analysis: `ask(n)`, n = the books listing an archive format (read from the library,
+    no file opened). None: no question (no `ask`, or no such book)."""
+    n = sum(1 for b in books if any(f in ARCHIVE_FORMATS for f in b.formats))
+    if ask is None or not n:
+        return None
+    yes = bool(ask(n))
+    log.info("%d books stored as an archive: %s", n, "unpack" if yes else "keep the archives")
+    return lambda book, archive: yes
 
 
 def prepare(book: Book, extractor, ask: Callable[[Book, Unpack], bool]) -> tuple[Book, list[Unpack]]:

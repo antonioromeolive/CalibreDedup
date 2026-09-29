@@ -38,6 +38,7 @@ Nothing is converted or repaired: the files stay as they are.
 - [AI](#ai)
 - [Data files and logs](#data-files-and-logs)
 - [Tests](#tests)
+- [Acknowledgements](#acknowledgements)
 - [Appendix: AI prompts](#appendix-ai-prompts)
 
 
@@ -247,8 +248,8 @@ AI calls (cached).
 
 **Same title, author written differently** (on by default). A book with no match is checked
 against books with **the same title** whose author may be the same person written
-differently: one letter apart in a name part of 5 letters or more ("Frederickk Marryat" / "Frederick
-Marryat", no AI), initials, or else the Text AI is asked (a transliteration such as
+differently: one letter apart in a name part of 5 letters or more ("Frederickk Marryat" /
+"Frederick Marryat", no AI), initials, or else the Text AI is asked (a transliteration such as
 "Dostoevskij" / "Fyodor Dostoyevsky", or a pen name; a small model may not know pen names).
 The books are then compared as usual, and the reason says why, e.g. "same person: 'Frederickk
 Marryat' / 'Frederick Marryat' (one letter apart)".
@@ -325,10 +326,10 @@ decide.
 Some books are only an archive holding the real files (a PDF, an EPUB, a DOC, a plot
 summary…). Both programs handle them the same way.
 
-- **During the analysis** (nothing is written) the archive's contents are listed. If they
-  are clear, you are asked **"Unpack the RAR file?"**, with what it would add. The box **Do
-  this for all books** answers the same for the rest of this analysis (it is cleared at the
-  next one).
+- **Before the analysis starts**, if some books are stored as an archive, you are asked
+  once, **"Unpack the archives?"**, for all of them. You can then leave the analysis running.
+  During the analysis (nothing is written) each archive's contents are listed; only clear
+  ones are unpacked.
 - **Unpack:** the files are extracted into a temporary folder and the book is analyzed with
   them instead of the archive (an EPUB inside is read first, its cover and text can be
   compared). The Formats column says what Execute will do.
@@ -381,6 +382,7 @@ python -m calibre_dedup --cli ... --no-ai          # metadata only
 python -m calibre_dedup --cli ... --cleanup-only   # nothing copied to the target
 python -m calibre_dedup --cli ... --unpack         # unpack every clear RAR/ZIP/7Z archive
 python -m calibre_dedup --cli ... --clear-cache    # ask the AI again
+python -m calibre_dedup --cli ... --no-cache       # ignore the cache, keep nothing (tests)
 ```
 
 Options left out are taken from the GUI's saved settings. The plan is printed; `--report`
@@ -472,7 +474,8 @@ python -m calibre_dedup.review_app --cli ... --include-reviewed                 
 ```
 
 Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
-clear RAR/ZIP/7Z archive without asking) and `--clear-cache`.
+clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ignore the cache,
+keep nothing).
 Options left out are taken from the review's saved settings.
 
 
@@ -570,6 +573,13 @@ the review), so analyzing again, or after *Stop*, is fast.
   answers.
 - To start over: Settings → **Clear AI cache…** (small button at the bottom right; not
   while a run is in progress), or `--clear-cache`. Each program clears only its own cache.
+- To test without the cache: tick **No AI cache** (beside *Settings…*; red while on), or
+  `--no-cache`. Every question goes to the AI and no answer is kept; the saved answers are
+  not touched. The box is off each time the program starts. The review then writes each analysis
+  run (also after *Stop*) to `review_runs\review_<library>_<date>.csv` in the data folder,
+  since its answers aren't kept anywhere else.
+- Nothing is ever pruned: answers for files that changed or moved stay unused in the file
+  until you clear the cache.
 
 ### When a setting can't take effect
 
@@ -606,6 +616,7 @@ there automatically.
 | `settings.json` | Duplicate Remover | libraries, options, AI profiles (no keys) |
 | `review_settings.json` | Review | its own settings |
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
+| `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes |
 | `selections.json` | Duplicate Remover | remembered ticks and changes, per source/target pair |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
@@ -631,6 +642,12 @@ the next time either program starts; folders of a program still running are neve
 ```
 
 
+## Acknowledgements
+
+Thanks to [Project Gutenberg](https://www.gutenberg.org/) and its volunteers for making
+available the ebooks used in this project's local software tests.
+
+
 ## Appendix: AI prompts
 
 These are all the instructions the programs send to the AI, in English whatever the books'
@@ -638,14 +655,45 @@ language (they are in [ai.py](calibre_dedup/ai.py)). Each is a *system prompt* (
 must do and how to answer) plus a short *user message* carrying the book's text, images or
 names. Every request also asks the server for JSON (`format: "json"` for Ollama,
 `response_format: json_object` for Azure and OpenAI; Anthropic has only the prompt's own
-instruction). The answers are cached, so each question is asked once per file and model.
+instruction).
 
-### 1. Reading a book's metadata (Duplicate Remover)
+The AI is used only in **Step 1: Analyze**, never on Execute (which writes what the analysis
+found). Every answer is cached (see [Cache](#cache)): a question already answered for the
+same file is not asked again (for covers, authors and the review: also by the same model).
+Tick **No AI cache** to ask every question again. With *Text AI* set to None, no prompt is sent at all.
 
-Used when the metadata can't decide: a book without title/authors, two copies whose edition
-or publisher is missing, and the year re-check. The AI reads the **start** of the book (title
-page, copyright page) and, if still needed, the **end** (colophon). Scanned PDFs are sent as
-page images to the Image AI. `SYSTEM_PROMPT`:
+| # | Prompt | Program | AI | Sent when |
+|---|---|---|---|---|
+| 1 | Reading a book's metadata | Duplicate Remover | Text AI (Image AI for scanned pages) | The metadata can't decide |
+| 2 | Comparing two covers | Duplicate Remover | Image AI | The metadata can't decide, and both books have a cover |
+| 3 | Same person, name written differently | Duplicate Remover | Text AI | Same title, authors that don't match |
+| 4 | Identifying a book | Metadata Review | Image AI if set, else Text AI | Every book analyzed |
+
+### Duplicate Remover
+
+The Duplicate Remover decides from Calibre's metadata first, and asks the AI only for the
+books that metadata can't settle. Most books never reach the AI: a book with a title and
+authors and no other book of the same title sends nothing.
+
+#### 1. Reading a book's metadata
+
+- **Phase:** Analyze.
+- **AI:** the **Text AI**. For a scanned PDF (page images, no text), the **Image AI** if
+  there is one; without one the book is skipped and marked *Reduced checks*.
+- **What is read:** the **start** of the book (title page, copyright page); the **end**
+  (colophon) only if what was needed is still missing.
+- **Sent when**, for each book:
+  - it has **no title or no authors** in Calibre;
+  - another book has the **same title and authors**, the metadata can't decide and the EPUB
+    text isn't identical: this book is read if its edition or publisher is missing, and so is
+    each other copy missing them;
+  - **Re-check year differences by reading both books** is on (the default) and two books with
+    the same title and authors differ **only by the year**: both are read for the year and
+    publisher printed inside.
+- **Always on:** no option reads every book. *Re-check year differences* is the setting that
+  sends it more often.
+
+`SYSTEM_PROMPT`:
 
 ```text
 You are a librarian extracting bibliographic metadata from an excerpt of an e-book (front
@@ -672,11 +720,27 @@ Rules:
 User message: `Excerpt:` and the text; for a scanned book, `The excerpt is given as page
 images, plus this extracted text:` and the text (or `…page images.` when there is none).
 
-### 2. Comparing two covers (Duplicate Remover)
+#### 2. Comparing two covers
 
-Used by *Compare covers* (when the metadata can't decide) and *Always compare covers* (also
-when it says the books differ), sent to the **Image AI**. The same prompt compares the covers
-stored inside the book files, for similar titles. "unsure" counts as not the same.
+- **Phase:** Analyze.
+- **AI:** the **Image AI** only. Without one the check is skipped, noted in the Reason
+  column, and the book is marked *Reduced checks*.
+- **What is sent:** the two books' covers (Calibre's `cover.jpg`). Two identical cover files
+  are a match without asking. "unsure" counts as not the same.
+- **Sent when** both books have a cover and the book isn't already a proven duplicate:
+  - **Compare covers when metadata can't decide** is on (the default): same title and
+    authors, still undecided after prompt 1 and the year re-check;
+  - **Match similar titles by the same author** is on (the default): titles alike, with no
+    proof from the ISBN, series number or EPUB text (the cover check still needs one of the
+    two cover options on);
+  - **Always compare covers** is on (off by default): also when the metadata says the books
+    **differ** (year, publisher, edition). For similar titles whose metadata differs, the covers
+    **inside the book files** are then compared too, with a second request (Calibre's cover
+    can be a downloaded picture).
+- **Always on:** *Always compare covers* is the widest: every pair of books with the same (or,
+  with *Match similar titles*, a similar) title and a cover. Books with no such partner are
+  never compared.
+
 `COVER_PROMPT`:
 
 ```text
@@ -697,11 +761,18 @@ Rules:
 
 User message: `Cover 1 and cover 2 are attached.`, with the two covers.
 
-### 3. Same person, name written differently (Duplicate Remover)
+#### 3. Same person, name written differently
 
-Used by *Same title, author written differently*: two books with the same title whose
-authors don't match and aren't one letter apart or initials (checked first, without AI). Sent
-to the **Text AI**. `AUTHOR_PROMPT`:
+- **Phase:** Analyze.
+- **AI:** the **Text AI**.
+- **What is sent:** the two author lists and the title both books share.
+- **Sent when** **Same title, author written differently** is on (the default), no book has
+  the same title **and** authors, and another book has the same title with authors that are
+  not one letter apart and not initials of each other (those two cases are decided without
+  AI). A "same" answer makes that book a candidate, compared as usual (prompts 1 and 2).
+- **Always on:** no. With the option off it is never sent.
+
+`AUTHOR_PROMPT`:
 
 ```text
 You decide whether two author names, taken from e-book metadata, name the same person.
@@ -730,11 +801,26 @@ Name 2: "<authors of the other>"
 Both books are titled: "<title>"
 ```
 
-### 4. Identifying a book (Metadata Review)
+### Metadata Review
 
-Used for every book the review analyzes (unless cached): the AI reads the first pages and the
-cover and proposes title, authors, publisher, year and series, which are compared with
-Calibre's metadata. `REVIEW_PROMPT`:
+The review has a single prompt: it identifies **every** book it analyzes and compares the
+answer with Calibre's metadata.
+
+#### 4. Identifying a book
+
+- **Phase:** Analyze (*Step 1*).
+- **AI:** with an **Image AI**, every book goes to it, with the cover and, for scanned books,
+  the page images. Without one, the **Text AI** reads the text only (the cover isn't read,
+  scanned PDFs are skipped).
+- **What is read:** the **start** of the book, and the cover (Image AI only).
+- **Sent when:** for every book analyzed, except books tagged `AIReviewed` while **Skip books
+  tagged AIReviewed** is on (the default), and books with nothing readable. If the AI's
+  content filter refuses a book (e.g. a violent novel), the same prompt is sent again with
+  less: the first 3,000 characters, then the text without images, then the cover alone.
+- **Always on:** it already covers every book. Untick *Skip books tagged AIReviewed* (or
+  `--include-reviewed`) to include the reviewed ones.
+
+`REVIEW_PROMPT`:
 
 ```text
 You are a librarian identifying an e-book from its first pages and, when attached, its cover.
@@ -757,7 +843,7 @@ Rules:
 - "series": the series or numbered collection the book belongs to, e.g. a saga
   ("Foundation") or a publisher's numbered collection ("Gutenberg"). null if none is shown.
 - "series_index": the book's number in that series (e.g. 3, or 1234 for "Gutenberg n. 1234").
-  null if not shown.
+ok g  null if not shown.
 ```
 
 User message, from these lines:
@@ -772,8 +858,8 @@ Text of the first pages:
 
 ### Connection tests (Settings, both programs)
 
-- **Test connection** sends prompt 1 with the made-up Italian front page (*Il guardiano del
-  faro* by Elena Marchetti; the translator Paolo Bianchi is not an author; Edizioni
+- **Test connection** sends [prompt 1](#1-reading-a-books-metadata) with the made-up
+  Italian front page (*Il guardiano del faro* by Elena Marchetti; the translator Paolo Bianchi is not an author; Edizioni
   Lanterna, third edition 2021, the first was 2019; ISBN 978-88-7000-123-4) and checks each
   value of the answer.
 - **Finding a refused advanced parameter** sends short requests with the parameters one at

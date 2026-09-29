@@ -62,3 +62,27 @@ def test_ai_updated_tag_only_when_a_field_changed(bridge):
     assert db.tags[1] == ("Fantasy", "AIUpdated")
     bridge.tag_updated(db, 1, ["title"], action)  # already tagged: not twice
     assert db.tags[1] == ("Fantasy", "AIUpdated")
+
+
+class FieldsDB:
+    def __init__(self, **fields):
+        self.fields = {k: {1: v} for k, v in fields.items()}
+
+    def field_for(self, name, book_id):
+        return self.fields[name][book_id]
+
+    def set_field(self, name, values):
+        self.fields.setdefault(name, {}).update(values)
+
+
+def test_swapped_title_and_author_are_written_only_if_unchanged(bridge):
+    swap = {"title": "Underwoods", "authors": ["Kingston"], "tag": "TitleAuthorSwapped",
+            "was_title": "Kingston", "was_authors": ["Underwoods"]}
+    db = FieldsDB(title="Kingston", authors=("Underwoods",), tags=("Novels",))
+    assert bridge.swap_title_author(db, 1, swap) == "; title and author swapped back, tagged TitleAuthorSwapped"
+    assert db.fields["title"][1] == "Underwoods" and db.fields["authors"][1] == ["Kingston"]
+    assert db.fields["tags"][1] == ("Novels", "TitleAuthorSwapped")
+    db = FieldsDB(title="Kingston", authors=("William Henry Giles Kingston",), tags=())  # fixed by hand meanwhile
+    assert "changed since the analysis" in bridge.swap_title_author(db, 1, swap)
+    assert db.fields["title"][1] == "Kingston" and db.fields["tags"][1] == ()
+    assert bridge.swap_title_author(db, 1, None) == ""

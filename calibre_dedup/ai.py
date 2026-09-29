@@ -527,15 +527,21 @@ class AIMetadata:
 
 
 class AICache:
-    """JSON cache so repeated analyses don't re-query the model."""
+    """JSON cache so repeated analyses don't re-query the model. `off` (for tests): every
+    question goes to the AI and nothing is kept; the cache file is neither read nor written."""
 
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, off: bool = False):
         self.path = path or config_dir() / "ai_cache.json"
+        self.off = off
         self._lock = threading.Lock()
+        self._data: dict = {}
+        if off:
+            log.info("AI cache off: every question goes to the AI, %s is left as it is", self.path.name)
+            return
         try:
-            self._data: dict = json.loads(self.path.read_text(encoding="utf-8"))
+            self._data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self._data = {}
+            pass
 
     @staticmethod
     def size(path: Path) -> tuple[int, int]:
@@ -581,13 +587,17 @@ class AICache:
         return hashlib.sha1(f"{a}|{b}".encode()).hexdigest()
 
     def get(self, key: str) -> dict | None:
-        return self._data.get(key)
+        return None if self.off else self._data.get(key)
 
     def put(self, key: str, value: dict) -> None:
+        if self.off:
+            return
         with self._lock:
             self._data[key] = value
 
     def save(self) -> None:
+        if self.off:
+            return
         with self._lock:
             tmp_name = ""
             try:

@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from calibre_dedup.ai import AICache
-from calibre_dedup.archives import Unpack, plan_unpack, prepare
+from calibre_dedup.archives import Unpack, ask_once, plan_unpack, prepare
 from calibre_dedup.executor import plan_actions
 from calibre_dedup.extract import TextExtractor
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
@@ -116,6 +116,16 @@ def test_a_damaged_archive_is_flagged_and_never_asked(tmp_path):
     finally:
         extractor.close()
     assert seen is book and asked == [] and u.problem.startswith("can't be opened")
+
+
+def test_asked_once_before_the_analysis_for_all_the_books():
+    books = [make_book(formats={"RAR": "a.rar"}), make_book(formats={"EPUB": "b.epub", "ZIP": "b.zip"}),
+             make_book(formats={"EPUB": "c.epub"})]
+    asked = []
+    answer = ask_once(books, lambda n: asked.append(n) or True)
+    assert asked == [2] and answer(books[0], None) is True
+    assert ask_once(books[2:], lambda n: asked.append(n) or True) is None and asked == [2]  # no archive: no question
+    assert ask_once(books, None) is None
 
 
 # --- Execute: what is sent to Calibre -----------------------------------------------------

@@ -111,6 +111,9 @@ class PlanItem:
     # e.g. the cover check with no Image AI, or the AI turned off after errors.
     skipped: list[str] = field(default_factory=list)
     by_cover: bool = False  # a duplicate because the covers are the same
+    # Title and author were swapped in the record: `identity` has them put right, and
+    # Execute writes them (with "Write found metadata" on) to a moved or ticked book.
+    swapped: bool = False
     # Formats Calibre can't open (format -> why). All of them: the item trashes the book.
     # Some: the book was decided on the others, and with `trash_bad` its whole record is
     # copied to the trash library as it is, then those formats are removed from the source.

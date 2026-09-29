@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import perf, tempdirs
+from ..ai import AICache
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
 from ..eta import Eta
@@ -57,7 +58,7 @@ from ..planner import (
 from ..report import write_csv
 from ..selection import (
     FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
-    can_override, runs_main_action, filter_key, mergeable_formats, override, revert,
+    can_override, checkable, runs_main_action, filter_key, mergeable_formats, override, revert,
 )
 from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
 from .cover_preview import CoverPreview
@@ -138,47 +139,53 @@ def ask_ai_down(parent, message: str, what: str, more_help: str) -> str | None:
     return choice
 
 
-def ask_unpack(parent, label: str, fmt: str, summary: str) -> tuple[bool, bool]:
-    """The "Unpack this archive?" question: (unpack, do this for all books)."""
-    box = QMessageBox(QMessageBox.Question, f"Unpack the {fmt} file?",
-                      f"{label}\n\nThis book is stored as a {fmt} archive. Unpack it?", parent=parent)
+def ask_unpack(parent, count: int) -> bool:
+    """The "Unpack the archives?" question, asked once before the first book."""
+    books = "1 book is" if count == 1 else f"{count} books are"
+    box = QMessageBox(QMessageBox.Question, "Unpack the archives?",
+                      f"{books} stored as a RAR, ZIP or 7Z archive. Unpack them?", parent=parent)
     box.setInformativeText(
-        f"{summary}\n\nNothing is written now: the book is analyzed with the files inside, and the "
-        "archive is unpacked on Execute. Right-click the book to change your mind.")
+        "Nothing is written now: the books are analyzed with the files inside, and the archives "
+        "are unpacked on Execute. Unclear archives (several books, nothing readable, password…) "
+        "are kept and flagged. Right-click a book to change your mind.")
     yes = box.addButton("Unpack", QMessageBox.YesRole)
-    box.addButton("Keep the archive", QMessageBox.NoRole)
-    for_all = QCheckBox("Do this for all books (this analysis only)")
-    box.setCheckBox(for_all)
+    box.addButton("Keep the archives", QMessageBox.NoRole)
     box.setDefaultButton(yes)
     box.exec()
-    return box.clickedButton() is yes, for_all.isChecked()
+    return box.clickedButton() is yes
+
+
+def no_cache_box() -> QCheckBox:
+    """"Don't use the AI cache": for tests. Red while on; not remembered (off at each start),
+    so that it can't stay on by mistake and have every analysis ask the AI again."""
+    box = QCheckBox("No AI cache")
+    box.setToolTip("For tests: every question goes to the AI, and no answer is kept.\n"
+                   "The saved answers aren't touched: they are used again once this is off.\n"
+                   "Not remembered: off each time the program starts.")
+    box.setStyleSheet(f"QCheckBox:checked {{ color: {RED[0]}; font-weight: bold; }}")
+    return box
 
 
 class UnpackQuestion:
-    """Mixed into the analysis workers: asks the window whether to unpack a book's archive
-    (the worker waits), and remembers "Do this for all books" for this analysis only."""
-    unpack_asked: Signal  # book, archive format, what unpacking would do
+    """Mixed into the analysis workers: asks the window, once before the first book,
+    whether to unpack the archives (the worker waits)."""
+    unpack_asked: Signal  # the number of books stored as an archive
 
     def _init_unpack(self) -> None:
-        self._unpack_all: bool | None = None
         self._unpack_yes = False
         self._unpack_answered = threading.Event()
 
-    def ask_unpack(self, book, u) -> bool:
-        if self._unpack_all is not None:
-            return self._unpack_all
+    def ask_unpack(self, count: int) -> bool:
         self._unpack_answered.clear()
         self._unpack_yes = False
-        self.unpack_asked.emit(book.label(), u.format, u.summary)
+        self.unpack_asked.emit(count)
         while not self._unpack_answered.wait(0.2):
             if self.cancel.is_set():  # Stop, or the window is closing
                 return False
         return self._unpack_yes
 
-    def answer_unpack(self, yes: bool, for_all: bool) -> None:
+    def answer_unpack(self, yes: bool) -> None:
         self._unpack_yes = yes
-        if for_all:
-            self._unpack_all = yes
         self._unpack_answered.set()
 
 
@@ -323,11 +330,11 @@ class PlanModel(QAbstractTableModel):
         self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.HEADERS) - 1))
 
     def set_checked(self, items: list[PlanItem], value: bool | None):
-        """Check (True), uncheck (False) or invert (None) items; LEAVE items are skipped."""
+        """Check (True), uncheck (False) or invert (None) items; those that can't be ticked are skipped."""
         if self.locked:
             return
         for it in items:
-            if it.action is not Action.LEAVE:
+            if checkable(it):
                 it.selected = (not it.selected) if value is None else value
         self.refresh()
 
@@ -345,7 +352,7 @@ class PlanModel(QAbstractTableModel):
     def flags(self, index):
         f = super().flags(index)
         it = self.items[index.row()]
-        if index.column() == self.COL_CHECK and it.action is not Action.LEAVE and not self.locked:
+        if index.column() == self.COL_CHECK and checkable(it) and not self.locked:
             f |= Qt.ItemIsUserCheckable
         return f
 
@@ -370,13 +377,14 @@ class PlanModel(QAbstractTableModel):
              + (" (different edition)" if it.different and it.action is not Action.TRASH else ""))
             if it.match else "",
             _formats_text(it),
-            ", ".join(sorted(ident.ai_fields)) or ("nothing found" if it.ai_used else ""),
+            ", ".join((["title/author swapped"] if it.swapped else []) + sorted(ident.ai_fields))
+            or ("nothing found" if it.ai_used else ""),
             it.status,
         ]
 
     def sort_key(self, it: PlanItem, col: int):
         if col == self.COL_CHECK:
-            return (2 if it.selected else 1) if it.action is not Action.LEAVE else 0
+            return (2 if it.selected else 1) if checkable(it) else 0
         v = self.values(it)[col]
         return v if isinstance(v, int) else str(v).casefold()
 
@@ -404,7 +412,7 @@ class PlanModel(QAbstractTableModel):
         col = index.column()
         if role in (Qt.DisplayRole, Qt.ToolTipRole):
             return self.values(it)[col]
-        if role == Qt.CheckStateRole and col == self.COL_CHECK and it.action is not Action.LEAVE:
+        if role == Qt.CheckStateRole and col == self.COL_CHECK and checkable(it):
             return Qt.Checked if it.selected else Qt.Unchecked
         if role == Qt.FontRole and it.manual:
             return self.italic_font
@@ -426,7 +434,7 @@ class PlanFilter(QSortFilterProxyModel):
         self.terms: list[str] = []
         self.action = ""
         self.ai_only = self.formats_only = self.checked_only = self.failed_only = self.reduced_only = False
-        self.cover_only = self.unreadable_only = self.archive_only = False
+        self.cover_only = self.unreadable_only = self.archive_only = self.swapped_only = False
         self.hide_unique = True
 
     def update(self, **kw):
@@ -447,7 +455,7 @@ class PlanFilter(QSortFilterProxyModel):
             return False
         if self.formats_only and not it.add_formats:
             return False
-        if self.checked_only and not (it.selected and it.action is not Action.LEAVE):
+        if self.checked_only and not (it.selected and checkable(it)):
             return False
         if self.failed_only and not it.status.startswith("FAILED"):
             return False
@@ -458,6 +466,8 @@ class PlanFilter(QSortFilterProxyModel):
         if self.unreadable_only and not it.bad_formats:
             return False
         if self.archive_only and not it.archives:
+            return False
+        if self.swapped_only and not it.swapped:
             return False
         # Same library: books with no duplicate are usually most of the list.
         if self.hide_unique and model.plan is not None and (
@@ -535,12 +545,13 @@ class AnalyzeWorker(QThread, UnpackQuestion):
     finished_ok = Signal(object)
     failed = Signal(str)
     ai_down = Signal(str, bool)  # message, image AI: the GUI asks the user, then calls answer()
-    unpack_asked = Signal(str, str, str)  # the GUI asks, then calls answer_unpack()
+    unpack_asked = Signal(int)  # the GUI asks, then calls answer_unpack()
     BATCH_SECONDS = 0.3  # books with no duplicate go by by the thousand: send them in batches
 
-    def __init__(self, settings: Settings, source: str, target: str, trash: str):
+    def __init__(self, settings: Settings, source: str, target: str, trash: str, no_cache: bool = False):
         super().__init__()
         self.settings, self.source, self.target, self.trash = settings, source, target, trash
+        self.no_cache = no_cache
         self.cancel = threading.Event()
         self._answered = threading.Event()
         self._choice = AI_OFF
@@ -564,7 +575,8 @@ class AnalyzeWorker(QThread, UnpackQuestion):
     def run(self):
         resolver = None
         try:
-            resolver = make_resolver(self.settings, on_down=self.ask)
+            resolver = make_resolver(self.settings, on_down=self.ask,
+                                     cache=AICache(off=True) if self.no_cache else None)
             batch: list = []
             sent = time.monotonic()
 
@@ -585,6 +597,7 @@ class AnalyzeWorker(QThread, UnpackQuestion):
                               similar_titles=self.settings.similar_titles,
                               always_cover=self.settings.always_cover,
                               author_variants=self.settings.author_variants,
+                              fix_swapped=self.settings.fix_swapped,
                               trash_unreadable=self.settings.trash_unreadable,
                               cleanup_only=self.settings.cleanup_only,
                               on_item=on_item, unpack=self.ask_unpack)
@@ -697,6 +710,8 @@ class MainWindow(QMainWindow):
         ai_row.addWidget(self.text_box, 1)
         ai_row.addWidget(QLabel("Image AI:"))
         ai_row.addWidget(self.image_box, 1)
+        self.no_cache = no_cache_box()
+        ai_row.addWidget(self.no_cache)
         ai_row.addWidget(settings_btn)
 
         # actions
@@ -738,11 +753,15 @@ class MainWindow(QMainWindow):
         for attr, label in [("ai_only", "AI used"), ("formats_only", "Adds formats"),
                             ("checked_only", "Only checked"), ("failed_only", "Only failed"),
                             ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover"),
-                            ("unreadable_only", "Unreadable files"), ("archive_only", "Archives")]:
+                            ("unreadable_only", "Unreadable files"), ("archive_only", "Archives"),
+                            ("swapped_only", "Title/author swapped")]:
             box = QCheckBox(label)
             box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
             self.toggles[attr] = box
         self.toggles["archive_only"].setToolTip(ARCHIVES_TIP)
+        self.toggles["swapped_only"].setToolTip(
+            "Books whose title and author were swapped in Calibre (\"Kingston\" by \"The Log House by the Lake\"):\n"
+            "the list shows them put right. Tick one to write that on Execute (tagged TitleAuthorSwapped).")
         self.toggles["reduced_only"].setToolTip(
             "Books decided with fewer checks than the settings ask for: the cover check or year re-check\n"
             "could not run (no Image AI, AI off), or an AI stopped responding during the analysis.\n"
@@ -1036,7 +1055,7 @@ class MainWindow(QMainWindow):
             return
         self.execute_btn.setToolTip("")
         todo = actionable(p)
-        possible = sum(1 for i in p.items if i.action is not Action.LEAVE)
+        possible = sum(1 for i in p.items if checkable(i))
         n_blocked = len(self.model.blocked)
         text = f"{len(todo)} of {possible} checked"
         if n_blocked:
@@ -1061,7 +1080,7 @@ class MainWindow(QMainWindow):
     def _header_clicked(self, section: int):
         if section != PlanModel.COL_CHECK or not self._can_edit():
             return
-        items = [it for it in self.model.items if it.action is not Action.LEAVE]
+        items = [it for it in self.model.items if checkable(it)]
         if items:
             self.model.set_checked(items, not all(it.selected for it in items))
 
@@ -1116,7 +1135,7 @@ class MainWindow(QMainWindow):
         self.cover.show_books([("This book", it.source), (match, it.match)])
 
     def _toggle_selected_rows(self):
-        items = [i for i in self._selected_items() if i.action is not Action.LEAVE]
+        items = [i for i in self._selected_items() if checkable(i)]
         if items:
             # Mixed selection: check all. All checked: uncheck all.
             self.model.set_checked(items, not all(i.selected for i in items))
@@ -1327,15 +1346,15 @@ class MainWindow(QMainWindow):
             self._stop()
         worker.answer(choice or AI_OFF)
 
-    def _on_unpack_asked(self, label: str, fmt: str, summary: str):
+    def _on_unpack_asked(self, count: int):
         """The worker waits for this answer (see UnpackQuestion)."""
         worker = self.worker
         if not isinstance(worker, AnalyzeWorker):
             return
         if self._close_pending:
-            worker.answer_unpack(False, True)
+            worker.answer_unpack(False)
             return
-        worker.answer_unpack(*ask_unpack(self, label, fmt, summary))
+        worker.answer_unpack(ask_unpack(self, count))
 
     def _analyze(self):
         self._sync_settings()
@@ -1351,7 +1370,7 @@ class MainWindow(QMainWindow):
         self._restored = 0
         self.hide_unique.setVisible(same or self.settings.same_series)
         self._fill_action_filter(same)
-        worker = AnalyzeWorker(self.settings, source, target, trash)
+        worker = AnalyzeWorker(self.settings, source, target, trash, self.no_cache.isChecked())
         worker.progress.connect(self._on_progress)
         worker.items_ready.connect(self._on_items)
         worker.finished_ok.connect(self._analysis_done)

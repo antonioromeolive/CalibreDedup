@@ -194,6 +194,21 @@ def fill_metadata(db, book_id, values):
     return changed
 
 
+def swap_title_author(db, book_id, swap):
+    """Put right a record whose title and author were swapped: overwrite both, then
+    tag the book. Only while both are still as the analysis saw them. Returns "; …"
+    for the result message."""
+    if not swap:
+        return ""
+    if (db.field_for("title", book_id) != swap["was_title"]
+            or list(db.field_for("authors", book_id)) != list(swap["was_authors"])):
+        return "; title/author not swapped back: changed since the analysis"
+    db.set_field("title", {book_id: swap["title"]})
+    db.set_field("authors", {book_id: swap["authors"]})
+    add_tag(db, [book_id], swap["tag"])
+    return f"; title and author swapped back, tagged {swap['tag']}"
+
+
 def set_metadata(db, book_id, values):
     """Overwrite fields with the reviewed values (calibre-review). The year keeps
     the date's month and day. Returns the changed fields, the book's folder and
@@ -293,11 +308,13 @@ def main(plan_path):
                     msg = f"moved to target (id {new_id})"
                     if changed:
                         msg += f"; filled {', '.join(changed)}" + tag_updated(tgt, new_id, changed, action)
+                    msg += swap_title_author(tgt, new_id, action.get("swap"))
                 elif action["op"] == "update":  # the book stays in the source
                     changed = fill_metadata(src, sid, action.get("set") or {})
                     msg = f"updated metadata in source"
                     if changed:
                         msg += f"; filled {', '.join(changed)}" + tag_updated(src, sid, changed, action)
+                    msg += swap_title_author(src, sid, action.get("swap"))
                     emit(event="result", src_id=sid, ok=True, msg=done + msg)
                     continue
                 elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes

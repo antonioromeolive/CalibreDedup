@@ -141,8 +141,19 @@ def actionable(plan: Plan) -> list[PlanItem]:
 
 def runs_main_action(i: PlanItem, stuck: dict[int, str]) -> bool:
     """Whether the item's own action (move, trash, metadata update) runs on Execute."""
-    return i.selected and i.source.id not in stuck and (
-        i.action is not Action.LEAVE or (i.ai_used and bool(i.identity.ai_fields)))
+    return i.selected and i.source.id not in stuck and (i.action is not Action.LEAVE or has_metadata_update(i))
+
+
+def checkable(i: PlanItem) -> bool:
+    """Whether the item can be ticked: it moves or trashes the book, or (left in place)
+    has metadata to write."""
+    return i.action is not Action.LEAVE or has_metadata_update(i)
+
+
+def has_metadata_update(i: PlanItem) -> bool:
+    """Whether a book left in place still has metadata to write: what the AI found,
+    or title and author put right after being swapped."""
+    return (i.ai_used and bool(i.identity.ai_fields)) or i.swapped
 
 
 # --- remembering choices --------------------------------------------------------

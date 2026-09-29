@@ -55,6 +55,9 @@ def run(argv: list[str]) -> int:
                          "copy nothing to the target (default: as set in the GUI)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="don't use the AI cache (for tests): every question goes to the AI, "
+                         "ai_cache.json is neither read nor written")
     ap.add_argument("--unpack", action="store_true",
                     help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are left as they are)")
     ap.add_argument("--report", help="write the plan as CSV to this file")
@@ -75,7 +78,7 @@ def run(argv: list[str]) -> int:
 
     if args.clear_cache:
         print(f"AI cache cleared: {AICache.clear(config_dir() / 'ai_cache.json'):,} answers removed", file=sys.stderr)
-    resolver = make_resolver(settings)
+    resolver = make_resolver(settings, cache=AICache(off=True) if args.no_cache else None)
     try:
         def progress(done, total, msg):
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
@@ -84,10 +87,10 @@ def run(argv: list[str]) -> int:
                           similar_matching=settings.similar_matching, cover_check=settings.cover_check,
                           recheck_years=settings.recheck_years, same_series=settings.same_series,
                           similar_titles=settings.similar_titles, always_cover=settings.always_cover,
-                          author_variants=settings.author_variants,
+                          author_variants=settings.author_variants, fix_swapped=settings.fix_swapped,
                           trash_unreadable=settings.trash_unreadable,
                           cleanup_only=settings.cleanup_only if args.cleanup_only is None else True,
-                          unpack=(lambda book, archive: True) if args.unpack else None)
+                          unpack=(lambda n: True) if args.unpack else None)
         print(file=sys.stderr)
     finally:
         if resolver:
