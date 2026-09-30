@@ -49,16 +49,19 @@ from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG, execute_plan, plan_actions
+from ..library_use import Conflict, LibraryInUse, LibraryUse, execution_conflicts, same_library
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
 from ..normalize import strip_accents
 from ..planner import (
-    AI_OFF, MAX_CONSECUTIVE_AI_ERRORS, NO_SERIES_REASON, RETRY, SKIP_BOOK, build_plan, run_summary,
+    AI_OFF, MAX_CONSECUTIVE_AI_ERRORS, RETRY, SKIP_BOOK, build_plan, check_libraries,
+    run_summary,
 )
 from ..report import write_csv
 from ..selection import (
     FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
-    can_override, checkable, runs_main_action, filter_key, mergeable_formats, override, revert,
+    can_override, checkable, is_changed, runs_main_action, filter_key, mergeable_formats, override, revert,
+    revert_all,
 )
 from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
 from .cover_preview import CoverPreview
@@ -153,6 +156,31 @@ def ask_unpack(parent, count: int) -> bool:
     box.setDefaultButton(yes)
     box.exec()
     return box.clickedButton() is yes
+
+
+def ask_other_trash(parent, program: str, conflicts: list[Conflict], trash_box: QComboBox) -> bool:
+    """Another execution writes a library of ours. Only the trash library can be changed
+    without analyzing again (the analysis never reads it): offer that. True = a new
+    trash library was put in `trash_box`, check again."""
+    text = "\n\n".join(c.describe(program) for c in conflicts)
+    if any(c.role != "trash" for c in conflicts):
+        QMessageBox.warning(parent, "Library in use", f"{text}\n\nWait until that execution has finished, "
+                                                      "then execute again.")
+        return False
+    box = QMessageBox(QMessageBox.Warning, "Trash library in use", text, parent=parent)
+    box.setInformativeText("Choose another trash library to execute now, without analyzing again, "
+                           "or wait until that execution has finished.")
+    choose = box.addButton("Choose another trash library…", QMessageBox.AcceptRole)
+    box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(choose)
+    box.exec()
+    if box.clickedButton() is not choose:
+        return False
+    d = QFileDialog.getExistingDirectory(parent, "Trash library", trash_box.currentText())
+    if not d:
+        return False
+    trash_box.setEditText(d)
+    return True
 
 
 def no_cache_box() -> QCheckBox:
@@ -470,8 +498,7 @@ class PlanFilter(QSortFilterProxyModel):
         if self.swapped_only and not it.swapped:
             return False
         # Same library: books with no duplicate are usually most of the list.
-        if self.hide_unique and model.plan is not None and (
-                skipped_no_series(it) or (model.plan.same_library and has_no_duplicate(it))):
+        if self.hide_unique and model.plan is not None and model.plan.same_library and has_no_duplicate(it):
             return False
         if self.terms:
             hay = strip_accents(" ".join(str(x) for x in model.values(it)[1:7])).casefold()
@@ -515,17 +542,11 @@ def add_unpack_actions(menu: QMenu, items: list, set_unpack) -> None:
         act.triggered.connect(lambda _=False, v=value: set_unpack(clear, v))
 
 
-def skipped_no_series(it: PlanItem) -> bool:
-    """Left untouched by the "same series" option: no series and number."""
-    return it.action is Action.LEAVE and it.planned_reason == NO_SERIES_REASON
-
-
 def has_no_duplicate(it: PlanItem) -> bool:
     """Left in place because no other book shares its title and authors, or every
     one that does is a different edition. The other Leave books need a look:
     undecided pairs, and books whose title/authors couldn't be read."""
-    return (it.action is Action.LEAVE and (it.match is None or it.different) and it.identity.has_title_authors
-            and not skipped_no_series(it))
+    return it.action is Action.LEAVE and (it.match is None or it.different) and it.identity.has_title_authors
 
 
 class PlanTable(QTableView):
@@ -644,6 +665,7 @@ class MainWindow(QMainWindow):
         self.worker: QThread | None = None
         self._stopping = False  # Stop pressed; the worker ends after the current book
         self._close_pending = False  # quit requested; close once the worker has ended
+        self._library_use: LibraryUse | None = None  # the libraries of the plan shown (see library_use)
         self._operation = ""  # "analyze" or "execute" while a worker thread exists
         self._done_count = self._exec_total = 0
         self._executed_removed = 0  # executed books taken off the list
@@ -775,8 +797,7 @@ class MainWindow(QMainWindow):
             "metadata differ (year, publisher, edition): check them before executing.")
         self.hide_unique = QCheckBox("Hide books with no duplicate")
         self.hide_unique.setToolTip("Same-library analysis: hide books left in the library because no other "
-                                    "book has the same title and authors.\nWith the series option: also hide "
-                                    "books left untouched because they have no series number.")
+                                    "book has the same title and authors.")
         self.hide_unique.setChecked(self.proxy.hide_unique)
         self.hide_unique.toggled.connect(lambda on: self.proxy.update(hide_unique=on))
         self.hide_unique.setVisible(False)
@@ -800,9 +821,14 @@ class MainWindow(QMainWindow):
         self.check_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), True))
         self.uncheck_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), False))
         self.invert_btn.clicked.connect(lambda: self.model.set_checked(self._visible_items(), None))
+        self.revert_all_btn = QPushButton("Revert all changes…")
+        self.revert_all_btn.setToolTip(
+            "Put every book back to the analysis' decision: actions, ticks, unreadable formats and archives,\n"
+            "and forget the choices remembered for these libraries (also of books not analyzed now)")
+        self.revert_all_btn.clicked.connect(self._revert_all)
         self.checked_label = _elastic(QLabel())
         bulk_row = QHBoxLayout()
-        for w in (self.check_btn, self.uncheck_btn, self.invert_btn):
+        for w in (self.check_btn, self.uncheck_btn, self.invert_btn, self.revert_all_btn):
             bulk_row.addWidget(w)
         bulk_row.addWidget(_elastic(QLabel("  Space toggles selected rows · right-click to change the action")), 1)
         bulk_row.addStretch(1)
@@ -1021,7 +1047,7 @@ class MainWindow(QMainWindow):
             box.setEnabled(not busy)
         self.cleanup_box.setEnabled(not busy)
         editable = self._can_edit()
-        for btn in (self.check_btn, self.uncheck_btn, self.invert_btn):
+        for btn in (self.check_btn, self.uncheck_btn, self.invert_btn, self.revert_all_btn):
             btn.setEnabled(editable)
         self._update_summary()
         self._update_notices()
@@ -1111,9 +1137,7 @@ class MainWindow(QMainWindow):
         text = f"{head}: {move} move, {trash} trash, {leave} leave"
         if leave:
             unique = sum(1 for it in self.plan.items if has_no_duplicate(it))
-            no_series = sum(1 for it in self.plan.items if skipped_no_series(it))
-            text += f" ({leave - unique - no_series} to review, {unique} with no duplicate"
-            text += f", {no_series} without series number)" if no_series else ")"
+            text += f" ({leave - unique} to review, {unique} with no duplicate)"
         text += f" · total {total}"
         hidden = total - self.proxy.rowCount()
         if hidden:
@@ -1264,6 +1288,23 @@ class MainWindow(QMainWindow):
                 revert(it)
         self.model.refresh()
 
+    def _revert_all(self):
+        """Every change made to this plan, and every choice remembered for its libraries."""
+        changed = sum(1 for it in self.plan.items if is_changed(it))
+        saved = self.store.saved(self.plan)
+        if not changed and not saved:
+            self.status_label.setText("No changes to revert: every book has the analysis' decision.")
+            return
+        if QMessageBox.question(
+                self, "Revert all changes",
+                f"Put {changed} book(s) back to the analysis' decision and forget the {saved} choice(s) "
+                "remembered for these libraries?\n\nThis can't be undone.") != QMessageBox.StandardButton.Yes:
+            return
+        self.store.forget(self.plan)
+        revert_all(self.plan)
+        log.info("Reverted all changes: %d book(s); %d remembered choice(s) forgotten", changed, saved)
+        self.model.refresh()  # saves the choices left: none
+
     def _clear_filters(self):
         self.search.clear()
         self.action_filter.setCurrentIndex(0)
@@ -1362,13 +1403,15 @@ class MainWindow(QMainWindow):
             return
         self._plan_signature = analysis_signature(self.settings)
         source, target, trash = (self._library(k) for k in ("source", "target", "trash"))
+        if not self._claim_libraries(LibraryUse("dedup"), [source, target], trash):
+            return
         same = bool(source) and str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
         # Rows appear as books are decided; the table is read-only and unsorted until the end.
         self.plan = Plan(source, target, trash, same_library=same)
         self._eta.reset()
         self.model.start_live(self.plan)
         self._restored = 0
-        self.hide_unique.setVisible(same or self.settings.same_series)
+        self.hide_unique.setVisible(same)
         self._fill_action_filter(same)
         worker = AnalyzeWorker(self.settings, source, target, trash, self.no_cache.isChecked())
         worker.progress.connect(self._on_progress)
@@ -1387,7 +1430,25 @@ class MainWindow(QMainWindow):
         self.model.append_items(items)
         self._update_summary()
 
+    def _claim_libraries(self, use: LibraryUse, analyzed: list[str], trash: str) -> bool:
+        """Mark the libraries of the new analysis as used, replacing the previous
+        plan's. False (and told) if another running program stands in the way."""
+        try:
+            use.claim(analyzed, trash)
+        except (LibraryInUse, OSError) as e:
+            QMessageBox.warning(self, "Library in use", str(e))
+            return False
+        self._release_libraries()
+        self._library_use = use
+        return True
+
+    def _release_libraries(self):
+        if self._library_use is not None:
+            self._library_use.release()
+            self._library_use = None
+
     def _analysis_failed(self, message: str):
+        self._release_libraries()
         self.plan = None
         self._plan_signature = None
         self.model.set_plan(None)
@@ -1420,7 +1481,7 @@ class MainWindow(QMainWindow):
         restored = self._restored  # applied batch by batch as books were decided
         self.plan = plan
         self.model.set_plan(plan)
-        self.hide_unique.setVisible(plan.same_library or any(skipped_no_series(it) for it in plan.items))
+        self.hide_unique.setVisible(plan.same_library)
         self._fill_action_filter(plan.same_library)
         log.debug("Plan model populated: items=%d", len(plan.items))
         self._finish()
@@ -1453,6 +1514,8 @@ class MainWindow(QMainWindow):
                                 "Close Calibre (and calibre-server) before executing: two programs "
                                 "must not change a library at the same time.")
             return
+        if not self._execution_libraries_ok():
+            return
         p = self.plan
         todo = actionable(p)
         main = [i for i in todo if runs_main_action(i, self.model.blocked)]
@@ -1469,7 +1532,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self, "Execute checked books",
             f"{moves} books will be moved to the target library.\n"
-            f"{trashes} books will be moved to the trash library.\n"
+            f"{trashes} books will be moved to the trash library ({p.trash_library}).\n"
             + (f"   {unreadable} of them have no file Calibre can open.\n" if unreadable else "")
             + (f"   {no_copy} of them (forced) have no copy in the target: "
                "they will only be in the trash library.\n" if no_copy else "")
@@ -1498,6 +1561,38 @@ class MainWindow(QMainWindow):
         self._exec_total = total
         self._start(worker, "execute")
         log.info("Execution started")
+
+    def _execution_libraries_ok(self) -> bool:
+        """The trash library chosen now is the one used (see _use_trash), and no library
+        of the plan is being written by another execution; if only the trash is, the
+        user may choose another. False = don't execute."""
+        p = self.plan
+        while True:
+            if not self._use_trash(self._library("trash")):
+                return False
+            conflicts = execution_conflicts("dedup", {"source": p.source_library, "target": p.target_library,
+                                                      "trash": p.trash_library})
+            if not conflicts:
+                return True
+            if not ask_other_trash(self, "dedup", conflicts, self.lib_boxes["trash"]):
+                return False
+
+    def _use_trash(self, trash: str) -> bool:
+        """Make `trash` the plan's trash library, checked as before an analysis. It may
+        differ from the analysis' without analyzing again: the analysis never reads it."""
+        p = self.plan
+        if same_library(trash, p.trash_library):
+            return True
+        try:
+            check_libraries(p.source_library, p.target_library, trash)
+        except ValueError as e:
+            QMessageBox.warning(self, "Trash library", str(e))
+            return False
+        if not self._claim_libraries(LibraryUse("dedup"), [p.source_library, p.target_library], trash):
+            return False
+        log.info("Trash library changed after the analysis: %s (was %s)", trash, p.trash_library)
+        p.trash_library = trash
+        return True
 
     def _on_result(self, item: PlanItem):
         self._done_count += 1
@@ -1595,6 +1690,7 @@ class MainWindow(QMainWindow):
             return
         self.settings.window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self._sync_settings()
+        self._release_libraries()
         event.accept()
 
 

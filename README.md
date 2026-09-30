@@ -143,7 +143,8 @@ be ticked unless you change their action.
 - A duplicate of a book this same plan moves into the target is **blocked** (⚠) while that
   move is unticked or overridden.
 - Your unticked books and changes are **remembered** per source/target pair and applied
-  again at the next analysis.
+  again at the next analysis. *Revert all changes…* puts every book back to the analysis'
+  decision and forgets what was remembered for the pair, also for books not in the list.
 - *Export CSV* saves the plan, including what is ticked.
 
 An amber bar above the list tells you what to know about the plan: checks that were skipped,
@@ -193,7 +194,7 @@ Stephen"), and **one shared author is enough** ("Dune" by Frank Herbert is compa
 "Dune" by Frank Herbert & Brian Herbert). Without it, all authors must match.
 
 Three options find more pairs (below): *Same title, author written differently*, *Match
-similar titles by the same author* and *Same author + same series + same number*.
+similar titles by the same author* and *Same series + same number*.
 
 #### How two books are compared
 
@@ -273,15 +274,17 @@ number, identical EPUB text, or the same cover. A real difference in edition or 
 left in the source, "similar title to …, not proven the same book: check manually", with the
 match shown so you can open both.
 
-**Same author + same series + same number = same book** (off by default). Two books sharing
-an author, a series and a number are the same book even if their titles differ ("Chasing the Sun"
-and "Chasing", both Gutenberg #243). Number 1 is ignored: it is Calibre's default. Turn it on only
-for libraries whose series numbers are reliable (a collection numbered by issue): where a
-genre is used as the series, or numbers are wrong, it would trash different books. While it
-is on, **source books without a series and a real number are left untouched**, not even an
-obvious duplicate is handled, so a library is cleaned in two passes: first with the option on,
-then off. These rows are counted apart ("N without series number") and hidden by *Hide books
-with no duplicate*.
+**Same series + same number = same book** (off by default). Two books sharing a series and a
+number are the same book when the title or an author agrees too, even loosely ("Chasing the
+Sun" and "Chasing", both Gutenberg #243; "Lo scudo del tempo" and "La pattuglia del tempo",
+both by Poul Anderson). It is checked first: a match decides the book at once,
+nothing else is compared and the AI is not asked (not even for a missing title or author). Number 1 is ignored: it is Calibre's default.
+Two books at the same number with unrelated titles and authors are not taken as duplicates:
+libraries often file sub-series (Millemondi, Classici) or wrong numbers under one series name.
+They go through the other checks, noting "same series and number as …". Still, turn it on only
+for libraries whose series numbers are mostly reliable (a collection numbered by issue). Books
+without a series or a real number (none, 0 or 1) go through the other checks as usual: one
+pass cleans the whole library.
 
 #### Duplicates within one library
 
@@ -363,7 +366,7 @@ RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
 | Re-check year differences by reading both books | on | The years printed in the books decide. |
 | Same title, author written differently | on | "Frederickk Marryat" / "Frederick Marryat"; AI for other spellings. |
 | Match similar titles by the same author | on | Needs proof: ISBN, same text or same cover. |
-| Same author + same series + same number = same book | off | For reliably numbered collections only. |
+| Same series + same number = same book | off | For reliably numbered collections only. |
 | Move files Calibre can't open to the trash library without asking | off | Ticks those rows. |
 | Write AI-found title/authors/publisher/ISBN to moved books | on | Only empty fields; changed books are tagged `AIUpdated`. |
 | Delete permanently from source | off | Else Calibre's recycle bin. |

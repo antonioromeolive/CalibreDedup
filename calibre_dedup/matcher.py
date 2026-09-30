@@ -28,7 +28,8 @@ it is the same edition from the same publisher:
 * a shared ISBN proves it is the same edition and publisher (different ISBNs
   prove nothing, as e-book and print ISBNs of one edition differ); so does a
   shared Amazon ASIN, which Amazon assigns to one edition; and, with the "same
-  series" option, the same series and number (not Calibre's default 1);
+  series" option, the same series and number (not Calibre's default 1) when
+  the title or an author agrees too (see planner._series_agrees);
 * otherwise edition (edition number, falling back to publication year) and
   publisher are compared. If either differs, the books are distinct. If either
   is unknown, no decision is possible.
@@ -96,7 +97,8 @@ def compare_publisher(a: Identity, b: Identity) -> Comparison:
 
 
 def compare(src: Identity, tgt: Identity) -> Comparison:
-    """Compare two books already known to share title and authors."""
+    """Compare two books already known to share title and authors (or, with the
+    "same series" option, series and number)."""
     if src.isbns and tgt.isbns and src.isbns & tgt.isbns:
         return Comparison(Verdict.DUPLICATE, f"same ISBN ({sorted(src.isbns & tgt.isbns)[0]})", proof=True)
     if src.asins & tgt.asins:

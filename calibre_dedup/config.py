@@ -115,7 +115,7 @@ class Settings:
     similar_matching: bool = True  # authors match loosely and one shared author is enough
     cover_check: bool = True  # the image AI compares covers when metadata can't decide
     recheck_years: bool = True  # AI reads both books when only the metadata years differ
-    same_series: bool = False  # same author + series + number (not 1) = same book, whatever the title
+    same_series: bool = False  # same series + number (not 1) = same book, if the title or an author agrees
     always_cover: bool = False  # compare covers even when the metadata says different; same cover wins
     author_variants: bool = True  # same title, author written differently ("Frederickk"/"Frederick"; AI if on)
     fix_swapped: bool = True  # title and author swapped ("Kingston — The Log House by the Lake"): analyzed put right

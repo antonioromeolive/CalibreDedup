@@ -38,12 +38,13 @@ import time
 import zlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import BinaryIO, Callable, TypeVar
 
 import requests
 
 from . import perf
 from .config import ANTHROPIC, AZURE, OLLAMA, OPENAI, ProviderProfile, config_dir
+from .tempdirs import lock, unlock
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -527,14 +528,16 @@ class AIMetadata:
 
 
 class AICache:
-    """JSON cache so repeated analyses don't re-query the model. `off` (for tests): every
-    question goes to the AI and nothing is kept; the cache file is neither read nor written."""
+    """JSON cache so repeated analyses don't re-query the model. Shared by every running
+    copy of the program: `save` merges (see there). `off` (for tests): every question
+    goes to the AI and nothing is kept; the cache file is neither read nor written."""
 
     def __init__(self, path: Path | None = None, off: bool = False):
         self.path = path or config_dir() / "ai_cache.json"
         self.off = off
         self._lock = threading.Lock()
         self._data: dict = {}
+        self._new: dict = {}  # answers not saved yet
         if off:
             log.info("AI cache off: every question goes to the AI, %s is left as it is", self.path.name)
             return
@@ -555,10 +558,12 @@ class AICache:
     def clear(path: Path) -> int:
         """Forget every answer: the file is emptied, not deleted (a missing review
         cache would be copied again from the shared one). Returns how many were
-        removed. Only while no analysis is running: a running one writes its copy back."""
-        removed = AICache.size(path)[0]
+        removed. An analysis running meanwhile writes back only the answers it gets
+        from then on."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+        with _FileLock(path):
+            removed = AICache.size(path)[0]
+            path.write_text("{}", encoding="utf-8")
         log.info("AI cache %s cleared: %d answers removed", path, removed)
         return removed
 
@@ -593,25 +598,38 @@ class AICache:
         if self.off:
             return
         with self._lock:
-            self._data[key] = value
+            if self._data.get(key) != value:
+                self._data[key] = value
+                self._new[key] = value
 
     def save(self) -> None:
+        """Merge this run's new answers into the file: several programs may analyze at
+        once, each adding its own. Nothing new, nothing written. Answers the others
+        saved meanwhile are taken in too; if the file was cleared, so is this copy
+        (only this run's new answers are written back)."""
         if self.off:
             return
         with self._lock:
+            if not self._new:
+                return
             tmp_name = ""
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=self.path.parent,
-                    prefix=f"{self.path.stem}_", suffix=".tmp", delete=False,
-                ) as tmp:
-                    tmp_name = tmp.name
-                    json.dump(self._data, tmp)
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
-                os.replace(tmp_name, self.path)
-            except OSError as e:
+                with _FileLock(self.path):
+                    data = _read_cache(self.path)
+                    data.update(self._new)
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", dir=self.path.parent,
+                        prefix=f"{self.path.stem}_", suffix=".tmp", delete=False,
+                    ) as tmp:
+                        tmp_name = tmp.name
+                        json.dump(data, tmp)
+                        tmp.flush()
+                        os.fsync(tmp.fileno())
+                    os.replace(tmp_name, self.path)
+                self._data = data
+                self._new = {}
+            except OSError as e:  # the new answers are kept for the next save
                 log.warning("Could not save AI cache %s: %s", self.path, e)
             finally:
                 if tmp_name:
@@ -619,6 +637,54 @@ class AICache:
                         Path(tmp_name).unlink()
                     except OSError:
                         pass
+
+
+def _read_cache(path: Path) -> dict:
+    """A cache file's answers: none if it is missing or damaged (then rewritten whole).
+    Any other read error is raised: saving over a file we could not read would lose it."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        log.warning("AI cache %s is damaged: its answers are dropped", path)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+class _FileLock:
+    """Held while a cache file is read, merged and replaced, so that programs saving
+    at the same time don't lose each other's answers. Waits for the other (a save
+    takes well under a second); raises OSError if it never comes free."""
+
+    TIMEOUT = 30.0
+
+    def __init__(self, path: Path):
+        self.path = path.with_name(path.name + ".lock")
+        self._file: BinaryIO | None = None
+
+    def __enter__(self) -> "_FileLock":
+        f = self.path.open("a+b")
+        deadline = time.monotonic() + self.TIMEOUT
+        while True:
+            try:
+                lock(f)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    f.close()
+                    raise OSError(f"{self.path.name} stayed locked by another program")
+                time.sleep(0.05)
+        self._file = f
+        return self
+
+    def __exit__(self, *exc) -> None:
+        assert self._file is not None
+        try:
+            unlock(self._file)
+        finally:
+            self._file.close()
+            self._file = None
 
 
 def extract_metadata(provider: Provider, text: str, images: list[str] | None = None) -> AIMetadata:

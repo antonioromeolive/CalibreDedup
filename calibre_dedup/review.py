@@ -300,7 +300,7 @@ class Reviewer(AIResolver):
             except AIError as e:
                 if not e.filtered or i == len(attempts) - 1:
                     raise
-                log.info("AI content filter refused %s: asking again with %s", book.label(), attempts[i + 1][2])
+                log.info("%s on %s: asking again with %s", e, book.label(), attempts[i + 1][2])
         raise AssertionError("unreachable")
 
     def _cover(self, book: Book) -> tuple[str | None, str]:
@@ -615,5 +615,5 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
             on_result(item, msg["ok"], msg["msg"])
 
     run_bridge(calibre_dir, {"source": result.library, "trash": result.trash_library,
-                             "permanent": permanent, "actions": actions}, on_message, cancel)
+                             "permanent": permanent, "actions": actions}, on_message, cancel, program="review")
     return ok, failed, tagged

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 
@@ -32,6 +33,7 @@ from . import perf, tempdirs
 from .ai import AICache
 from .config import Settings, config_dir
 from .executor import execute_plan
+from .library_use import LibraryInUse, LibraryUse
 from .models import Action
 from .planner import build_plan, run_summary
 from .report import write_csv
@@ -76,6 +78,13 @@ def run(argv: list[str]) -> int:
     if args.no_ai:
         settings.text_profile = ""
 
+    use = LibraryUse("dedup")
+    try:
+        use.claim([args.source, args.target], args.trash)
+    except LibraryInUse as e:
+        print(e, file=sys.stderr)
+        return 2
+    atexit.register(use.release)
     if args.clear_cache:
         print(f"AI cache cleared: {AICache.clear(config_dir() / 'ai_cache.json'):,} answers removed", file=sys.stderr)
     resolver = make_resolver(settings, cache=AICache(off=True) if args.no_cache else None)

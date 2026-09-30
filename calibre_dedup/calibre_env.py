@@ -82,20 +82,44 @@ def calibre_is_running() -> bool:
     return bool(names & running)
 
 
-def known_libraries() -> list[str]:
-    """Libraries Calibre has recently used, read from its global preferences."""
+def _calibre_config_dir() -> Path:
     if sys.platform == "win32":
         cfg = Path(os.environ.get("APPDATA", "")) / "calibre"
     elif sys.platform == "darwin":
         cfg = Path.home() / "Library" / "Preferences" / "calibre"
     else:
         cfg = Path.home() / ".config" / "calibre"
-    cfg = Path(os.environ.get("CALIBRE_CONFIG_DIRECTORY", cfg))
+    return Path(os.environ.get("CALIBRE_CONFIG_DIRECTORY", cfg))
+
+
+def _read_json(path: Path) -> dict:
     try:
-        data = json.loads((cfg / "global.py.json").read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    libs = list(data.get("library_usage_stats", {}))
-    if data.get("library_path"):
-        libs.insert(0, data["library_path"])
-    return [str(Path(p)) for p in dict.fromkeys(libs) if Path(p, "metadata.db").is_file()]
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def known_libraries() -> list[str]:
+    """Libraries Calibre has used, most used first: its current library (global.py.json),
+    then its usage counts (gui.json; global.py.json in older versions). Paths that differ
+    only in case or slashes are one library; those without a metadata.db are left out."""
+    cfg = _calibre_config_dir()
+    current = _read_json(cfg / "global.py.json")
+    counts: dict[str, tuple[str, int]] = {}  # normalized path -> (path, uses)
+    for data in (_read_json(cfg / "gui.json"), current):
+        stats = data.get("library_usage_stats")
+        for p, n in (stats.items() if isinstance(stats, dict) else ()):
+            key = os.path.normcase(os.path.normpath(p))
+            first, total = counts.get(key, (str(Path(p)), 0))
+            counts[key] = (first, total + (n if isinstance(n, int) else 0))
+    libs = [p for p, _ in sorted(counts.values(), key=lambda pn: -pn[1])]
+    if current.get("library_path"):
+        libs.insert(0, str(Path(current["library_path"])))
+    out, seen = [], set()
+    for p in libs:
+        key = os.path.normcase(os.path.normpath(p))
+        if key not in seen and Path(p, "metadata.db").is_file():
+            out.append(p)
+        seen.add(key)
+    return out

@@ -32,10 +32,10 @@ from pathlib import Path
 from typing import Callable
 
 from .calibre_env import CREATE_NO_WINDOW, calibre_is_running, tool
-from .config import config_dir
+from .library_use import ExecutionLock
 from .models import Action, Plan, PlanItem
 from .selection import actionable, blocked, has_metadata_update, runs_main_action
-from .tempdirs import RunDir, lock, unlock
+from .tempdirs import RunDir
 
 log = logging.getLogger(__name__)
 BRIDGE = Path(__file__).with_name("bridge_script.py")
@@ -55,31 +55,6 @@ def _keep_failed_in_source(item: PlanItem) -> None:
     item.selected = False
     item.manual = False
     item.reason = f"kept in source after execution failure: {item.reason}"
-
-
-class _ExecutionLock:
-    def __init__(self):
-        self.path = config_dir() / "execution.lock"
-        self._file = None
-
-    def acquire(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("a+b")
-        try:
-            lock(self._file)
-        except OSError as e:
-            self._file.close()
-            self._file = None
-            raise ExecutionError("Another CalibreDedup instance is executing a plan.") from e
-
-    def release(self):
-        if self._file is None:
-            return
-        try:
-            unlock(self._file)
-        finally:
-            self._file.close()
-            self._file = None
 
 
 def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
@@ -156,12 +131,15 @@ def _ai_values(item: PlanItem) -> dict:
 
 
 def run_bridge(calibre_dir: Path, payload: dict, on_message: Callable[[dict], None],
-               cancel: threading.Event | None = None) -> None:
+               cancel: threading.Event | None = None, program: str = "dedup") -> None:
     """Run bridge_script.py in calibre-debug with `payload` as its plan, calling
-    `on_message` for each "result" / "stopped" event it prints. Holds the
-    execution lock: only one plan (of any CalibreDedup program) runs at a time."""
-    execution_lock = _ExecutionLock()
-    execution_lock.acquire()
+    `on_message` for each "result" / "stopped" event it prints. Locks the libraries
+    it writes (see library_use.ExecutionLock): if another execution writes one of
+    them, raises ExecutionError naming it."""
+    execution_lock = ExecutionLock(program)
+    conflicts = execution_lock.acquire({r: payload.get(r) or "" for r in ("source", "target", "trash")})
+    if conflicts:
+        raise ExecutionError("\n".join(c.describe(program) for c in conflicts))
     try:
         with RunDir("execute_") as tmp:
             payload = {**payload, "tmp": str(tmp)}  # where the bridge extracts archives

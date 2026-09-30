@@ -141,3 +141,58 @@ def test_no_cache_ignores_the_saved_answers_and_leaves_the_files_as_they_are(mon
     assert (config.config_dir() / "ai_cache.json").read_bytes() == before
     assert not (config.config_dir() / REVIEW_CACHE_FILE).exists()  # not even created as a copy
     assert AICache().get("old") == {"title": "x"}
+
+
+def test_programs_analyzing_at_once_keep_each_others_answers(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    a, b = AICache(), AICache()  # both started before either saved
+    a.put("a1", {"title": "x"})
+    a.save()
+    b.put("b1", {"title": "y"})
+    b.save()
+    a.put("a2", {"title": "z"})
+    a.save()
+    assert AICache().get("a1") and AICache().get("b1") and AICache().get("a2")
+    assert a.get("b1") == {"title": "y"}  # the other's answers are taken in when saving
+
+
+def test_nothing_new_nothing_written(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    cache = AICache()
+    cache.save()
+    path = config.config_dir() / "ai_cache.json"
+    assert not path.exists()
+    cache.put("k", {"title": "x"})
+    cache.save()
+    path.write_text('{"k": {"title": "x"}, "other": {}}', encoding="utf-8")
+    cache.put("k", {"title": "x"})  # same answer again: nothing new
+    cache.save()
+    assert path.read_text(encoding="utf-8") == '{"k": {"title": "x"}, "other": {}}'  # not rewritten
+
+
+def test_clearing_while_an_analysis_runs_keeps_only_its_later_answers(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup.ai import AICache
+    running = AICache()
+    running.put("old", {"title": "x"})
+    running.save()
+    assert AICache.clear(config.config_dir() / "ai_cache.json") == 1
+    running.put("new", {"title": "y"})
+    running.save()
+    assert AICache().get("old") is None and AICache().get("new") == {"title": "y"}
+    assert running.get("old") is None
+
+
+def test_a_save_that_cannot_lock_keeps_its_answers_for_the_next(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    from calibre_dedup import ai
+    monkeypatch.setattr(ai._FileLock, "TIMEOUT", 0.1)
+    cache = ai.AICache()
+    cache.put("k", {"title": "x"})
+    with ai._FileLock(cache.path):  # another program saving
+        cache.save()
+    assert ai.AICache().get("k") is None
+    cache.save()
+    assert ai.AICache().get("k") == {"title": "x"}

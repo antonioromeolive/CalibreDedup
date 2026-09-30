@@ -102,6 +102,22 @@ def revert(item: PlanItem) -> None:
         u.unpack = u.planned
 
 
+def is_changed(item: PlanItem) -> bool:
+    """Whether the user changed the analysis' choices for the book: its action, its
+    tick, its unreadable formats or its archives."""
+    return (item.manual or item.selected != item.planned_selected or item.trash_bad != item.planned_trash_bad
+            or any(u.unpack != u.planned for u in item.archives))
+
+
+def revert_all(plan: Plan) -> int:
+    """Put every book back to the analysis' choices. Returns how many had changed."""
+    changed = [i for i in plan.items if is_changed(i)]
+    for i in changed:
+        revert(i)
+        i.trash_bad = i.planned_trash_bad
+    return len(changed)
+
+
 # --- dependencies ---------------------------------------------------------------
 def blocked(plan: Plan) -> dict[int, str]:
     """Source id -> why the item can't run.
@@ -195,6 +211,16 @@ class SelectionStore:
             restored += 1
         return restored
 
+    def saved(self, plan: Plan) -> int:
+        """How many books of the plan's libraries have saved choices (analyzed or not)."""
+        return len(self._read().get(self._key(plan), {}))
+
+    def forget(self, plan: Plan) -> None:
+        """Drop every saved choice of the plan's libraries, also of books not analyzed."""
+        data = self._read()
+        if data.pop(self._key(plan), None) is not None:
+            self._write(data)
+
     def save(self, plan: Plan, partial: bool = False) -> None:
         """`partial`: the plan doesn't cover every book yet (analysis still running)."""
         entries = {}
@@ -224,6 +250,9 @@ class SelectionStore:
             data[key] = entries
         else:
             data.pop(key, None)
+        self._write(data)
+
+    def _write(self, data: dict) -> None:
         try:
             self.path.write_text(json.dumps(data, indent=1), encoding="utf-8")
         except OSError as e:

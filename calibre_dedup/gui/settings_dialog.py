@@ -485,14 +485,14 @@ class SettingsDialog(QDialog):
             "identical EPUB text or the same cover. A different cover or edition rules the book out;\n"
             "otherwise the book is left in the source for you to check.")
         self.a_similar_titles.setChecked(s.similar_titles)
-        self.a_series = QCheckBox("Same author + same series + same number = same book, even if titles differ")
+        self.a_series = QCheckBox("Same series + same number = same book, even if titles and authors differ")
         self.a_series.setToolTip(
-            "Only when both books have the same series name and number, and share an author.\n"
+            "Only when both books have the same series name and number; titles and authors are not compared.\n"
+            "A match decides at once: nothing else is checked, the AI is not asked.\n"
             "Number 1 is ignored: it is Calibre's default when no number was set.\n"
             "Turn it on only for libraries whose series numbers are reliable (e.g. a collection\n"
             "like Gutenberg, numbered by issue): a wrong number would send a different book to trash.\n"
-            "While it is on, source books without a series and a number are left untouched:\n"
-            "run the analysis again with it off for those.")
+            "Books without a series or a number (or with number 1) go through the other checks as usual.")
         self.a_series.setChecked(s.same_series)
         self.a_unreadable = QCheckBox("Move files Calibre can't open to the trash library without asking")
         self.a_unreadable.setToolTip(

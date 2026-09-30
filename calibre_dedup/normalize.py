@@ -265,6 +265,28 @@ def contains_title(big: str, small: str, noise: set[str]) -> bool:
     return all(_is_noise(w, noise) for w in rest)
 
 
+MIN_TITLE_WORD = 4  # shorter words ("era", "sun", "di") tie too many titles together
+
+
+def related_titles(a: str, b: str, noise: set[str]) -> bool:
+    """Whether two titles share at least half the words of the shorter one: words of
+    MIN_TITLE_WORD letters or more that aren't `noise` or articles and prepositions,
+    one letter's typo allowed in long words. "Le Escrescenze della Luna" / "Escrescenze
+    Sulla Luna", "La crisi della realtà" / "La Crisii Della Realta - Volume 2"."""
+    def words(title: str) -> set[str]:
+        return {w for w in _tokens(title) if len(w) >= MIN_TITLE_WORD and w not in _TITLE_WORDS
+                and not _is_noise(w, noise)}
+
+    wa, wb = words(a), words(b)
+    if not wa or not wb:
+        return False
+    if len(wa) > len(wb):
+        wa, wb = wb, wa
+    shared = sum(1 for w in wa if any(
+        w == x or (min(len(w), len(x)) >= MIN_TYPO_LENGTH and _one_edit_apart(w, x)) for x in wb))
+    return 2 * shared >= len(wa)
+
+
 def author_key(name: str) -> tuple[str, ...]:
     """Order-insensitive author key: 'Tolkien, J.R.R.' == 'J. R. R. Tolkien'.
     Every spelling of "various authors" gives VARIOUS_AUTHORS_KEY."""

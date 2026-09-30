@@ -50,17 +50,19 @@ from ..config import OLLAMA, Settings, config_dir, load_review_settings
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG
 from ..extract import TextExtractor
+from ..library import LibraryError
+from ..library_use import LibraryInUse, LibraryUse, execution_conflicts, same_library
 from ..normalize import strip_accents
 from ..review import (
     ACTION_LABELS, FIELD_LABELS, FIELDS, ReviewAction, ReviewItem, ReviewResult, Reviewer, book_cover_file,
-    REVIEW_CACHE_FILE, REVIEWED_TAG, current_value, execute_review, format_value, is_reviewed, review_actions,
-    review_cache, scan_library, summary, write_run_csv,
+    REVIEW_CACHE_FILE, REVIEWED_TAG, check_libraries, current_value, execute_review, format_value, is_reviewed,
+    review_actions, review_cache, scan_library, summary, write_run_csv,
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from .main_window import (
     AI_LOG_COLOR, ARCHIVES_TIP, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
-    add_unpack_actions, archive_texts, ask_ai_down, ask_unpack, configure_logging, no_cache_box, open_file,
-    with_eta,
+    add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, no_cache_box,
+    open_file, with_eta,
 )
 from ..planner import AI_OFF
 from .cover_preview import CoverPreview
@@ -420,6 +422,7 @@ class ReviewWindow(QMainWindow):
         self.worker: QThread | None = None
         self._operation = ""
         self._stopping = self._close_pending = False
+        self._library_use: LibraryUse | None = None  # the libraries of the review shown (see library_use)
         self._busy = False
         self._done_count = self._exec_total = 0
         self._status_msg, self._status_since = "", 0.0
@@ -919,6 +922,8 @@ class ReviewWindow(QMainWindow):
         if not self._preflight_ok():
             return
         library, trash = self._library("library"), self._library("trash")
+        if not self._claim_libraries(LibraryUse("review"), [library], trash):
+            return
         self.result = ReviewResult(library, trash)
         self._eta.reset()
         self.model.locked = False
@@ -932,6 +937,54 @@ class ReviewWindow(QMainWindow):
         worker.unpack_asked.connect(self._on_unpack_asked)
         self._start(worker, "scan")
         log.info("Review started")
+
+    def _claim_libraries(self, use: LibraryUse, analyzed: list[str], trash: str) -> bool:
+        """Mark the libraries of the new review as used, replacing the previous one's.
+        False (and told) if another running program stands in the way."""
+        try:
+            use.claim(analyzed, trash)
+        except (LibraryInUse, OSError) as e:
+            QMessageBox.warning(self, "Library in use", str(e))
+            return False
+        self._release_libraries()
+        self._library_use = use
+        return True
+
+    def _release_libraries(self):
+        if self._library_use is not None:
+            self._library_use.release()
+            self._library_use = None
+
+    def _execution_libraries_ok(self) -> bool:
+        """The trash library chosen now is the one used (see _use_trash), and neither
+        library is being written by another execution; if only the trash is, the user
+        may choose another. False = don't execute."""
+        r = self.result
+        while True:
+            if not self._use_trash(self._library("trash")):
+                return False
+            conflicts = execution_conflicts("review", {"source": r.library, "trash": r.trash_library})
+            if not conflicts:
+                return True
+            if not ask_other_trash(self, "review", conflicts, self.lib_boxes["trash"]):
+                return False
+
+    def _use_trash(self, trash: str) -> bool:
+        """Make `trash` the review's trash library, checked as before a review. It may
+        differ from the review's without reviewing again: the review never reads it."""
+        r = self.result
+        if same_library(trash, r.trash_library):
+            return True
+        try:
+            check_libraries(r.library, trash)
+        except LibraryError as e:
+            QMessageBox.warning(self, "Trash library", str(e))
+            return False
+        if not self._claim_libraries(LibraryUse("review"), [r.library], trash):
+            return False
+        log.info("Trash library changed after the review: %s (was %s)", trash or "none", r.trash_library or "none")
+        r.trash_library = trash
+        return True
 
     def _on_items(self, items: list):
         self.model.append_items(items)
@@ -1001,7 +1054,8 @@ class ReviewWindow(QMainWindow):
                                                             "two programs must not change a library at the same time.")
             return
         self._sync_settings()
-        self.result.trash_library = self._library("trash")
+        if not self._execution_libraries_ok():
+            return
         updates, trashes, tags, formats, unpacks = self._counts()
         if (trashes or formats or unpacks) and not self.result.trash_library:
             QMessageBox.warning(self, "No trash library", "Choose a trash library to move books to it.")
@@ -1092,6 +1146,7 @@ class ReviewWindow(QMainWindow):
             self._after_execution()
         elif self.result is not None and not self.model.items:
             self.result = None
+            self._release_libraries()
         self._finish()
         log.error(message)
         if not self._close_pending:
@@ -1117,6 +1172,7 @@ class ReviewWindow(QMainWindow):
             return
         self.settings.review_window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self._sync_settings()
+        self._release_libraries()
         event.accept()
 
 

@@ -538,7 +538,7 @@ def test_library_vanishing_between_books_stops_the_analysis(libs, monkeypatch):
     assert plan.stopped and plan.stop_reason == r"library not reachable: F:\lib"
 
 
-def test_same_series_and_number_proves_duplicate_whatever_the_title(libs):
+def test_same_series_and_number_proves_duplicate_with_a_related_title(libs):
     src, tgt, trash = libs(
         source=[{"title": "Chasing", "authors": ["R. M. Ballantyne"], "series": "Gutenberg", "series_index": 243}],
         target=[{"title": "Chasing the Sun", "authors": ["Ballantyne, R. M."], "series": "gutenberg", "series_index": 243,
@@ -547,6 +547,68 @@ def test_same_series_and_number_proves_duplicate_whatever_the_title(libs):
     assert build_plan(src, tgt, trash).items[0].action is Action.MOVE  # option off: titles differ
     item = build_plan(src, tgt, trash, same_series=True).items[0]
     assert item.action is Action.TRASH and "same series and number (gutenberg #243)" in item.reason
+
+
+def test_same_series_and_number_needs_no_shared_author(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Chasing", "authors": ["Robert Ballantyne"], "series": "Gutenberg", "series_index": 243}],
+        target=[{"title": "Chasing the Sun", "authors": ["Anonymous Editor"], "series": "Gutenberg",
+                 "series_index": 243}],
+    )
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.TRASH and "same series and number" in item.reason
+
+
+def test_same_series_and_number_with_another_title_by_the_same_author(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Lo scudo del tempo", "authors": ["Anderson, Poul"], "series": "Urania", "series_index": 14}],
+        target=[{"title": "Guardiani del futuro", "authors": ["Poul Anderson"], "series": "Urania",
+                 "series_index": 14}],
+    )
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.TRASH and "same series and number" in item.reason
+
+
+@pytest.mark.parametrize("authors", [["Richard Matheson"], ["AA.VV."]])
+def test_same_series_and_number_with_unrelated_title_and_authors_is_not_a_duplicate(libs, authors):
+    # A sub-series or a wrong number filed under the same series name; "various authors" is nobody.
+    src, tgt, trash = libs(
+        source=[{"title": "Io sono Helen Driscoll", "authors": authors, "series": "Urania", "series_index": 3}],
+        target=[{"title": "L'orrenda invasione", "authors": ["John Wyndham" if authors != ["AA.VV."] else "AA.VV."],
+                 "series": "Urania", "series_index": 3}],
+    )
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.MOVE and "same series and number as" in item.reason
+
+
+def test_series_words_alone_dont_relate_titles(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Urania n. 15", "authors": ["David G. Hartwell"], "series": "Urania", "series_index": 15}],
+        target=[{"title": "Oltre l'orizzonte (Urania)", "authors": ["Robert A. Heinlein"], "series": "Urania",
+                 "series_index": 15}],
+    )
+    assert build_plan(src, tgt, trash, same_series=True).items[0].action is Action.MOVE
+
+
+def test_a_series_match_decides_before_the_ai_reads_a_missing_author(libs):
+    # No usable author: the AI would be asked first; the series match makes it needless.
+    src, tgt, trash = libs(
+        source=[{"title": "Chasing", "authors": ["Unknown"], "series": "Gutenberg", "series_index": 243}],
+        target=[{"title": "Chasing the Sun", "series": "Gutenberg", "series_index": 243}],
+    )
+    resolver = FakeResolver({})
+    item = build_plan(src, tgt, trash, resolver=resolver, same_series=True).items[0]
+    assert item.action is Action.TRASH and not item.ai_used and resolver.calls == []
+
+
+def test_same_series_duplicates_within_one_library(tmp_path, monkeypatch):
+    monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
+    lib = make_library(tmp_path / "lib", [
+        {"title": "Chasing", "authors": ["A"], "series": "Gutenberg", "series_index": 243},
+        {"title": "Chasing the Sun", "authors": ["B"], "series": "Gutenberg", "series_index": 243, "formats": ["MOBI"]},
+    ])
+    plan = build_plan(lib, lib, str(tmp_path / "trash"), same_series=True)
+    assert sorted(i.action for i in plan.items) == sorted([Action.LEAVE, Action.TRASH])
 
 
 @pytest.mark.parametrize("target", [
@@ -567,14 +629,12 @@ def test_series_decides_nothing_when_series_or_number_differ(libs, target):
     {"series": "Gutenberg", "series_index": 0},
     {"series_index": 7},                                        # a number without a series
 ])
-def test_with_the_series_option_books_without_series_number_are_left_untouched(libs, source):
-    from calibre_dedup.planner import NO_SERIES_REASON
-    # Even an obvious duplicate (same ISBN) is left alone: nothing is decided or executed for it.
+def test_with_the_series_option_books_without_series_number_go_through_the_other_checks(libs, source):
+    # Number 1 (Calibre's default) or 0 counts as no number: the ISBN still finds the duplicate.
     src, tgt, trash = libs(source=[{"title": "Dune", "isbn": "9780441013593", **source}],
                            target=[{"title": "Dune", "isbn": "9780441013593"}])
     item = build_plan(src, tgt, trash, same_series=True).items[0]
-    assert item.action is Action.LEAVE and item.reason == NO_SERIES_REASON and not item.ai_used
-    assert build_plan(src, tgt, trash).items[0].action is Action.TRASH  # option off: as before
+    assert item.action is Action.TRASH and "same ISBN" in item.reason
 
 
 def test_the_series_option_changes_nothing_when_off(libs):

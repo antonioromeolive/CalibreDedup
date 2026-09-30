@@ -25,7 +25,9 @@ import pytest
 from calibre_dedup.ai import AICache
 from calibre_dedup.executor import _keep_failed_in_source, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
-from calibre_dedup.selection import SelectionStore, action_label, actionable, blocked, can_override, override, revert
+from calibre_dedup.selection import (
+    SelectionStore, action_label, actionable, blocked, can_override, override, revert, revert_all,
+)
 
 
 def book(bid, formats=("EPUB",)):
@@ -175,6 +177,30 @@ def test_stopped_analysis_keeps_choices_of_books_it_did_not_reach(tmp_path):
     assert store.apply(fresh) == 1
     assert fresh.items[1].selected  # re-checked in the partial plan
     assert fresh.items[3].action is Action.MOVE  # untouched by the partial plan
+
+
+def test_revert_all_undoes_every_change_and_forget_drops_books_not_analyzed(tmp_path):
+    store = SelectionStore(tmp_path / "sel.json")
+    plan = make_plan()
+    plan.items[1].selected = False
+    override(plan.items[3], Action.MOVE)
+    plan.items[2].trash_bad = True
+    store.save(plan)
+    other = Plan("src2", "tgt", "trash", make_plan().items)
+    override(other.items[3], Action.TRASH)
+    store.save(other)
+
+    partial = make_plan()
+    partial.items = partial.items[:2]  # book 4's saved move is not in this plan
+    assert store.apply(partial) == 1 and store.saved(partial) == 2
+    assert revert_all(partial) == 1 and not partial.items[1].manual and partial.items[1].selected
+    assert revert_all(partial) == 0
+    store.forget(partial)
+    assert store.saved(partial) == 0 and store.apply(make_plan()) == 0
+    assert store.saved(other) == 1  # other libraries keep their choices
+
+    assert revert_all(plan) == 3
+    assert plan.items[3].action is Action.LEAVE and not plan.items[2].trash_bad
 
 
 def test_same_library_plan_cannot_force_a_move():

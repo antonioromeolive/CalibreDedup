@@ -28,6 +28,7 @@ GUI by default; with --cli, a dry run that prints the differences (and, with
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 
@@ -36,6 +37,7 @@ def run_cli(argv: list[str]) -> int:
     from . import perf, tempdirs
     from .ai import AICache
     from .config import config_dir, load_review_settings
+    from .library_use import LibraryInUse, LibraryUse
     from .review import (
         FIELDS, REVIEW_CACHE_FILE, ReviewAction, Reviewer, current_value, execute_review, format_value,
         review_cache, scan_library, summary, write_run_csv,
@@ -74,6 +76,13 @@ def run_cli(argv: list[str]) -> int:
         settings.image_profile = args.image_profile
     fields = {f.strip() for f in args.fields.split(",") if f.strip() in FIELDS}
 
+    use = LibraryUse("review")
+    try:
+        use.claim([args.library], args.trash)
+    except LibraryInUse as e:
+        print(e, file=sys.stderr)
+        return 2
+    atexit.register(use.release)
     if args.clear_cache:
         removed = AICache.clear(config_dir() / REVIEW_CACHE_FILE)
         print(f"AI cache cleared: {removed:,} answers removed", file=sys.stderr)

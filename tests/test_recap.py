@@ -48,14 +48,6 @@ def test_everything_else_is_not_counted_as_no_duplicate(it):
     assert not has_no_duplicate(it)
 
 
-def test_books_left_untouched_by_the_series_option_are_counted_apart():
-    from calibre_dedup.gui.main_window import skipped_no_series
-    from calibre_dedup.planner import NO_SERIES_REASON
-    skipped = PlanItem(item(Action.LEAVE).source, Action.LEAVE, NO_SERIES_REASON, Identity(title="Dune", authors=["X"]))
-    assert skipped_no_series(skipped) and not has_no_duplicate(skipped)
-    assert not skipped_no_series(item(Action.LEAVE))
-
-
 def test_a_different_edition_left_in_place_still_counts_as_no_duplicate():
     it = item(Action.LEAVE, match=OTHER)
     it.different = True

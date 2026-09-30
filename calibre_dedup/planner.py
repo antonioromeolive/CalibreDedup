@@ -61,8 +61,8 @@ from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
 from .normalize import (
     MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, initials_match, is_unknown,
-    looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number, series_key,
-    similar_authors_keys, surname_match, title_key, title_variants,
+    looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number, related_titles,
+    series_key, similar_authors_keys, surname_match, title_key, title_variants,
 )
 from .selection import action_label
 
@@ -75,9 +75,6 @@ RETRY = "retry"  # send the same request again
 SKIP_BOOK = "skip"  # leave this book without the AI, keep the AI on (asked again after as many errors)
 AI_OFF = "off"  # go on without that AI for the rest of the run
 MAX_LIBRARY_PATH = 89  # Calibre refuses longer library paths on Windows
-# With the "same series" option, source books without a series and a real number
-# are left alone: nothing is decided or executed for them.
-NO_SERIES_REASON = "no series number (series option on): left untouched"
 # Checks wanted for a book that could not run (PlanItem.skipped).
 SKIP_AI = "text AI"  # turned off after repeated errors
 SKIP_IMAGE_AI = "image AI"  # turned off after repeated errors
@@ -414,8 +411,7 @@ class _Candidate:
 
 def _keys(ident: Identity, ignore_subtitle: bool, similar: bool) -> list[tuple]:
     """Index keys of a book. Strict: title + all authors. Similar: title + each
-    author, loosely normalized, so books sharing any author are compared. With
-    the "same series" option, also series + number + author(s), whatever the title."""
+    author, loosely normalized, so books sharing any author are compared."""
     if not ident.authors:
         return []
     if similar:
@@ -423,13 +419,26 @@ def _keys(ident: Identity, ignore_subtitle: bool, similar: bool) -> list[tuple]:
     else:
         a = authors_key(ident.authors)
         authors = [a] if a else []
-    keys = []
     t = title_key(ident.title, ignore_subtitle) if ident.title else ""
-    if t:
-        keys += [(t, a) for a in authors]
-    if keys and ident.series:
-        keys += [("series", *ident.series, a) for a in authors]
-    return keys
+    return [(t, a) for a in authors] if t else []
+
+
+def _series_key(ident: Identity) -> tuple:
+    """Index key of a book's series and number (the "same series" option), whatever
+    its title and authors."""
+    return ("series", *ident.series)
+
+
+def _series_agrees(a: Identity, b: Identity) -> bool:
+    """Same series and number is proof only when the titles or the authors agree too:
+    libraries file a publisher's sub-series (Millemondi, Classici) and wrong numbers
+    under one series name, so the number alone pairs unrelated books."""
+    if a.title and b.title and related_titles(a.title, b.title, noise_words(a.series[0])):
+        return True
+    people = [(x, y) for x in a.authors for y in b.authors
+              if not is_unknown(x) and not is_unknown(y) and author_key(x) != VARIOUS_AUTHORS_KEY]
+    return any(author_key(x) == author_key(y) or names_nearly_equal(x, y) or initials_match(x, y)
+               for x, y in people)
 
 
 def _author_keys(ident: Identity, similar: bool) -> list:
@@ -676,6 +685,8 @@ def build_plan(
     def add_to_index(c: _Candidate) -> None:
         for k in _keys(c.identity, ignore_subtitle, similar_matching):
             index[k].append(c)
+        if c.identity.series is not None:
+            index[_series_key(c.identity)].append(c)
         for k in _keys(c.identity, True, similar_matching):
             main_index[k].append(c)
         if similar is not None and c.identity.title:
@@ -933,10 +944,22 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
                 by_title: dict | None = None, persons: SwapDetector | None = None) -> PlanItem:
     """`skipped` collects the checks wanted for this book that could not run."""
     ident = metadata_identity(sb, same_series)
-    if same_series and ident.series is None:
-        return PlanItem(sb, Action.LEAVE, NO_SERIES_REASON, ident)
     notes: list[str] = []
     ai_used = False
+
+    # 0. Same series and number, with the title or an author in common: proof, so
+    # looked up first; a match decides the book and nothing else is checked (no AI
+    # either). Unrelated books at the same number go through the other checks.
+    if ident.series is not None:
+        candidates = _lookup(index, [_series_key(ident)])
+        clash = next((c for c in candidates if not _series_agrees(ident, c.identity)), None)
+        candidates = [c for c in candidates if _series_agrees(ident, c.identity)]
+        if clash is not None and not candidates:
+            notes.append(f"same series and number as {clash.book.label()!r}, but another title "
+                         "and authors: not taken as a duplicate")
+        if candidates:
+            decision = decide(ident, [c.identity for c in candidates])
+            return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used)
 
     def enrich(book: Book, i: Identity, need: Callable[[Identity], bool]) -> tuple[Identity, list[str]]:
         i, n = resolver.enrich(book, i, need)
@@ -1042,17 +1065,8 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
                 break
 
     if decision.verdict is Verdict.DUPLICATE:
-        cand = candidates[decision.match_index]
-        # A cover overruling the metadata: the same book, but its files may be
-        # another edition's; nothing is added to the other copy (Trash only).
-        missing = [] if override else [f for f in sb.formats if f not in cand.formats and f != "PDF"]
-        cand.formats.update(missing)  # later duplicates must not add the same format again
-        reason = f"duplicate of {cand.book.label()!r} ({decision.reason})"
-        if missing:
-            reason += f"; adding {', '.join(missing)} to target copy"
-        return _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=cand.book,
-                                match_planned=cand.planned, add_formats=missing, ai_used=ai_used,
-                                by_cover=by_cover))
+        return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used,
+                               by_cover, override)
     if decision.verdict is Verdict.DISTINCT:
         action = Action.LEAVE if same_library else Action.MOVE
         reason = (f"different from existing books: {decision.reason}" if same_library
@@ -1063,6 +1077,21 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
         sb, Action.LEAVE,
         _join(f"same title/authors as {candidates[0].book.label()!r} but {decision.reason}", notes),
         ident, match=candidates[0].book, match_planned=candidates[0].planned, ai_used=ai_used))
+
+
+def _duplicate_item(sb: Book, ident: Identity, cand: _Candidate, why: str, notes: list[str], ai_used: bool,
+                    by_cover: bool = False, override: bool = False) -> PlanItem:
+    """`sb` is a duplicate of `cand`: to trash, adding the formats the kept copy lacks.
+    `override`: a cover overruling the metadata; the same book, but its files may be
+    another edition's, so nothing is added to the other copy (Trash only)."""
+    missing = [] if override else [f for f in sb.formats if f not in cand.formats and f != "PDF"]
+    cand.formats.update(missing)  # later duplicates must not add the same format again
+    reason = f"duplicate of {cand.book.label()!r} ({why})"
+    if missing:
+        reason += f"; adding {', '.join(missing)} to target copy"
+    return _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=cand.book,
+                            match_planned=cand.planned, add_formats=missing, ai_used=ai_used,
+                            by_cover=by_cover))
 
 
 def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolver: AIResolver | None,
