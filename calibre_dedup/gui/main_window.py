@@ -28,6 +28,7 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -60,13 +61,15 @@ from ..planner import (
 )
 from ..report import write_csv
 from ..selection import (
-    FILTER_LABELS, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
+    FILTER_LABELS, MERGE, MERGE_LABEL, SelectionStore, action_label, actionable, blocked, blocked_reason,
     can_override, checkable, is_changed, runs_main_action, filter_key, mergeable_formats, override, revert,
     revert_all,
 )
 from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
 from ..version import app_version
 from .cover_preview import CoverPreview
+from .filters import STATUS_ENTRIES, STATUS_TIP, Entry, FilterButton, showing_text, status_keys
+from .filters import filter_row as make_filter_row
 from .icons import DEDUP, app_icon, set_taskbar_identity
 from .settings_dialog import SettingsDialog
 from .style import BLUE, GREEN, RED, button_css, mark_inactive, set_running, style_none_item
@@ -457,16 +460,55 @@ class PlanModel(QAbstractTableModel):
         return None
 
 
+LEAVE_UNIQUE = "leave_unique"
+ACTION_ENTRIES: list[Entry] = [
+    (Action.MOVE.value, FILTER_LABELS[Action.MOVE.value], "Books copied to the target library on Execute."),
+    (MERGE, FILTER_LABELS[MERGE], "Duplicates whose missing formats are added to the kept copy, then trashed."),
+    (Action.TRASH.value, FILTER_LABELS[Action.TRASH.value], "Duplicates moved to the trash library on Execute."),
+    (LEAVE_UNIQUE, "Leave: no duplicate", "Left in place: no other book has the same title and authors "
+                                          "(or only other editions)."),
+    (Action.LEAVE.value, "Leave: to check", "Left in place but undecided: a possible duplicate, or title and "
+                                            "authors could not be read."),
+]
+BOOK_ENTRIES: list[Entry] = [
+    ("ai", "AI used", "The AI read the book (or compared covers or authors) to decide it."),
+    ("formats", "Adds formats", "Its formats the kept copy lacks are added to it before the trash."),
+    ("reduced", "Reduced checks", "Decided with fewer checks than the settings ask for (no Image AI, AI off or "
+                                  "stopped): analyze again once that is fixed."),
+    ("cover", "Decided by cover", "Duplicates proven by the same cover: check those whose metadata differ."),
+    ("unreadable", "Unreadable files", "Files Calibre can't open (a format it doesn't read, a fake PDF)."),
+    ("archives", "Archives", "Books stored as RAR/ZIP/7Z: their archive can be unpacked on Execute."),
+    ("swapped", "Title/author swapped", "Title and author were swapped in Calibre: the list shows them put "
+                                        "right."),
+    ("other", "Other books", "Books that match none of the entries above."),
+]
+
+
+def action_key(it: PlanItem) -> str:
+    key = filter_key(it)
+    return LEAVE_UNIQUE if key == Action.LEAVE.value and has_no_duplicate(it) else key
+
+
+def book_kinds(it: PlanItem) -> set[str]:
+    kinds = {k for k, on in (("ai", it.ai_used), ("formats", it.add_formats), ("reduced", it.skipped),
+                             ("cover", it.by_cover), ("unreadable", it.bad_formats), ("archives", it.archives),
+                             ("swapped", it.swapped)) if on}
+    return kinds or {"other"}
+
+
+def is_checked(it: PlanItem) -> bool:
+    return it.selected and checkable(it)
+
+
 class PlanFilter(QSortFilterProxyModel):
-    """Free-text search (all words must match) plus action and quick toggles."""
+    """The search (all words must match) and the Actions, Books and Status lists (see filters.py)."""
 
     def __init__(self):
         super().__init__()
         self.terms: list[str] = []
-        self.action = ""
-        self.ai_only = self.formats_only = self.checked_only = self.failed_only = self.reduced_only = False
-        self.cover_only = self.unreadable_only = self.archive_only = self.swapped_only = False
-        self.hide_unique = True
+        self.actions: set[str] = set()
+        self.kinds: set[str] = set()
+        self.states: set[str] = set()
 
     def update(self, **kw):
         for k, v in kw.items():
@@ -480,28 +522,11 @@ class PlanFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent):
         model: PlanModel = self.sourceModel()
         it = model.items[row]
-        if self.action and filter_key(it) != self.action:
+        if self.actions and action_key(it) not in self.actions:
             return False
-        if self.ai_only and not it.ai_used:
+        if self.kinds and not (self.kinds & book_kinds(it)):
             return False
-        if self.formats_only and not it.add_formats:
-            return False
-        if self.checked_only and not (it.selected and checkable(it)):
-            return False
-        if self.failed_only and not it.status.startswith("FAILED"):
-            return False
-        if self.reduced_only and not it.skipped:
-            return False
-        if self.cover_only and not it.by_cover:
-            return False
-        if self.unreadable_only and not it.bad_formats:
-            return False
-        if self.archive_only and not it.archives:
-            return False
-        if self.swapped_only and not it.swapped:
-            return False
-        # Same library: books with no duplicate are usually most of the list.
-        if self.hide_unique and model.plan is not None and model.plan.same_library and has_no_duplicate(it):
+        if self.states and not (self.states & status_keys(is_checked(it), it.status)):
             return False
         if self.terms:
             hay = strip_accents(" ".join(str(x) for x in model.values(it)[1:7])).casefold()
@@ -778,49 +803,32 @@ class MainWindow(QMainWindow):
         self._search_timer.timeout.connect(
             lambda: self.proxy.update(terms=strip_accents(self.search.text()).casefold().split()))
         self.search.textChanged.connect(self._search_timer.start)
-        self.action_filter = _compact(QComboBox(), 12)
-        self._fill_action_filter(False)
-        self.action_filter.currentIndexChanged.connect(
-            lambda: self.proxy.update(action=self.action_filter.currentData()))
-        self.toggles = {}
-        for attr, label in [("ai_only", "AI used"), ("formats_only", "Adds formats"),
-                            ("checked_only", "Only checked"), ("failed_only", "Only failed"),
-                            ("reduced_only", "Reduced checks"), ("cover_only", "Decided by cover"),
-                            ("unreadable_only", "Unreadable files"), ("archive_only", "Archives"),
-                            ("swapped_only", "Title/author swapped")]:
-            box = QCheckBox(label)
-            box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
-            self.toggles[attr] = box
-        self.toggles["archive_only"].setToolTip(ARCHIVES_TIP)
-        self.toggles["swapped_only"].setToolTip(
-            "Books whose title and author were swapped in Calibre (\"Kingston\" by \"The Log House by the Lake\"):\n"
-            "the list shows them put right. Tick one to write that on Execute (tagged TitleAuthorSwapped).")
-        self.toggles["reduced_only"].setToolTip(
-            "Books decided with fewer checks than the settings ask for: the cover check or year re-check\n"
-            "could not run (no Image AI, AI off), or an AI stopped responding during the analysis.\n"
-            "Analyze again once that is fixed (answers already received are cached).")
-        self.toggles["unreadable_only"].setToolTip(
-            "Books with files Calibre can't open (a format it doesn't read, a fake PDF, a file that\n"
-            "fails to open). Only such files: Trash, to the trash library. Some: the Formats column says\n"
-            "whether they go to the trash library (right-click to change); the book keeps the others.")
-        self.toggles["cover_only"].setToolTip(
-            "Duplicates proven by the same cover. With 'Always compare covers', also books whose\n"
-            "metadata differ (year, publisher, edition): check them before executing.")
-        self.hide_unique = QCheckBox("Hide books with no duplicate")
-        self.hide_unique.setToolTip("Same-library analysis: hide books left in the library because no other "
-                                    "book has the same title and authors.")
-        self.hide_unique.setChecked(self.proxy.hide_unique)
-        self.hide_unique.toggled.connect(lambda on: self.proxy.update(hide_unique=on))
-        self.hide_unique.setVisible(False)
+        items = lambda: self.model.items  # noqa: E731
+        self.action_filter = FilterButton(
+            "Actions", "Actions: show the books with any of the actions ticked here. Nothing ticked: all books.\n"
+                       "Same library: 'Leave: no duplicate' (usually most books) starts unticked.",
+            ACTION_ENTRIES, lambda: Counter(action_key(it) for it in items()))
+        self.book_filter = FilterButton(
+            "Books", "Books: show the kinds of book ticked here (any of them). Nothing ticked: all books.\n"
+                     "A book can be of several kinds: it is shown if any of them is ticked.",
+            BOOK_ENTRIES, lambda: Counter(k for it in items() for k in book_kinds(it)))
+        self.status_filter = FilterButton(
+            "Status", STATUS_TIP, STATUS_ENTRIES,
+            lambda: Counter(k for it in items() for k in status_keys(is_checked(it), it.status)))
+        self._filter_same_library: bool | None = None
+        self._set_action_entries(False)
+        self.action_filter.changed.connect(lambda: self.proxy.update(actions=self.action_filter.selected()))
+        self.book_filter.changed.connect(lambda: self.proxy.update(kinds=self.book_filter.selected()))
+        self.status_filter.changed.connect(lambda: self.proxy.update(states=self.status_filter.selected()))
         clear = QPushButton("Clear filters")
+        clear.setToolTip("Show every book: clear the search and untick all three lists.")
         clear.clicked.connect(self._clear_filters)
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(self.search, 1)
-        filter_row.addWidget(self.action_filter)
-        for box in self.toggles.values():
-            filter_row.addWidget(box)
-        filter_row.addWidget(self.hide_unique)
-        filter_row.addWidget(clear)
+        self.showing_label = QLabel()
+        for signal in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset,
+                       self.proxy.layoutChanged):
+            signal.connect(self._update_showing)
+        filter_row = make_filter_row(self.search, [self.action_filter, self.book_filter, self.status_filter],
+                                     clear, self.showing_label)
 
         # bulk selection
         self.check_btn = QPushButton("Check visible")
@@ -1009,18 +1017,15 @@ class MainWindow(QMainWindow):
             y = min(max(self.y(), area.top()), area.top() + area.height() - h - 50)
         self.move(x, y)
 
-    def _fill_action_filter(self, same_library: bool):
-        """List the actions a plan can contain: a same-library plan never moves."""
-        current = self.action_filter.currentData()
-        self.action_filter.blockSignals(True)
-        self.action_filter.clear()
-        self.action_filter.addItem("All actions", "")
-        for key, label in FILTER_LABELS.items():
-            if not (same_library and key == Action.MOVE.value):
-                self.action_filter.addItem(label, key)
-        self.action_filter.setCurrentIndex(max(0, self.action_filter.findData(current)))
-        self.action_filter.blockSignals(False)
-        self.proxy.update(action=self.action_filter.currentData())
+    def _set_action_entries(self, same_library: bool):
+        """List the actions a plan can contain: a same-library plan never moves. When
+        that changes, the Actions list starts again: in one library, books with no
+        duplicate (usually most of them) unticked; between two, everything."""
+        shown = {k for k, _, _ in ACTION_ENTRIES if not (same_library and k == Action.MOVE.value)}
+        self.action_filter.set_shown(shown)
+        if same_library != self._filter_same_library:
+            self._filter_same_library = same_library
+            self.action_filter.set_default(shown - {LEAVE_UNIQUE} if same_library else set())
 
     def _library(self, key: str) -> str:
         return self.lib_boxes[key].currentText().strip()
@@ -1318,10 +1323,11 @@ class MainWindow(QMainWindow):
 
     def _clear_filters(self):
         self.search.clear()
-        self.action_filter.setCurrentIndex(0)
-        for box in self.toggles.values():
-            box.setChecked(False)
-        self.hide_unique.setChecked(False)
+        for button in (self.action_filter, self.book_filter, self.status_filter):
+            button.set_selected(set())
+
+    def _update_showing(self, *_):
+        self.showing_label.setText(showing_text(self.proxy.rowCount(), self.model.rowCount()))
 
     def _append_log(self, text: str, ai: bool):
         if ai:  # kept as plain text (the JSON replies' indentation too), only coloured
@@ -1422,8 +1428,7 @@ class MainWindow(QMainWindow):
         self._eta.reset()
         self.model.start_live(self.plan)
         self._restored = 0
-        self.hide_unique.setVisible(same)
-        self._fill_action_filter(same)
+        self._set_action_entries(same)
         worker = AnalyzeWorker(self.settings, source, target, trash, self.no_cache.isChecked())
         worker.progress.connect(self._on_progress)
         worker.items_ready.connect(self._on_items)
@@ -1492,8 +1497,7 @@ class MainWindow(QMainWindow):
         restored = self._restored  # applied batch by batch as books were decided
         self.plan = plan
         self.model.set_plan(plan)
-        self.hide_unique.setVisible(plan.same_library)
-        self._fill_action_filter(plan.same_library)
+        self._set_action_entries(plan.same_library)
         log.debug("Plan model populated: items=%d", len(plan.items))
         self._finish()
         log.debug("Worker marked finished")

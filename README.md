@@ -118,15 +118,20 @@ Only **ticked** books are acted on. *Move* and *Trash* rows start ticked; *Leave
 be ticked unless you change their action.
 
 - **Filter** with the search box (all words must match, across title, authors, reason and
-  match), by action, or with:
-  - *AI used*, *Adds formats*, *Only checked*, *Only failed*;
-  - *Reduced checks*: books decided with fewer checks than the settings ask for (see
-    [When a setting can't take effect](#when-a-setting-cant-take-effect));
-  - *Decided by cover*: books a cover comparison decided (see *Always compare covers*);
-  - *Unreadable files*: books with files Calibre can't open (see
-    [Files Calibre can't open](#files-calibre-cant-open));
-  - *Hide books with no duplicate* (within one library, on by default): hides the books left
-    in place because no other book shares their title and authors.
+  match) and three drop-down lists. **Within a list, a book is shown if it matches any ticked
+  entry; nothing ticked is no filter. Between the lists, it must pass them all.** Each entry
+  shows how many books it has, and explains itself on mouse-over. A list that filters is
+  coloured, and *Showing X of Y books* says how much of the list is shown. *Clear filters*
+  shows everything.
+  - **Actions:** *Move*, *Merge & Trash*, *Trash only*, *Leave: no duplicate* (no other book
+    shares their title and authors; within one library it starts unticked, as these are
+    usually most books), *Leave: to check* (undecided).
+  - **Books:** *AI used*, *Adds formats*, *Reduced checks* (decided with fewer checks than the
+    settings ask for, see [When a setting can't take effect](#when-a-setting-cant-take-effect)),
+    *Decided by cover* (see *Always compare covers*), *Unreadable files* (see
+    [Files Calibre can't open](#files-calibre-cant-open)), *Archives*, *Title/author swapped*,
+    and *Other books* (none of these). A book can be of several kinds.
+  - **Status:** *Checked*, *Not checked*, *Done*, *Failed* (on Execute).
 - **Tick in bulk:** *Check visible*, *Uncheck visible* and *Invert visible* act on the rows
   the filters show. **Space** toggles the selected rows.
 - **Right-click** a row (or several) to change the action:
@@ -429,8 +434,13 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   suffixes ("Editore", "S.p.A.") are not differences, and a field the AI did not find is
   never proposed: **nothing is erased**. The cover of the selected book is shown on the
   right.
-- **Filters:** *Only with differences* (on by default), *Not read* (books the AI couldn't
-  read: no file, no text, errors), *Only checked*, *Only failed*, *Unreadable files*.
+- **Filters:** the search box and three drop-down lists, combined as in the Duplicate
+  Remover (any ticked entry within a list, all lists together):
+  - **Actions:** *Update*, *Keep*, *Trash*.
+  - **Books:** *With differences* (ticked at the start; also books that Execute changes
+    anyway: sent to the trash, archive unpacked), *Not read* (no file, no text, errors),
+    *Unreadable files*, *Archives*, *Generic cover*, *Other books* (none of these).
+  - **Status:** *Checked*, *Not checked*, *Done*, *Failed*.
 - **Choosing:** books with differences are proposed for **Update** and ticked.
   - The **Change:** boxes turn a field on or off for all books (e.g. never change the
     publisher).
@@ -438,8 +448,10 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     struck through), or sets the action: *Update metadata*, *Keep as it is*, *Move to the
     trash library*; and, for unreadable formats, *Move the unreadable formats to the trash
     library* / *Keep the unreadable formats*.
-  - Right-click → **Ask the AI** reads the selected books again with the Text AI / Image AI
-    selected above (change them first to try another model), never from the cache. Each row
+  - Right-click → **Ask the AI** reads the selected books again, never from the cache: with the
+    Text AI / Image AI selected above, or with any configured AI picked in its submenu (just for
+    this question: the choice above stays as it is). An AI that reads images reads the text and
+    the cover; a text-only one reads the text only. Each row
     is replaced as if this were the first answer, and the answer is cached for that model:
     the other models' answers are kept. Handy for books the AI failed on, or for a second
     opinion; e.g. filter *Not read*, select all, right-click.
@@ -450,7 +462,7 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   first). See [Files Calibre can't open](#files-calibre-cant-open).
 - **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
   the Duplicate Remover (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
-  an unpacked book stays visible with *Only with differences*, since Execute changes it.
+  an unpacked book stays visible with *With differences*, since Execute changes it.
 - **Books with a generic cover** (the same image on books of 3 or more different titles and
   authors, see above) say so in the *Read* column, and Execute tags them **`BadCover`**
   (unless they go to the trash), so you can find them in Calibre later and give them a real

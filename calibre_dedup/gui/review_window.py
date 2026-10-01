@@ -33,6 +33,7 @@ import logging
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import replace
 
 from PySide6.QtCore import (
@@ -62,9 +63,11 @@ from ..review import (
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from ..version import app_version
+from .filters import STATUS_ENTRIES, STATUS_TIP, Entry, FilterButton, showing_text, status_keys
+from .filters import filter_row as make_filter_row
 from .icons import REVIEW, app_icon, set_taskbar_identity
 from .main_window import (
-    AI_LOG_COLOR, ARCHIVES_TIP, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
+    AI_LOG_COLOR, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
     add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, no_cache_box,
     open_file, with_eta,
 )
@@ -260,13 +263,54 @@ class ReviewModel(QAbstractTableModel):
         self.layoutChanged.emit()
 
 
+ACTION_ENTRIES: list[Entry] = [
+    (ReviewAction.UPDATE.value, ACTION_LABELS[ReviewAction.UPDATE], "Books whose proposed values are written on Execute."),
+    (ReviewAction.KEEP.value, ACTION_LABELS[ReviewAction.KEEP], "Books left as they are (tagged reviewed on Execute)."),
+    (ReviewAction.TRASH.value, ACTION_LABELS[ReviewAction.TRASH],
+     "Books moved to the trash library on Execute."),
+]
+BOOK_ENTRIES: list[Entry] = [
+    ("changes", "With differences", "The AI read something different from Calibre's metadata, or Execute changes "
+                                    "the book anyway (trash, unpacking)."),
+    ("unread", "Not read", "The AI could not read the book: no file, no text, or an error."),
+    ("unreadable", "Unreadable files", "Files Calibre can't open (a format it doesn't read, a fake PDF): proposed "
+                                       "for the trash library; the book keeps the others."),
+    ("archives", "Archives", "Books stored as RAR/ZIP/7Z: their archive can be unpacked on Execute."),
+    ("generic", "Generic cover", f"The same cover image as books of other titles and authors: tagged "
+                                 f"{BAD_COVER_TAG} on Execute."),
+    ("other", "Other books", "Books that match none of the entries above."),
+]
+DEFAULT_BOOKS = {"changes"}
+
+
+def book_kinds(it: ReviewItem) -> set[str]:
+    kinds = set()
+    if it.changes or it.action is ReviewAction.TRASH or it.archives_to_unpack:
+        kinds.add("changes")
+    if it.found is None:
+        kinds.add("unread")
+    if it.bad_formats:
+        kinds.add("unreadable")
+    if it.archives:
+        kinds.add("archives")
+    if it.generic_cover:
+        kinds.add("generic")
+    return kinds or {"other"}
+
+
+def is_checked(it: ReviewItem) -> bool:
+    return it.selected and it.action is not ReviewAction.KEEP
+
+
 class ReviewFilter(QSortFilterProxyModel):
+    """The search (all words must match) and the Actions, Books and Status lists (see filters.py)."""
+
     def __init__(self):
         super().__init__()
         self.terms: list[str] = []
-        self.action = ""
-        self.changes_only = True
-        self.unread_only = self.checked_only = self.failed_only = self.unreadable_only = self.archive_only = False
+        self.actions: set[str] = set()
+        self.kinds: set[str] = set(DEFAULT_BOOKS)
+        self.states: set[str] = set()
 
     def update(self, **kw):
         for k, v in kw.items():
@@ -279,22 +323,11 @@ class ReviewFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent):
         model: ReviewModel = self.sourceModel()
         it = model.items[row]
-        if self.action and it.action.value != self.action:
+        if self.actions and it.action.value not in self.actions:
             return False
-        # A book the user sent to the trash, or whose archive is unpacked, stays visible
-        # even without differences: Execute does something to it.
-        if (self.changes_only and not it.changes and it.action is not ReviewAction.TRASH
-                and not it.archives_to_unpack):
+        if self.kinds and not (self.kinds & book_kinds(it)):
             return False
-        if self.unread_only and it.found is not None:
-            return False
-        if self.checked_only and not (it.selected and it.action is not ReviewAction.KEEP):
-            return False
-        if self.failed_only and not it.status.startswith("FAILED"):
-            return False
-        if self.unreadable_only and not it.bad_formats:
-            return False
-        if self.archive_only and not it.archives:
+        if self.states and not (self.states & status_keys(is_checked(it), it.status)):
             return False
         if self.terms:
             hay = strip_accents(" ".join(model.text(it, c) for c in range(1, len(model.HEADERS)))).casefold()
@@ -570,37 +603,29 @@ class ReviewWindow(QMainWindow):
         self._search_timer.timeout.connect(
             lambda: self.proxy.update(terms=strip_accents(self.search.text()).casefold().split()))
         self.search.textChanged.connect(self._search_timer.start)
-        self.action_filter = _compact(QComboBox(), 10)
-        self.action_filter.addItem("All actions", "")
-        for action, label in ACTION_LABELS.items():
-            self.action_filter.addItem(label, action.value)
-        self.action_filter.currentIndexChanged.connect(
-            lambda: self.proxy.update(action=self.action_filter.currentData()))
-        self.toggles: dict[str, QCheckBox] = {}
-        for attr, label, tip in [
-            ("changes_only", "Only with differences", "Hide books where the AI read the same metadata"),
-            ("unread_only", "Not read", "Books the AI could not read (no file, no text, errors)"),
-            ("checked_only", "Only checked", ""),
-            ("failed_only", "Only failed", ""),
-            ("unreadable_only", "Unreadable files",
-             "Books with files Calibre can't open (a format it doesn't read, a fake PDF, a file that fails to\n"
-             "open). Only such files: proposed for the trash. Some: the whole record is copied to the trash\n"
-             "library as it is, then those files are removed from the book (right-click to keep them)."),
-            ("archive_only", "Archives", ARCHIVES_TIP),
-        ]:
-            box = QCheckBox(label)
-            box.setToolTip(tip)
-            box.setChecked(getattr(self.proxy, attr))
-            box.toggled.connect(lambda on, a=attr: self.proxy.update(**{a: on}))
-            self.toggles[attr] = box
+        items = lambda: self.model.items  # noqa: E731
+        self.action_filter = FilterButton(
+            "Actions", "Actions: show the books with any of the actions ticked here. Nothing ticked: all books.",
+            ACTION_ENTRIES, lambda: Counter(it.action.value for it in items()))
+        self.book_filter = FilterButton(
+            "Books", "Books: show the kinds of book ticked here (any of them). Nothing ticked: all books.\n"
+                     "A book can be of several kinds: it is shown if any of them is ticked.",
+            BOOK_ENTRIES, lambda: Counter(k for it in items() for k in book_kinds(it)), default=DEFAULT_BOOKS)
+        self.status_filter = FilterButton(
+            "Status", STATUS_TIP, STATUS_ENTRIES,
+            lambda: Counter(k for it in items() for k in status_keys(is_checked(it), it.status)))
+        self.action_filter.changed.connect(lambda: self.proxy.update(actions=self.action_filter.selected()))
+        self.book_filter.changed.connect(lambda: self.proxy.update(kinds=self.book_filter.selected()))
+        self.status_filter.changed.connect(lambda: self.proxy.update(states=self.status_filter.selected()))
         clear = QPushButton("Clear filters")
+        clear.setToolTip("Show every book: clear the search and untick all three lists.")
         clear.clicked.connect(self._clear_filters)
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(self.search, 1)
-        filter_row.addWidget(self.action_filter)
-        for box in self.toggles.values():
-            filter_row.addWidget(box)
-        filter_row.addWidget(clear)
+        self.showing_label = QLabel()
+        for signal in (self.proxy.rowsInserted, self.proxy.rowsRemoved, self.proxy.modelReset,
+                       self.proxy.layoutChanged):
+            signal.connect(self._update_showing)
+        filter_row = make_filter_row(self.search, [self.action_filter, self.book_filter, self.status_filter],
+                                     clear, self.showing_label)
 
         # bulk selection
         self.check_btn = QPushButton("Check visible")
@@ -878,11 +903,16 @@ class ReviewWindow(QMainWindow):
         if items:
             menu.addSeparator()
             readable = [i for i in items if i.book.formats and not i.broken]
-            # with the Text AI / Image AI selected above, never from the cache
-            act = menu.addAction(f"Ask the AI ({len(readable)})" if len(items) > 1 else "Ask the AI")
-            act.setEnabled(bool(readable) and self.worker is None and not self.model.locked
+            # never from the cache: with the AIs selected above, or with one picked here
+            ask = menu.addMenu(f"Ask the AI ({len(readable)})" if len(items) > 1 else "Ask the AI")
+            ask.setEnabled(bool(readable) and self.worker is None and not self.model.locked
                            and self.result is not None)
-            act.triggered.connect(lambda _=False, r=readable: self._ask_ai(r))
+            for label, name in self._ask_choices():
+                act = ask.addAction(label)
+                act.triggered.connect(lambda _=False, r=readable, n=name: self._ask_ai(r, n))
+                if name is None:
+                    act.setEnabled(bool(self.text_box.currentData()))
+                    ask.addSeparator()
         if items and self._can_edit():
             menu.addSeparator()
             for action, label in ((ReviewAction.UPDATE, "Update metadata"), (ReviewAction.KEEP, "Keep as it is"),
@@ -941,9 +971,11 @@ class ReviewWindow(QMainWindow):
 
     def _clear_filters(self):
         self.search.clear()
-        self.action_filter.setCurrentIndex(0)
-        for box in self.toggles.values():
-            box.setChecked(False)
+        for button in (self.action_filter, self.book_filter, self.status_filter):
+            button.set_selected(set())
+
+    def _update_showing(self, *_):
+        self.showing_label.setText(showing_text(self.proxy.rowCount(), self.model.rowCount()))
 
     def _append_log(self, text: str, ai: bool):
         style = "white-space:pre-wrap"
@@ -953,14 +985,14 @@ class ReviewWindow(QMainWindow):
         self.log_view.appendHtml(f"<span style='{style}'>{html.escape(text)}</span>")
 
     # --- scan ------------------------------------------------------------------------------
-    def _preflight_ok(self) -> bool:
-        s = self.settings
+    def _preflight_ok(self, settings: Settings | None = None, warn_no_image: bool = True) -> bool:
+        s = settings or self.settings
         if not s.use_ai or s.profile() is None:
             QMessageBox.warning(self, "No AI", "The review reads every book with the AI: choose a Text AI "
                                                "(and, to read covers, an Image AI).")
             return False
         problems = []
-        if s.image_ai() is None:
+        if warn_no_image and s.image_ai() is None:
             problems.append("No Image AI: covers and scanned PDFs won't be read, only the text of the first pages.")
         checked = set()
         for role, p in (("Text AI", s.profile()), ("Image AI", s.image_ai())):
@@ -1083,19 +1115,38 @@ class ReviewWindow(QMainWindow):
         for reason in result.ai_down:
             log.warning("Review: %s", reason)
 
-    def _ask_ai(self, items: list[ReviewItem]):
+    def _ask_choices(self) -> list[tuple[str, str | None]]:
+        """The entries of the Ask the AI menu: (label, profile name), None for the AIs selected above."""
+        text, image = self.text_box.currentData(), self.image_box.currentData()
+        above = "With the AIs selected above"
+        if text:
+            above += f" ({text}" + (f" + {image}" if image and image != text else "") + ")"
+        return [(above, None)] + [(self._profile_label(p) + (" · text and covers" if p.vision else " · text only"),
+                                   p.name) for p in self.settings.profiles]
+
+    def _ask_settings(self, profile: str | None) -> Settings:
+        """The settings to ask with: those selected above, or this one profile alone (for the text,
+        and for the covers too when it reads images). The choice above is left as it is."""
+        if profile is None:
+            return replace(self.settings)
+        return replace(self.settings, text_profile=profile,
+                       image_profile=profile if (p := self.settings.profile(profile)) and p.vision else "")
+
+    def _ask_ai(self, items: list[ReviewItem], profile: str | None = None):
         self._sync_settings()
-        if not self._preflight_ok():
+        settings = self._ask_settings(profile)
+        if not self._preflight_ok(settings, warn_no_image=profile is None):
             return
         self._eta.reset()
-        worker = AskWorker(replace(self.settings), items, self.no_cache.isChecked())
+        worker = AskWorker(settings, items, self.no_cache.isChecked())
         worker.progress.connect(self._on_progress)
         worker.replaced.connect(self._on_replaced)
         worker.asked.connect(self._ask_done)
         worker.failed.connect(self._worker_failed)
         worker.ai_down.connect(self._on_ai_down)
         self._start(worker, "ask")
-        log.info("Asking the AI about %d books", len(items))
+        log.info("Asking the AI about %d books (%s)", len(items),
+                 " + ".join(dict.fromkeys(n for n in (settings.text_profile, settings.image_profile) if n)))
 
     def _on_replaced(self, old: ReviewItem, new: ReviewItem):
         self.model.replace(old, new)
