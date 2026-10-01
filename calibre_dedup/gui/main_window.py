@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import perf, tempdirs
+from ..awake import keep_awake
 from ..ai import AICache
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
@@ -594,6 +595,10 @@ class AnalyzeWorker(QThread, UnpackQuestion):
         self._answered.set()
 
     def run(self):
+        with keep_awake():  # no idle sleep halfway through the run
+            self._run()
+
+    def _run(self):
         resolver = None
         try:
             resolver = make_resolver(self.settings, on_down=self.ask,
@@ -645,6 +650,10 @@ class ExecuteWorker(QThread):
         self.cancel = threading.Event()
 
     def run(self):
+        with keep_awake():  # no idle sleep halfway through the run
+            self._run()
+
+    def _run(self):
         try:
             ok, failed = execute_plan(
                 self.plan, require_calibre_dir(self.settings), self.settings.update_metadata,

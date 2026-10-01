@@ -45,8 +45,10 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
 )
 
+from ..awake import keep_awake
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import OLLAMA, Settings, config_dir, load_review_settings
+from ..covers import BAD_COVER_TAG
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG
 from ..extract import TextExtractor
@@ -55,8 +57,8 @@ from ..library_use import LibraryInUse, LibraryUse, execution_conflicts, same_li
 from ..normalize import strip_accents
 from ..review import (
     ACTION_LABELS, FIELD_LABELS, FIELDS, ReviewAction, ReviewItem, ReviewResult, Reviewer, book_cover_file,
-    REVIEW_CACHE_FILE, REVIEWED_TAG, check_libraries, current_value, execute_review, format_value, is_reviewed,
-    review_actions, review_cache, scan_library, summary, write_run_csv,
+    REVIEW_CACHE_FILE, REVIEWED_TAG, ask_ai, check_libraries, current_value, execute_review, format_value,
+    is_reviewed, review_actions, review_cache, scan_library, summary, write_run_csv,
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from .main_window import (
@@ -120,6 +122,17 @@ class ReviewModel(QAbstractTableModel):
         self.items = [i for i in self.items if id(i) not in ids]
         self._rows = {id(it): row for row, it in enumerate(self.items)}
         self.endResetModel()
+
+    def replace(self, old: ReviewItem, new: ReviewItem):
+        """Show `new` in the row of `old` (the AI was asked again)."""
+        row = self._rows.pop(id(old), None)
+        if row is None:
+            return
+        self.items[row] = new
+        self._rows[id(new)] = row
+        self._sorted = False
+        self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.HEADERS) - 1))
+        self.selection_changed.emit()
 
     def refresh(self):
         if self.items:
@@ -357,6 +370,10 @@ class ScanWorker(QThread, UnpackQuestion):
         self._answered.set()
 
     def run(self):
+        with keep_awake():  # no idle sleep halfway through the run
+            self._run()
+
+    def _run(self):
         reviewer = None
         try:
             reviewer = make_resolver(self.settings, on_down=self.ask, cls=Reviewer,
@@ -390,6 +407,33 @@ class ScanWorker(QThread, UnpackQuestion):
                 reviewer.extractor.close()
 
 
+class AskWorker(ScanWorker):
+    """Asks the AI again about some books of the review shown (review.ask_ai)."""
+    replaced = Signal(object, object)  # old item, new item
+    asked = Signal(int)  # books done
+
+    def __init__(self, settings: Settings, items: list[ReviewItem], no_cache: bool = False):
+        super().__init__(settings, "", "", no_cache)
+        self.items = items
+
+    def _run(self):
+        reviewer = None
+        try:
+            reviewer = make_resolver(self.settings, on_down=self.ask, cls=Reviewer,
+                                     cache=review_cache(self.no_cache))
+            if reviewer is None:
+                raise RuntimeError("Asking the AI needs one: choose a Text AI (or an Image AI).")
+            done = ask_ai(reviewer, self.items, self.progress.emit, self.cancel, self.replaced.emit)
+            self.asked.emit(len(done))
+        except Exception as e:
+            log.exception("Asking the AI failed")
+            self.failed.emit(str(e))
+        finally:
+            if reviewer:
+                reviewer.cache.save()
+                reviewer.extractor.close()
+
+
 class ExecuteWorker(QThread):
     result = Signal(object)
     finished_ok = Signal(int, int, int)
@@ -401,6 +445,10 @@ class ExecuteWorker(QThread):
         self.cancel = threading.Event()
 
     def run(self):
+        with keep_awake():  # no idle sleep halfway through the run
+            self._run()
+
+    def _run(self):
         try:
             ok, failed, tagged = execute_review(
                 self.review, self.fields_on, require_calibre_dir(self.settings), self.settings.delete_permanently,
@@ -562,7 +610,8 @@ class ReviewWindow(QMainWindow):
         bulk_row.addWidget(self.check_btn)
         bulk_row.addWidget(self.uncheck_btn)
         bulk_row.addWidget(_elastic(QLabel(
-            "  Space toggles selected rows · right-click: Update / Keep / Trash, or don't change a field")), 1)
+            "  Space toggles selected rows · right-click: Update / Keep / Trash, don't change a field, "
+            "or ask the AI again")), 1)
         bulk_row.addWidget(self.checked_label)
 
         # table, cover, log
@@ -680,7 +729,7 @@ class ReviewWindow(QMainWindow):
         self._sync_settings()
         dialog = SettingsDialog(self.settings, self, dedup_options=False,
                                 cache_path=config_dir() / REVIEW_CACHE_FILE,
-                                cache_busy=self.worker is not None and self._operation == "scan")
+                                cache_busy=self.worker is not None and self._operation in ("scan", "ask"))
         try:
             if dialog.exec():
                 self._fill_profiles()
@@ -733,16 +782,18 @@ class ReviewWindow(QMainWindow):
         """Ticks and actions: when idle and while scanning, never while executing."""
         return not self.model.locked and (not self._busy or self._operation == "scan")
 
-    def _counts(self) -> tuple[int, int, int, int, int]:
+    def _counts(self) -> tuple[int, int, int, int, int, int]:
         """(updates, trashes, books only tagged as reviewed, books losing unreadable
-        formats, books whose archive is unpacked) that Execute would do."""
+        formats, books whose archive is unpacked, books tagged BAD_COVER_TAG) that
+        Execute would do."""
         actions = review_actions(self.model.items, self.fields_on)
         updates = sum(1 for a in actions if a["op"] == "set")
         trashes = sum(1 for a in actions if a["op"] == "trash")
-        tags = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag")
+        tags = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag" and a["tag"] == REVIEWED_TAG)
         formats = sum(1 for a in actions if a.get("trash_formats"))
         unpacks = sum(1 for a in actions if a.get("unpack"))
-        return updates, trashes, tags, formats, unpacks
+        covers = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag" and a["tag"] == BAD_COVER_TAG)
+        return updates, trashes, tags, formats, unpacks, covers
 
     def _update_summary(self):
         items = self.model.items
@@ -759,17 +810,18 @@ class ReviewWindow(QMainWindow):
             f"<b style='color:{ACTION_COLORS[ReviewAction.UPDATE]}'>{changed} with differences</b> · "
             f"<b style='color:#e65100'>{unread} not read</b> · {len(items)} books"
             + (f" · {skipped} already {REVIEWED_TAG}" if skipped else ""))
-        updates, trashes, tags, formats, unpacks = self._counts()
+        updates, trashes, tags, formats, unpacks, covers = self._counts()
         self.checked_label.setText(f"{updates} to update · {trashes} to trash · "
                                    + (f"{formats} losing unreadable formats · " if formats else "")
                                    + (f"{unpacks} archives to unpack · " if unpacks else "")
-                                   + f"{updates + tags} to tag {REVIEWED_TAG}")
+                                   + f"{updates + tags} to tag {REVIEWED_TAG}"
+                                   + (f" · {covers} {BAD_COVER_TAG}" if covers else ""))
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
                                  else f"2. Execute and mark reviewed ({updates + trashes + tags})")
         set_running(self.execute_btn, executing)
         self.execute_btn.setEnabled(not self._busy and self.worker is None and self.result is not None
-                                    and bool(updates + trashes + tags + formats + unpacks))
+                                    and bool(updates + trashes + tags + formats + unpacks + covers))
 
     # --- table interaction ------------------------------------------------------------------
     def _visible_items(self) -> list[ReviewItem]:
@@ -821,6 +873,14 @@ class ReviewWindow(QMainWindow):
             act = menu.addAction("Copy proposed title")
             act.triggered.connect(lambda: QApplication.clipboard().setText(item.changes["title"]))
         items = self._selected_items()
+        if items:
+            menu.addSeparator()
+            readable = [i for i in items if i.book.formats and not i.broken]
+            # with the Text AI / Image AI selected above, never from the cache
+            act = menu.addAction(f"Ask the AI ({len(readable)})" if len(items) > 1 else "Ask the AI")
+            act.setEnabled(bool(readable) and self.worker is None and not self.model.locked
+                           and self.result is not None)
+            act.triggered.connect(lambda _=False, r=readable: self._ask_ai(r))
         if items and self._can_edit():
             menu.addSeparator()
             for action, label in ((ReviewAction.UPDATE, "Update metadata"), (ReviewAction.KEEP, "Keep as it is"),
@@ -1021,6 +1081,31 @@ class ReviewWindow(QMainWindow):
         for reason in result.ai_down:
             log.warning("Review: %s", reason)
 
+    def _ask_ai(self, items: list[ReviewItem]):
+        self._sync_settings()
+        if not self._preflight_ok():
+            return
+        self._eta.reset()
+        worker = AskWorker(replace(self.settings), items, self.no_cache.isChecked())
+        worker.progress.connect(self._on_progress)
+        worker.replaced.connect(self._on_replaced)
+        worker.asked.connect(self._ask_done)
+        worker.failed.connect(self._worker_failed)
+        worker.ai_down.connect(self._on_ai_down)
+        self._start(worker, "ask")
+        log.info("Asking the AI about %d books", len(items))
+
+    def _on_replaced(self, old: ReviewItem, new: ReviewItem):
+        self.model.replace(old, new)
+        if self.result is not None:
+            self.result.items = [new if i is old else i for i in self.result.items]
+
+    def _ask_done(self, count: int):
+        self._finish()
+        msg = f"The AI was asked again about {count} books"
+        self.status_label.setText(msg)
+        log.info(msg)
+
     def _on_unpack_asked(self, count: int):
         worker = self.worker
         if not isinstance(worker, ScanWorker):
@@ -1056,7 +1141,7 @@ class ReviewWindow(QMainWindow):
         self._sync_settings()
         if not self._execution_libraries_ok():
             return
-        updates, trashes, tags, formats, unpacks = self._counts()
+        updates, trashes, tags, formats, unpacks, covers = self._counts()
         if (trashes or formats or unpacks) and not self.result.trash_library:
             QMessageBox.warning(self, "No trash library", "Choose a trash library to move books to it.")
             return
@@ -1077,6 +1162,8 @@ class ReviewWindow(QMainWindow):
                 f"{AI_UPDATED_TAG}.\n"
                 + (f"The {unread} books the AI could not read are not tagged: the next analysis tries them again.\n"
                    if unread else "")
+                + (f"{covers} books with a generic cover (the same image on books of different titles) are "
+                   f"tagged {BAD_COVER_TAG}, to find them a real cover in Calibre.\n" if covers else "")
                 + "\nContinue?") != QMessageBox.Yes:
             return
         self.model.locked = True

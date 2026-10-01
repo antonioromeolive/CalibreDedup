@@ -34,6 +34,12 @@ import sys
 
 
 def run_cli(argv: list[str]) -> int:
+    from .awake import keep_awake
+    with keep_awake():  # no idle sleep halfway through an unattended run
+        return _run_cli(argv)
+
+
+def _run_cli(argv: list[str]) -> int:
     from . import perf, tempdirs
     from .ai import AICache
     from .config import config_dir, load_review_settings

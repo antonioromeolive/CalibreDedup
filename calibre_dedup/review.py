@@ -48,6 +48,7 @@ from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadat
 from .executor import AI_UPDATED_TAG, ExecutionError, run_bridge
 from .calibre_env import calibre_is_running
 from .config import config_dir
+from .covers import BAD_COVER_TAG, cover_file, generic_covers, generic_note
 from .extract import cover_png, unreadable_formats
 from .library import LibraryError, read_books
 from .models import Book
@@ -95,6 +96,9 @@ class ReviewItem:
     # The book's archives (archives.Unpack): unpacked on Execute when their `unpack` is on,
     # whatever the book's action (unless the whole book goes to the trash).
     archives: list = field(default_factory=list)
+    # Its cover.jpg is a generic cover shown by this many books (covers.py), else 0:
+    # tagged BAD_COVER_TAG on Execute, unless the book goes to the trash.
+    generic_cover: int = 0
 
     @property
     def archives_to_unpack(self) -> list:
@@ -231,6 +235,8 @@ class Reviewer(AIResolver):
     Image AI, every book is sent to it (it reads text too), else to the text AI.
     Errors and "AI not responding" are handled as in the analysis (AIResolver)."""
 
+    fresh = False  # always ask the AI, never answer from the cache (the answer is still cached)
+
     def review(self, book: Book) -> tuple[ReviewMetadata | None, str]:
         picked = self.extractor.pick_format(book.formats)
         if not picked:
@@ -246,7 +252,7 @@ class Reviewer(AIResolver):
         if not vision and book_cover_file(book) is not None:
             cover_note = "cover not read: no Image AI"
         key = self._key(book, fmt, path, cover)
-        cached = self.cache.get(key)
+        cached = None if self.fresh else self.cache.get(key)
         if cached is not None:
             self.stats["read_cached"] += 1
             return ReviewMetadata(**cached), _join(f"{fmt} first pages" + (" + cover" if cover else "")
@@ -381,6 +387,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     of the n books that have one (see archives.ask_once); None: archives are read as they are."""
     check_libraries(library, trash)
     books = read_books(library)
+    generic = generic_covers(books)  # over the whole library: reviewed books show the image too
     skipped = sum(1 for b in books if is_reviewed(b)) if skip_reviewed else 0
     if skipped:
         books = [b for b in books if not is_reviewed(b)]
@@ -397,15 +404,8 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
         perf.book(n + 1)
         if progress:
             progress(n, len(books), f"Reading {book.label()}")
-        seen, archives = unpack_archives(book, reviewer.extractor, unpack) if unpack is not None else (book, [])
-        item = _review_book(reviewer, book, seen)
-        if archives:
-            item.archives = archives
-            item.note = _join(item.note, "; ".join(u.note for u in archives))
-        if item.changes:
-            log.info("%s: %s", book.label(), ", ".join(
-                f"{k} {format_value(k, current_value(book, k))!r} -> {format_value(k, v)!r}"
-                for k, v in item.changes.items()))
+        item = _scan_book(reviewer, book, unpack)
+        _mark_generic(item, generic.get(str(cover_file(book)), 0))
         result.items.append(item)
         if on_item:
             on_item(item)
@@ -415,6 +415,61 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     result.stats = dict(reviewer.stats)
     result.ai_down = [r for r in (reviewer.disabled_reason, reviewer.image_disabled_reason) if r]
     return result
+
+
+def ask_ai(reviewer: Reviewer, items: list[ReviewItem],
+           progress: Callable[[int, int, str], None] | None = None,
+           cancel: threading.Event | None = None,
+           on_item: Callable[[ReviewItem, ReviewItem], None] | None = None) -> list[tuple[ReviewItem, ReviewItem]]:
+    """Ask the AI about these books again, never from the cache: each new row is built
+    as if this were the first answer (what the user did to the old row is not kept).
+    Archives are unpacked or not as the old row says. `on_item(old, new)` for each book.
+    Returns the (old, new) pairs done."""
+    done: list[tuple[ReviewItem, ReviewItem]] = []
+    reviewer.fresh = True
+    perf.run_start("review-ask", len(items), reviewer.provider, reviewer.vision)
+    try:
+        for n, old in enumerate(items):
+            if cancel is not None and cancel.is_set():
+                log.info("Asking the AI stopped after %d of %d books", n, len(items))
+                break
+            perf.book(n + 1)
+            if progress:
+                progress(n, len(items), f"Reading {old.book.label()}")
+            decided = {u.path: u.unpack for u in old.archives}
+            unpack = (lambda book, u, d=decided: d.get(u.path, False)) if old.archives else None
+            new = _scan_book(reviewer, old.book, unpack)
+            _mark_generic(new, old.generic_cover)
+            done.append((old, new))
+            if on_item:
+                on_item(old, new)
+    finally:
+        reviewer.fresh = False
+        perf.run_end(len(done), cancel is not None and cancel.is_set())
+    if progress:
+        progress(len(done), len(items), "Done")
+    return done
+
+
+def _mark_generic(item: ReviewItem, count: int) -> None:
+    if count and BAD_COVER_TAG.casefold() not in {t.casefold() for t in item.book.tags}:
+        item.generic_cover = count
+        item.note = _join(item.note, f"{generic_note(count)}: tagged {BAD_COVER_TAG} on Execute")
+
+
+def _scan_book(reviewer: Reviewer, book: Book,
+               unpack: Callable[[Book, object], bool] | None) -> ReviewItem:
+    """One book of a scan: its archives unpacked as `unpack` says, then read."""
+    seen, archives = unpack_archives(book, reviewer.extractor, unpack) if unpack is not None else (book, [])
+    item = _review_book(reviewer, book, seen)
+    if archives:
+        item.archives = archives
+        item.note = _join(item.note, "; ".join(u.note for u in archives))
+    if item.changes:
+        log.info("%s: %s", book.label(), ", ".join(
+            f"{k} {format_value(k, current_value(book, k))!r} -> {format_value(k, v)!r}"
+            for k, v in item.changes.items()))
+    return item
 
 
 def _review_book(reviewer: Reviewer, book: Book, seen: Book | None = None) -> ReviewItem:
@@ -491,7 +546,8 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
     """Bridge actions: "set" for the checked updates, "trash" (no target) for the
     checked trash, and one "tag" with every other reviewed book: updated or not,
     each book of the scan is tagged REVIEWED_TAG ("set" tags its book too, and
-    AI_UPDATED_TAG when a field is written). Not the
+    AI_UPDATED_TAG when a field is written); last, one "tag" BAD_COVER_TAG with the
+    books showing a generic cover, unless they go to the trash. Not the
     books the AI couldn't read (unless the user chose Keep): the next scan tries
     them again. "trash_formats": the formats Calibre can't open go first (the whole
     record is copied to the trash library as it is), on their own for a book with
@@ -527,6 +583,10 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
         actions.append({**base, "op": "set", "set": values, "tag": REVIEWED_TAG, "updated_tag": AI_UPDATED_TAG})
     if tag_ids:
         actions.append({"op": "tag", "src_ids": tag_ids, "tag": REVIEWED_TAG})
+    bad_covers = [it.book.id for it in items
+                  if it.generic_cover and not (it.selected and it.action is ReviewAction.TRASH)]
+    if bad_covers:
+        actions.append({"op": "tag", "src_ids": bad_covers, "tag": BAD_COVER_TAG})
     return actions
 
 
@@ -573,6 +633,16 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
 
     def on_message(msg: dict) -> None:
         nonlocal ok, failed, tagged
+        if msg["event"] == "tagged" and msg.get("tag") == BAD_COVER_TAG:  # a mark only: the rows keep their status
+            if msg["ok"]:
+                for sid in msg["src_ids"]:
+                    items[sid].book.tags = set(items[sid].book.tags) | {BAD_COVER_TAG}
+                    items[sid].generic_cover = 0
+                log.info("%d book(s) with a generic cover %s", len(msg["src_ids"]), msg["msg"])
+            else:
+                failed += len(msg["src_ids"])
+                log.error("Tagging %s failed: %s", BAD_COVER_TAG, msg.get("trace") or msg["msg"])
+            return
         if msg["event"] == "tagged":
             if msg["ok"]:
                 tagged += len(msg["src_ids"])

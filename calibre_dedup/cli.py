@@ -31,6 +31,7 @@ import sys
 
 from . import perf, tempdirs
 from .ai import AICache
+from .awake import keep_awake
 from .config import Settings, config_dir
 from .executor import execute_plan
 from .library_use import LibraryInUse, LibraryUse
@@ -41,6 +42,11 @@ from .session import make_resolver, require_calibre_dir
 
 
 def run(argv: list[str]) -> int:
+    with keep_awake():  # no idle sleep halfway through an unattended run
+        return _run(argv)
+
+
+def _run(argv: list[str]) -> int:
     for stream in (sys.stdout, sys.stderr):  # titles may not fit the console code page
         stream.reconfigure(errors="replace")
     settings = Settings.load()

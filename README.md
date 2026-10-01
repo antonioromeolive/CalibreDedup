@@ -66,6 +66,12 @@ library is created when you choose an empty folder.
 **Both programs at once.** Analyses can run side by side. Executions take turns:
 while one program executes, the other's *Execute* waits until it is done.
 
+**Sleep.** While an analysis or an execution runs (GUI or command line), Windows won't
+go to sleep on its idle timer, so a run left overnight isn't paused halfway. The screen
+may still turn off, and closing the lid or choosing *Sleep* still works. When the run
+ends, the idle timer starts again from zero: the computer sleeps after its usual
+*Sleep after* time.
+
 
 ## Duplicate Remover
 
@@ -221,7 +227,10 @@ In this order; the first rule that decides wins:
    or else the metadata of both. The reason says so, e.g. "same year (2005, read by AI)".
 3. **Still undecided: the covers.** With *Compare covers* on and an Image AI, the same cover
    means a duplicate. Different, unclear or missing covers decide nothing: the book stays in
-   the source.
+   the source. Covers are only compared between books whose title and authors already match
+   (or similar titles by the same author), and a **generic cover** is never proof: the same
+   image on books of 3 or more different titles *and* authors, e.g. the "Microsoft Word 2000"
+   logo a converter took from a document, or a publisher's stock picture.
 
 A duplicate is **Merge & Trash** when it has formats the kept copy lacks (except PDF), which
 are added to the kept copy first; otherwise it is **Trash only**.
@@ -429,6 +438,11 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     struck through), or sets the action: *Update metadata*, *Keep as it is*, *Move to the
     trash library*; and, for unreadable formats, *Move the unreadable formats to the trash
     library* / *Keep the unreadable formats*.
+  - Right-click → **Ask the AI** reads the selected books again with the Text AI / Image AI
+    selected above (change them first to try another model), never from the cache. Each row
+    is replaced as if this were the first answer, and the answer is cached for that model:
+    the other models' answers are kept. Handy for books the AI failed on, or for a second
+    opinion; e.g. filter *Not read*, select all, right-click.
   - *Check visible* / *Uncheck visible* act on the rows the filters show.
 - **Books with no file Calibre can open** (a record without files, or only unreadable ones)
   are proposed for the trash, ticked. A book with some unreadable files is read from the
@@ -437,6 +451,10 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
 - **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
   the Duplicate Remover (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
   an unpacked book stays visible with *Only with differences*, since Execute changes it.
+- **Books with a generic cover** (the same image on books of 3 or more different titles and
+  authors, see above) say so in the *Read* column, and Execute tags them **`BadCover`**
+  (unless they go to the trash), so you can find them in Calibre later and give them a real
+  cover. Nothing else is changed: neither Calibre's cover nor the e-book files.
 
 ### Step 3: Execute
 

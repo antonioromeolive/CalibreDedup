@@ -32,7 +32,7 @@ from calibre_dedup.extract import Excerpt
 from calibre_dedup.models import Book
 from calibre_dedup.review import (
     FIELDS,
-    ReviewAction, ReviewItem, Reviewer, apply_to_book, find_changes, format_value, review_actions, scan_library,
+    ReviewAction, ReviewItem, Reviewer, apply_to_book, ask_ai, find_changes, format_value, review_actions, scan_library,
     summary,
 )
 from tests.test_planner import make_library
@@ -190,6 +190,48 @@ def test_reviewer_reads_once_then_uses_the_cache(tmp_path):
     assert len(text.calls) == 1
     assert first.items[0].changes == second.items[0].changes == {"year": 1965, "series": ("Dune", 1.0)}
     assert "cached" in second.items[0].note
+
+
+def test_asking_the_ai_again_skips_the_cache_and_rebuilds_the_row(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "dune", "text": "x"}])
+    cache = AICache(tmp_path / "cache.json")
+    old = scan_library(lib, "", Reviewer(FakeProvider(""), FakeExtractor(), cache)).items[0]
+    assert old.changes == {}
+    old.set_action(ReviewAction.TRASH)  # what the user did to the old row is not kept
+    text = FakeProvider(REPLY)
+    reviewer = Reviewer(text, FakeExtractor(), cache)
+    seen = []
+    [(was, new)] = ask_ai(reviewer, [old], on_item=lambda a, b: seen.append((a, b)))
+    assert was is old and seen == [(old, new)] and len(text.calls) == 1
+    assert new.changes == {"year": 1965, "series": ("Dune", 1.0)}
+    assert (new.action, new.selected, new.manual) == (ReviewAction.UPDATE, True, False)
+    assert not reviewer.fresh
+    # the new answer is cached: a scan with the same model reuses it
+    again = scan_library(lib, "", reviewer).items[0]
+    assert len(text.calls) == 1 and "cached" in again.note and again.changes == new.changes
+
+
+def test_asking_the_ai_with_another_model_keeps_the_first_models_answer(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "dune", "text": "x"}])
+    cache = AICache(tmp_path / "cache.json")
+    first = FakeProvider(json.dumps({"year": 1970}), name="a")
+    old = scan_library(lib, "", Reviewer(first, FakeExtractor(), cache)).items[0]
+    other = FakeProvider(REPLY, name="b")
+    [(_, new)] = ask_ai(Reviewer(other, FakeExtractor(), cache), [old])
+    assert "year" in new.changes and new.changes["year"] == 1965
+    back = scan_library(lib, "", Reviewer(first, FakeExtractor(), cache)).items[0]
+    assert len(first.calls) == 1 and back.changes == {"year": 1970}
+
+
+def test_asking_the_ai_stops_when_cancelled(tmp_path):
+    import threading
+    lib = make_library(tmp_path / "lib", [{"title": f"Book {i}", "text": "x"} for i in range(3)])
+    cache = AICache(tmp_path / "cache.json")
+    items = scan_library(lib, "", Reviewer(FakeProvider(REPLY), FakeExtractor(), cache)).items
+    cancel = threading.Event()
+    done = ask_ai(Reviewer(FakeProvider(REPLY), FakeExtractor(), cache), items, cancel=cancel,
+                  on_item=lambda *_: cancel.set())
+    assert len(done) == 1
 
 
 def test_with_an_image_ai_the_cover_is_sent_first(tmp_path, monkeypatch):

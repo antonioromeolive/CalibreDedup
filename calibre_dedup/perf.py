@@ -71,7 +71,8 @@ def _describe(provider) -> dict | None:
 
 
 def run_start(program: str, books: int, text_provider=None, image_provider=None) -> None:
-    """A run of `program` ("dedup" or "review") over `books` books begins."""
+    """A run of `program` ("dedup", "review", or "review-ask": the AI asked again
+    about some books) over `books` books begins."""
     global _run, _book
     with _lock:
         if _run is not None:  # the last one ended with an exception

@@ -278,13 +278,13 @@ def main(plan_path):
             if os.path.exists(stop_file):
                 emit(event="stopped")
                 break
-            if action["op"] == "tag":  # calibre-review: the reviewed books with nothing to write
+            if action["op"] == "tag":  # calibre-review: the reviewed books with nothing to write, the bad covers
                 try:
                     ids = [i for i in action["src_ids"] if i in src.all_book_ids()]
                     add_tag(src, ids, action["tag"])
-                    emit(event="tagged", src_ids=ids, ok=True, msg=f"tagged {action['tag']}")
+                    emit(event="tagged", src_ids=ids, tag=action["tag"], ok=True, msg=f"tagged {action['tag']}")
                 except Exception as e:
-                    emit(event="tagged", src_ids=action["src_ids"], ok=False, msg=str(e),
+                    emit(event="tagged", src_ids=action["src_ids"], tag=action["tag"], ok=False, msg=str(e),
                          trace=traceback.format_exc())
                 continue
             sid = action["src_id"]

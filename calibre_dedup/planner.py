@@ -31,7 +31,8 @@ AI is only consulted when metadata is not enough:
   can't be compared from metadata (both books are then enriched).
 It reads the first pages, then the last pages if fields are still missing.
 If that still can't decide, a vision model may compare the two covers: the
-same cover is taken as proof of the same book.
+same cover is taken as proof of the same book, unless it is a generic cover
+(the same image on books of different titles, see covers.py).
 Before any AI call, identical EPUB text proves the same book (copies that
 differ only in metadata or cover).
 """
@@ -55,6 +56,7 @@ from .archives import ask_once, prepare as unpack_archives
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
+from .covers import generic_covers, generic_note
 from .extract import TextExtractor, cover_png, epub_text_digest, unreadable_formats
 from .library import read_books
 from .matcher import Decision, Verdict, compare, decide
@@ -179,6 +181,7 @@ class AIResolver:
         self.disabled_reason = ""
         self.image_errors = 0
         self.image_disabled_reason = ""
+        self.generic: dict[str, int] = {}  # generic covers (covers.generic_covers): never proof
         # What the AI did during the run, for the summary: "read", "read_cached",
         # "cover", "cover_cached", "cover_identical".
         self.stats: Counter[str] = Counter()
@@ -251,6 +254,9 @@ class AIResolver:
         pa, pb = _cover_path(a), _cover_path(b)
         if self.vision is None or not (pa.is_file() and pb.is_file()):
             return False, "", False
+        for book, path in ((a, pa), (b, pb)):
+            if str(path) in self.generic:
+                return False, f"{generic_note(self.generic[str(path)])} on {book.label()}: not proof", False
         if pa.stat().st_size == pb.stat().st_size and pa.read_bytes() == pb.read_bytes():
             self.stats["cover_identical"] += 1
             return True, "identical cover files", False
@@ -667,6 +673,8 @@ def build_plan(
     same_library = str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
     target_books = read_books(target) if Path(target, "metadata.db").is_file() else []
     plan = Plan(source, target, trash, total_books=len(source_books), same_library=same_library)
+    if resolver is not None and (cover_check or always_cover):
+        resolver.generic = generic_covers(source_books + target_books)
 
     index: dict[tuple, list[_Candidate]] = defaultdict(list)
     main_index: dict[tuple, list[_Candidate]] = defaultdict(list)  # subtitle ignored
