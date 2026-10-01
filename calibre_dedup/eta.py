@@ -23,19 +23,20 @@
 """Estimated time left for a long run (analysis, review scan).
 
 Books go at very different speeds: without AI or from the cache in milliseconds,
-with an AI call in seconds or minutes. The rate is therefore measured over the
-last few minutes only (it follows a stretch of AI books, or of cached ones), and
-the shown estimate changes at most every REFRESH seconds, so it doesn't jump.
+with an AI call in seconds or minutes, and the library mixes them (books read by
+an earlier run come from the cache, wherever they are). So the rate is the whole
+run's: time since the first book / books done. A window over the last minutes was
+tried: it follows every stretch (minutes during cached books, hours during scanned
+PDFs) and was further off (loc-ita2 review of 2026-10-01: 56-73% mean error against
+39-58%). Its cost: after a long stretch of cached books it stays too low, until the
+new books outweigh them. The shown estimate changes at most every REFRESH seconds.
 Cheap enough to call for every book: one comparison, sometimes one division.
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 
-WINDOW = 300.0  # seconds of progress the rate is measured over
-SAMPLE_EVERY = 5.0  # seconds between two samples kept for the window
 REFRESH = 10.0  # seconds between two changes of the shown estimate
 MIN_ELAPSED = 20.0  # no estimate before this (the first books say little)
 MIN_DONE = 3
@@ -47,35 +48,29 @@ class Eta:
         self.reset()
 
     def reset(self) -> None:
-        self._samples: deque[tuple[float, int]] = deque()  # (time, books done)
-        self._started = self.clock()
+        self._start: tuple[float, int] | None = None  # (time, books done) at the first book
         self._done = self._total = 0
         self._shown, self._shown_at = "", float("-inf")
 
     def update(self, done: int, total: int) -> None:
-        """Called for every book; keeps a sample only every SAMPLE_EVERY seconds."""
-        now = self.clock()
-        if self._samples and done < self._samples[-1][1]:  # a new run: start again
+        """Called for every book. The clock starts at the first call, so what came
+        before the first book (reading the library, questions) isn't counted."""
+        if self._start is not None and done < self._done:  # a new run: start again
             self.reset()
+        if self._start is None:
+            self._start = (self.clock(), done)
         self._done, self._total = done, total
-        if not self._samples or now - self._samples[-1][0] >= SAMPLE_EVERY:
-            self._samples.append((now, done))
-            while len(self._samples) > 2 and now - self._samples[1][0] >= WINDOW:
-                self._samples.popleft()
 
     def seconds_left(self) -> float | None:
-        now = self.clock()
-        if now - self._started < MIN_ELAPSED or self._done < MIN_DONE or not self._samples:
+        if self._start is None:
+            return None
+        t0, d0 = self._start
+        elapsed, books = self.clock() - t0, self._done - d0
+        if elapsed < MIN_ELAPSED or books < MIN_DONE:
             return None
         if self._done >= self._total:
             return 0.0
-        t0, d0 = self._samples[0]
-        if now - t0 < MIN_ELAPSED:  # the window was just restarted
-            t0, d0 = self._started, 0
-        books = self._done - d0
-        if books <= 0:
-            return None  # nothing finished in the whole window: can't tell
-        return (self._total - self._done) * (now - t0) / books
+        return (self._total - self._done) * elapsed / books
 
     def text(self) -> str:
         """"about 2 h 10 min left", refreshed at most every REFRESH seconds; "" when unknown."""

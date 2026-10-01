@@ -61,6 +61,8 @@ from ..review import (
     is_reviewed, review_actions, review_cache, scan_library, summary, write_run_csv,
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
+from ..version import app_version
+from .icons import REVIEW, app_icon, set_taskbar_identity
 from .main_window import (
     AI_LOG_COLOR, ARCHIVES_TIP, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
     add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, no_cache_box,
@@ -476,7 +478,7 @@ class ReviewWindow(QMainWindow):
         self._status_msg, self._status_since = "", 0.0
         self._eta = Eta()  # time left of the scan
         self.fields_on: set[str] = {f for f in settings.review_fields if f in FIELDS}
-        self.setWindowTitle(self.TITLE)
+        self.setWindowTitle(f"{self.TITLE} {app_version()}")
         self._restore_geometry()
 
         # libraries
@@ -1266,8 +1268,11 @@ class ReviewWindow(QMainWindow):
 def run_review_gui() -> int:
     handler = QtLogHandler()
     configure_logging(handler, "calibre_review.log")
+    set_taskbar_identity(REVIEW)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(ReviewWindow.TITLE)
+    app.setWindowIcon(app_icon(REVIEW))
+    log.info("%s %s", ReviewWindow.TITLE, app_version())
 
     def _excepthook(exc_type, exc, tb):
         log.critical("Unhandled exception", exc_info=(exc_type, exc, tb))

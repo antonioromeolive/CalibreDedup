@@ -38,6 +38,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from .config import config_dir
+from .version import app_version
 
 log = logging.getLogger("calibre_dedup.perf")
 log.setLevel(logging.INFO)
@@ -81,7 +82,7 @@ def run_start(program: str, books: int, text_provider=None, image_provider=None)
                 "ai_seconds": 0.0, "books_with_ai": set(), "input_tokens": 0, "output_tokens": 0,
                 "reasoning_tokens": 0}
         _book = None
-    _write("run_start", program=program, books=books,
+    _write("run_start", program=program, version=app_version(), books=books,
            text_ai=_describe(text_provider), image_ai=_describe(image_provider))
 
 

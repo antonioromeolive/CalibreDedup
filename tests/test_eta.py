@@ -52,12 +52,20 @@ def test_steady_rate():
     assert eta.text() == "about 30 min left"
 
 
-def test_rate_follows_the_last_minutes_not_the_whole_run():
+def test_rate_is_the_whole_runs_average():
     clock = Clock()
     eta = Eta(clock)
-    run(eta, clock, range(1, 5001), 0.01, 6000)  # cached books: fast
-    run(eta, clock, range(5001, 5201), 10, 6000)  # then AI books: 10 s each, for 2000 s
-    assert abs(eta.seconds_left() - 800 * 10) < 800  # not the fast average of the whole run
+    run(eta, clock, range(0, 100), 1, 1100)  # cached and AI books mixed: 1 s each on average
+    run(eta, clock, range(100, 200), 3, 1100)  # a slower stretch doesn't take over
+    assert abs(eta.seconds_left() - 900 * 2) < 60
+
+
+def test_time_before_the_first_book_is_not_counted():
+    clock = Clock()
+    eta = Eta(clock)
+    clock.now = 600  # reading the library, a question to the user
+    run(eta, clock, range(0, 101), 2, 1000)
+    assert abs(eta.seconds_left() - 900 * 2) < 60
 
 
 def test_shown_text_changes_at_most_every_ten_seconds():

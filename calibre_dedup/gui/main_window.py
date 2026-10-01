@@ -65,7 +65,9 @@ from ..selection import (
     revert_all,
 )
 from ..session import analysis_signature, changed_settings, make_resolver, preflight, require_calibre_dir
+from ..version import app_version
 from .cover_preview import CoverPreview
+from .icons import DEDUP, app_icon, set_taskbar_identity
 from .settings_dialog import SettingsDialog
 from .style import BLUE, GREEN, RED, button_css, mark_inactive, set_running, style_none_item
 
@@ -682,7 +684,7 @@ class MainWindow(QMainWindow):
         self._progress_max = 1
         self._status_msg, self._status_since = "", 0.0  # current book, for the seconds counter
         self._eta = Eta()  # time left of the analysis
-        self.setWindowTitle("Calibre Duplicate Remover")
+        self.setWindowTitle(f"Calibre Duplicate Remover {app_version()}")
         self._restore_geometry()
         # Warnings about the shown plan: settings changed since, an AI that stopped
         # responding, checks that could not run. Hidden when there is nothing to say.
@@ -1707,8 +1709,11 @@ def run_gui() -> int:
     handler = QtLogHandler()
     configure_logging(handler, "calibre_dedup.log")
 
+    set_taskbar_identity(DEDUP)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Calibre Duplicate Remover")
+    app.setWindowIcon(app_icon(DEDUP))
+    log.info("Calibre Duplicate Remover %s", app_version())
 
     def _excepthook(exc_type, exc, tb):
         log.critical("Unhandled exception", exc_info=(exc_type, exc, tb))

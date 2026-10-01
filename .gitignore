@@ -11,3 +11,5 @@ dist/
 TODO.md
 .env*
 secrets.json
+calibre_dedup/_version.txt
+calibre_dedup/_version_*.tmp
