@@ -529,8 +529,9 @@ class AIMetadata:
 
 class AICache:
     """JSON cache so repeated analyses don't re-query the model. Shared by every running
-    copy of the program: `save` merges (see there). `off` (for tests): every question
-    goes to the AI and nothing is kept; the cache file is neither read nor written."""
+    copy of the program: `save` merges (see there). `off` (for tests): the saved answers
+    are not used, every question goes to the AI; its answers are still saved (replacing
+    the old ones for the same questions), and reused within this run."""
 
     def __init__(self, path: Path | None = None, off: bool = False):
         self.path = path or config_dir() / "ai_cache.json"
@@ -538,8 +539,8 @@ class AICache:
         self._lock = threading.Lock()
         self._data: dict = {}
         self._new: dict = {}  # answers not saved yet
-        if off:
-            log.info("AI cache off: every question goes to the AI, %s is left as it is", self.path.name)
+        if off:  # _data: only this run's answers
+            log.info("AI cache off: every question goes to the AI, its answers are saved in %s", self.path.name)
             return
         try:
             self._data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -592,11 +593,9 @@ class AICache:
         return hashlib.sha1(f"{a}|{b}".encode()).hexdigest()
 
     def get(self, key: str) -> dict | None:
-        return None if self.off else self._data.get(key)
+        return self._data.get(key)
 
     def put(self, key: str, value: dict) -> None:
-        if self.off:
-            return
         with self._lock:
             if self._data.get(key) != value:
                 self._data[key] = value
@@ -606,9 +605,8 @@ class AICache:
         """Merge this run's new answers into the file: several programs may analyze at
         once, each adding its own. Nothing new, nothing written. Answers the others
         saved meanwhile are taken in too; if the file was cleared, so is this copy
-        (only this run's new answers are written back)."""
-        if self.off:
-            return
+        (only this run's new answers are written back). With `off`, the others' answers
+        are written but not taken in."""
         with self._lock:
             if not self._new:
                 return
@@ -627,7 +625,8 @@ class AICache:
                         tmp.flush()
                         os.fsync(tmp.fileno())
                     os.replace(tmp_name, self.path)
-                self._data = data
+                if not self.off:
+                    self._data = data
                 self._new = {}
             except OSError as e:  # the new answers are kept for the next save
                 log.warning("Could not save AI cache %s: %s", self.path, e)

@@ -67,8 +67,8 @@ def _run_cli(argv: list[str]) -> int:
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer of the review first (review_cache.json)")
     ap.add_argument("--no-cache", action="store_true",
-                    help="don't use the AI cache (for tests): every question goes to the AI, "
-                         "review_cache.json is neither read nor written")
+                    help="don't use the saved AI answers (for tests): every question goes to the AI; "
+                         "the new answers are still saved in review_cache.json")
     ap.add_argument("--unpack", action="store_true",
                     help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are read as they are)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -106,7 +106,7 @@ def _run_cli(argv: list[str]) -> int:
     finally:
         reviewer.cache.save()
         reviewer.extractor.close()
-    if args.no_cache:  # the answers aren't kept: save the run's results
+    if args.no_cache:  # a run from scratch: keep its results
         print(f"Analysis written to {write_run_csv(result)}", file=sys.stderr)
 
     for item in result.items:

@@ -190,11 +190,11 @@ def ask_other_trash(parent, program: str, conflicts: list[Conflict], trash_box: 
 
 
 def no_cache_box() -> QCheckBox:
-    """"Don't use the AI cache": for tests. Red while on; not remembered (off at each start),
-    so that it can't stay on by mistake and have every analysis ask the AI again."""
+    """"Don't use the saved AI answers": for tests. Red while on; not remembered (off at each
+    start), so that it can't stay on by mistake and have every analysis ask the AI again."""
     box = QCheckBox("No AI cache")
-    box.setToolTip("For tests: every question goes to the AI, and no answer is kept.\n"
-                   "The saved answers aren't touched: they are used again once this is off.\n"
+    box.setToolTip("For tests: the saved answers are not used, every question goes to the AI.\n"
+                   "Its answers are still saved, replacing the old ones for the same questions.\n"
                    "Not remembered: off each time the program starts.")
     box.setStyleSheet(f"QCheckBox:checked {{ color: {RED[0]}; font-weight: bold; }}")
     return box

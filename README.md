@@ -399,7 +399,7 @@ python -m calibre_dedup --cli ... --no-ai          # metadata only
 python -m calibre_dedup --cli ... --cleanup-only   # nothing copied to the target
 python -m calibre_dedup --cli ... --unpack         # unpack every clear RAR/ZIP/7Z archive
 python -m calibre_dedup --cli ... --clear-cache    # ask the AI again
-python -m calibre_dedup --cli ... --no-cache       # ignore the cache, keep nothing (tests)
+python -m calibre_dedup --cli ... --no-cache       # ask the AI again, save the new answers (tests)
 ```
 
 Options left out are taken from the GUI's saved settings. The plan is printed; `--report`
@@ -507,8 +507,8 @@ python -m calibre_dedup.review_app --cli ... --include-reviewed                 
 ```
 
 Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
-clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ignore the cache,
-keep nothing).
+clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ask the AI again
+without the saved answers; the new answers are saved).
 Options left out are taken from the review's saved settings.
 
 
@@ -607,10 +607,11 @@ the review), so analyzing again, or after *Stop*, is fast.
 - To start over: Settings → **Clear AI cache…** (small button at the bottom right; not
   while a run is in progress), or `--clear-cache`. Each program clears only its own cache.
 - To test without the cache: tick **No AI cache** (beside *Settings…*; red while on), or
-  `--no-cache`. Every question goes to the AI and no answer is kept; the saved answers are
-  not touched. The box is off each time the program starts. The review then writes each analysis
-  run (also after *Stop*) to `review_runs\review_<library>_<date>.csv` in the data folder,
-  since its answers aren't kept anywhere else.
+  `--no-cache`. Every question goes to the AI, without using the saved answers; the new answers
+  are still saved, replacing the old ones for the same questions (the others are kept). The box
+  is off each time the program starts. The review then also writes each analysis run (also
+  after *Stop*) to `review_runs\review_<library>_<date>.csv` in the data folder, as a record of
+  that run from scratch.
 - Nothing is ever pruned: answers for files that changed or moved stay unused in the file
   until you clear the cache.
 

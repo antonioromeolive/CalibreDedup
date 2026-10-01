@@ -430,7 +430,7 @@ class ScanWorker(QThread, UnpackQuestion):
                                   skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack)
             if batch:
                 self.items_ready.emit(batch.copy())
-            if self.no_cache:  # the answers aren't kept: save the run's results
+            if self.no_cache:  # a run from scratch: keep its results
                 write_run_csv(result)
             self.finished_ok.emit(result)
         except Exception as e:

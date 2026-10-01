@@ -64,8 +64,8 @@ def _run(argv: list[str]) -> int:
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
     ap.add_argument("--no-cache", action="store_true",
-                    help="don't use the AI cache (for tests): every question goes to the AI, "
-                         "ai_cache.json is neither read nor written")
+                    help="don't use the saved AI answers (for tests): every question goes to the AI; "
+                         "the new answers are still saved in ai_cache.json")
     ap.add_argument("--unpack", action="store_true",
                     help="unpack every clear RAR/ZIP/7Z archive of a book (default: archives are left as they are)")
     ap.add_argument("--report", help="write the plan as CSV to this file")

@@ -209,8 +209,6 @@ def review_cache(off: bool = False) -> AICache:
     shared ai_cache.json, which holds the answers of reviews made before the split.
     `off`: no cache (see AICache)."""
     path = config_dir() / REVIEW_CACHE_FILE
-    if off:
-        return AICache(path, off=True)
     shared = config_dir() / "ai_cache.json"
     if not path.exists() and shared.is_file():
         try:
@@ -218,7 +216,7 @@ def review_cache(off: bool = False) -> AICache:
             log.info("Review AI cache created from %s", shared)
         except OSError as e:
             log.warning("Could not copy %s to %s: %s", shared, path, e)
-    return AICache(path)
+    return AICache(path, off=off)
 
 
 def is_reviewed(book: Book) -> bool:
