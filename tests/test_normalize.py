@@ -226,3 +226,17 @@ def test_looks_like_name(text, name):
 def test_surname_match(a, b, same):
     from calibre_dedup.normalize import surname_match
     assert surname_match(a, b) is same
+
+
+@pytest.mark.parametrize("title", ["ITABOOK 0052 - Hemingway", "il_vecchio_e_il_mare", "Moby Dick.epub", "scan0012",
+                                   "B00ABC1234", "(Gutenberg - 0411- Brother Jacob - George Eliot)"])
+def test_titles_made_from_file_names(title):
+    from calibre_dedup.normalize import looks_like_file_name
+    assert looks_like_file_name(title)
+
+
+@pytest.mark.parametrize("title", ["1984", "Fahrenheit 451", "1Q84", "2001: Odissea nello spazio", "Catch-22",
+                                   "Le 120 giornate di Sodoma", "Il conte di Montecristo (Vol. 2)", "Urania 1234"])
+def test_titles_with_numbers_are_titles(title):
+    from calibre_dedup.normalize import looks_like_file_name
+    assert not looks_like_file_name(title)

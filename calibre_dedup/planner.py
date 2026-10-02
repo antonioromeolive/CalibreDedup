@@ -26,15 +26,16 @@ source and target are the same library, duplicate records are merged into the
 record with richer metadata and the weaker record is sent to trash.
 
 AI is only consulted when metadata is not enough:
-* the source book has no usable title/authors, or
+* the source book has no usable title/authors, or a title made from a file name, or
 * a same-title/same-author book exists in the target but edition or publisher
   can't be compared from metadata (both books are then enriched).
 It reads the first pages, then the last pages if fields are still missing.
-If that still can't decide, a vision model may compare the two covers: the
-same cover is taken as proof of the same book, unless it is a generic cover
-(the same image on books of different titles, see covers.py).
-Before any AI call, identical EPUB text proves the same book (copies that
-differ only in metadata or cover).
+If that still can't decide, the covers do (see _by_covers): with no edition data
+to compare, two books are the same unless their covers differ; the same cover is
+proof, unless it is a generic cover (the same image on books of different titles,
+see covers.py). Without the AI, identical files prove the same book whatever the
+metadata, and identical EPUB text proves it before any AI call (copies that differ
+only in metadata or cover). A copy whose text is in another language is another book.
 """
 
 from __future__ import annotations
@@ -56,16 +57,17 @@ from .archives import ask_once, prepare as unpack_archives
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
-from .covers import generic_covers, generic_note
+from .covers import GENERIC_COVER_BOOKS, generic_covers, generic_note
 from .extract import CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, epub_text_digest, unreadable_formats
-from .library_cache import FileChecks
+from .language import language_name
+from .library_cache import FileChecks, FileHashes, TextFacts
 from .library import read_books, tag_filter_text, tag_selects
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
 from .normalize import (
     MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, initials_match, is_unknown,
-    looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number, related_titles,
-    series_key, similar_authors_keys, surname_match, title_key, title_variants,
+    looks_like_file_name, looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number,
+    related_titles, series_key, similar_authors_keys, surname_match, title_key, title_variants,
 )
 from .selection import action_label
 
@@ -85,6 +87,13 @@ SKIP_COVER = "cover check"  # no Image AI (or no AI at all)
 SKIP_YEARS = "year re-check"  # AI off
 SKIP_SCANNED = "scanned PDF"  # a PDF with no text, and no Image AI to read its pages
 SCANNED_PDF_SKIPPED = "scanned PDF skipped: no Image AI"
+# What two covers say about two books (see _covers).
+SAME = "same"  # identical files, or the same cover per the Image AI
+DIFFERENT = "different"
+UNCLEAR = "unclear"  # the books' own doing: a cover missing, not a real one, or the AI unsure
+SKIPPED = "skipped"  # the check can't run here: cover check off, no Image AI, the AI down
+_COVER_VERDICTS = {"same": SAME, "different": DIFFERENT, "unsure": UNCLEAR}
+LENGTH_RATIO = 3  # a copy this many times longer than the other is another content
 
 
 def metadata_identity(book: Book, same_series: bool = False) -> Identity:
@@ -250,39 +259,49 @@ class AIResolver:
         return f"{what} error: {e}"
 
     def same_cover(self, a: Book, b: Book) -> tuple[bool, str, bool]:
-        """Whether both books show the same cover, per the vision model.
-        Returns (same, note, model_called)."""
+        """Whether both books show the same cover: identical files, or the same per the
+        vision model; a generic cover is never proof. Returns (same, note, model_called)."""
         pa, pb = _cover_path(a), _cover_path(b)
         if self.vision is None or not (pa.is_file() and pb.is_file()):
             return False, "", False
         for book, path in ((a, pa), (b, pb)):
             if str(path) in self.generic:
                 return False, f"{generic_note(self.generic[str(path)])} on {book.label()}: not proof", False
-        if pa.stat().st_size == pb.stat().st_size and pa.read_bytes() == pb.read_bytes():
+        if _identical(pa, pb):
             self.stats["cover_identical"] += 1
             return True, "identical cover files", False
+        verdict, note, called = self.ai_cover_verdict(a, b)
+        return verdict == SAME, note, called
+
+    def ai_cover_verdict(self, a: Book, b: Book) -> tuple[str, str, bool]:
+        """What the vision model says of two books' covers (both there, neither generic nor
+        identical: see _covers): SAME, DIFFERENT, UNCLEAR (it is unsure, or an image can't
+        be read) or SKIPPED (the image AI is down, or failed). Returns (verdict, note,
+        model_called)."""
+        pa, pb = _cover_path(a), _cover_path(b)
         key = AICache.pair_key(str(pa), str(pb), f"cover|{self._model_id(self.vision)}")
         cached = self.cache.get(key)
         if cached is not None:
             self.stats["cover_cached"] += 1
-            return cached["verdict"] == "same", f"AI cover check: {cached['verdict']} (cached)", False
+            return (_COVER_VERDICTS.get(cached["verdict"], UNCLEAR), f"AI cover check: {cached['verdict']} (cached)",
+                    False)
         if self.image_disabled_reason:
-            return False, self.image_disabled_reason, False
+            return SKIPPED, self.image_disabled_reason, False
         covers = cover_png(pa), cover_png(pb)
         if None in covers:
-            return False, "cover image unreadable", False
+            return UNCLEAR, "cover image unreadable", False
         log.info("AI comparing covers of %s and %s", a.label(), b.label())
         try:
             verdict, reason = compare_covers(self.vision, *covers)
         except AIError as e:
             note = self._error(a, e, image=True)
             if note is None:  # the user chose Retry
-                return self.same_cover(a, b)
-            return False, note, True
+                return self.ai_cover_verdict(a, b)
+            return SKIPPED, note, True
         self.image_errors = 0
         self.stats["cover"] += 1
         self.cache.put(key, {"verdict": verdict, "reason": reason})
-        return verdict == "same", f"AI cover check: {verdict}", True
+        return _COVER_VERDICTS.get(verdict, UNCLEAR), f"AI cover check: {verdict}", True
 
     def same_person(self, book: Book, names_a: str, names_b: str,
                     title: str | None = None) -> tuple[bool, str, bool]:
@@ -402,6 +421,7 @@ class _Candidate:
     planned: bool  # a source book that the plan moves into the target
     ai_done: bool = False
     year_rechecked: bool = False  # the AI read it to re-check a year difference
+    title_read: bool = False  # its title is a file name: the AI was asked for the real one
     formats: set[str] = field(default_factory=set)  # formats the target copy will have
     _variants: list[str] | None = None
 
@@ -572,6 +592,77 @@ def _lookup(index: dict[tuple, list[_Candidate]], keys: list[tuple]) -> list[_Ca
     return list(found.values())
 
 
+def _placeholder(books: list[Book]) -> bool:
+    """The same file on books of GENERIC_COVER_BOOKS or more titles and authors is a
+    placeholder (a "file not found" page), as a generic cover is."""
+    return (len({title_key(b.title or "") for b in books}) >= GENERIC_COVER_BOOKS
+            and len({authors_key(b.authors) for b in books}) >= GENERIC_COVER_BOOKS)
+
+
+class _FileIndex:
+    """The books' files by format and size (from metadata.db: nothing is opened), to find
+    the same file in two books whatever their titles and authors: the same book. Only
+    files of the same size are read (FileHashes), to tell."""
+
+    def __init__(self, hashes: FileHashes):
+        self.hashes = hashes
+        self.by_size: dict[tuple[str, int], list[_Candidate]] = defaultdict(list)
+
+    def add(self, c: _Candidate) -> None:
+        for fmt in c.book.formats:
+            if c.book.sizes.get(fmt):
+                self.by_size[(fmt, c.book.sizes[fmt])].append(c)
+
+    def match(self, book: Book) -> tuple[_Candidate, str] | None:
+        """A book of the index with one of `book`'s files, and that file's format."""
+        for fmt in book.formats:
+            size = book.sizes.get(fmt)
+            others = [c for c in self.by_size.get((fmt, size), []) if c.book is not book] if size else []
+            mine = self.hashes.digest(book, fmt) if others else None
+            same = [c for c in others if mine is not None and self.hashes.digest(c.book, fmt) == mine]
+            if same and not _placeholder([book] + [c.book for c in same]):
+                return same[0], fmt
+        return None
+
+
+@dataclass
+class _Context:
+    """What deciding a book needs besides the book: the indexes of the books it may be
+    a copy of, the AI, the options, and what was found in the books' files."""
+    index: dict[tuple, list[_Candidate]]
+    main_index: dict[tuple, list[_Candidate]]  # subtitles ignored
+    resolver: AIResolver | None
+    stats: Counter[str]
+    ignore_subtitle: bool = False
+    same_library: bool = False
+    similar_matching: bool = False
+    cover_check: bool = False
+    recheck_years: bool = False
+    same_series: bool = False
+    always_cover: bool = False
+    similar: _SimilarIndex | None = None  # similar titles
+    by_title: dict | None = None  # authors written differently
+    persons: SwapDetector | None = None
+    generic: dict[str, int] = field(default_factory=dict)  # generic covers (covers.py): never proof
+    files: _FileIndex | None = None
+    texts: TextFacts | None = None  # language and length of the books' text; None: not read
+    # Books that stay as they are (the target's) whose title is a file name, by author key:
+    # the AI reads their real title when a book by that author finds no copy.
+    named: dict[tuple, list[_Candidate]] | None = None
+    add_titles: Callable[[_Candidate], None] = lambda c: None  # index a book under its (new) title
+
+
+@dataclass
+class _Outcome:
+    """What comparing a book with its candidates found (see _decide_one)."""
+    decision: Decision
+    content: bool = False  # the same text: in the same language, whatever it is
+    by_cover: bool = False
+    override: bool = False  # the same cover overruled the metadata
+    no_edition: bool = False  # PlanItem.no_edition
+    called: bool = False  # the AI was asked
+
+
 def _unreachable(paths: list[Path]) -> str:
     """The first library database that can't be reached any more, or ''."""
     for p in paths:
@@ -611,6 +702,64 @@ def _digest(path: str, mtime_ns: int, size: int) -> str | None:  # keyed on mtim
 
 def _cover_path(book: Book) -> Path:
     return Path(book.library, book.path, "cover.jpg")
+
+
+def _identical(a: Path, b: Path) -> bool:
+    try:
+        return a.stat().st_size == b.stat().st_size and a.read_bytes() == b.read_bytes()
+    except OSError:  # a cover that went away is no proof, and not this book's error
+        return False
+
+
+def _covers(ctx: _Context, a: Book, b: Book) -> tuple[str, str, bool, str]:
+    """What the two books' covers say: SAME (identical files, which needs no AI, or the
+    same per the Image AI), DIFFERENT, UNCLEAR (a cover missing, a generic one, an image
+    that can't be read, or the AI unsure: the books' own doing) or SKIPPED (the check
+    can't run here: cover check off, no Image AI, the AI down). Returns (verdict, note,
+    model called, the check to report as skipped (PlanItem.skipped) or "")."""
+    if not (ctx.cover_check or ctx.always_cover):
+        return SKIPPED, "", False, ""
+    pa, pb = _cover_path(a), _cover_path(b)
+    present = [(book, path) for book, path in ((a, pa), (b, pb)) if book.has_cover and path.is_file()]
+    generic = [(book, path) for book, path in present if str(path) in ctx.generic]
+    if len(present) == 2 and not generic and _identical(pa, pb):
+        ctx.stats["cover_identical"] += 1
+        return SAME, "identical cover files", False, ""
+    resolver = ctx.resolver
+    if resolver is None or resolver.vision is None:
+        return SKIPPED, f"cover check skipped: {'AI is off' if resolver is None else 'no Image AI'}", False, SKIP_COVER
+    if resolver.image_disabled_reason:
+        return SKIPPED, resolver.image_disabled_reason, False, SKIP_IMAGE_AI
+    if len(present) < 2:
+        missing = a if not present or present[0][0] is not a else b
+        return UNCLEAR, f"no cover on {missing.label()!r}", False, ""
+    if generic:
+        book, path = generic[0]
+        return UNCLEAR, f"{generic_note(ctx.generic[str(path)])} on {book.label()!r}: not a real cover", False, ""
+    verdict, note, called = resolver.ai_cover_verdict(a, b)
+    return verdict, note, called, SKIP_IMAGE_AI if verdict == SKIPPED and resolver.image_disabled_reason else ""
+
+
+def _other_language(ctx: _Context, a: Book, b: Book) -> str:
+    """How `b`'s text is in another language than `a`'s, or "" (the same, or unknown)."""
+    if ctx.texts is None:
+        return ""
+    mine, theirs = ctx.texts.get(a)[0], ctx.texts.get(b)[0]
+    if mine and theirs and mine != theirs:
+        return f"in another language ({language_name(theirs)} text, this one {language_name(mine)})"
+    return ""
+
+
+def _longer(ctx: _Context, a: Book, b: Book) -> str:
+    """How one of the books is LENGTH_RATIO times longer than the other: another content
+    (a collection and one of its stories, a complete and an abridged edition). "" if not,
+    or unknown."""
+    if ctx.texts is None:
+        return ""
+    la, lb = ctx.texts.get(a)[1], ctx.texts.get(b)[1]
+    if not la or not lb or max(la, lb) < LENGTH_RATIO * min(la, lb):
+        return ""
+    return f"{(a if la > lb else b).label()!r} is {max(la, lb) / min(la, lb):.1f} times longer: another content"
 
 
 def check_libraries(source: str, target: str, trash: str) -> None:
@@ -673,11 +822,14 @@ def build_plan(
     are left as they are. Needs the AI's resolver (its extractor).
     `generic_check`: look for generic covers (see covers.generic_covers), which are then
     never proof; off (for tests on a big library), any cover can be. `library_cache`:
-    where what is found in the source's files (covers, unreadable formats) is kept
-    for the next time (see library_cache); None: not kept.
+    where what is found in the books' files (covers, unreadable formats, hashes, the
+    language and length of the text) is kept for the next time (see library_cache);
+    None: not kept.
     `tag`: only the source books with this tag (with `tag_exclude`, without it) get an
     item; the others are still matched against (in one library, as copies that stay:
-    see _keep_chosen). The target is always read whole."""
+    see _keep_chosen). The target is always read whole.
+    In every mode the source books are analyzed best copy first (keep_rank): of two
+    copies, the first decided is the one moved or kept, the other is trashed into it."""
     check_libraries(source, target, trash)
     progress = progress or (lambda *_: None)
     tag = tag.strip()
@@ -693,15 +845,26 @@ def build_plan(
         log.info("Only the %d of %d source books %s are analyzed", len(chosen), len(source_books),
                  tag_filter_text(tag, tag_exclude))
     file_checks = FileChecks(library_cache)
-    if resolver is not None and (cover_check or always_cover):
+    hashes = FileHashes(library_cache)
+    extractor = getattr(resolver, "extractor", None)
+    # The books' text is read (for its language and length) only by the AI's extractor:
+    # with the AI off, the analysis reads the metadata only.
+    texts = TextFacts(library_cache, extractor) if hasattr(extractor, "text_profile") else None
+    generic: dict[str, int] = {}
+    if cover_check or always_cover:
         if generic_check:
             progress(0, len(chosen), "Looking for generic covers…")
-            resolver.generic = generic_covers(source_books + target_books, cancel, library_cache)
+            generic = generic_covers(source_books + target_books, cancel, library_cache)
         else:
             log.warning("Generic covers not looked for (setting): a placeholder cover may count as proof")
+    if resolver is not None:
+        resolver.generic = generic
 
     index: dict[tuple, list[_Candidate]] = defaultdict(list)
     main_index: dict[tuple, list[_Candidate]] = defaultdict(list)  # subtitle ignored
+    files = _FileIndex(hashes)
+    # Books that stay as they are, with a file name for title: the AI reads the real one when needed.
+    named: dict[tuple, list[_Candidate]] | None = defaultdict(list) if resolver is not None else None
     # For similar titles: books by author key, and the collections' words.
     similar = _SimilarIndex(defaultdict(list), _collection_words(source_books + target_books)) \
         if similar_titles else None
@@ -714,26 +877,36 @@ def build_plan(
             log.info("%s: %s, analyzed as %s", b.label(), SWAPPED_NOTE, fixed.label())
         return fixed
 
-    def add_to_index(c: _Candidate) -> None:
+    def add_titles(c: _Candidate) -> None:
         for k in _keys(c.identity, ignore_subtitle, similar_matching):
             index[k].append(c)
-        if c.identity.series is not None:
-            index[_series_key(c.identity)].append(c)
         for k in _keys(c.identity, True, similar_matching):
             main_index[k].append(c)
+
+    def add_to_index(c: _Candidate) -> None:
+        add_titles(c)
+        if c.identity.series is not None:
+            index[_series_key(c.identity)].append(c)
         if similar is not None and c.identity.title:
             for k in _author_keys(c.identity, similar_matching):
                 similar.by_author[k].append(c)
         if by_title is not None and c.identity.title and c.identity.authors:
             by_title[title_key(c.identity.title, ignore_subtitle)].append(c)
+        files.add(c)
+
+    def add_staying(c: _Candidate) -> None:
+        """A book that is never analyzed itself (the target's, or left out by the tag filter)."""
+        add_to_index(c)
+        if named is not None and c.identity.title and looks_like_file_name(c.identity.title):
+            for k in _author_keys(c.identity, similar_matching):
+                named[k].append(c)
 
     if not same_library:
         for tb in target_books:
             tb = put_right(tb) or tb
-            add_to_index(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
+            add_staying(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
 
     total = len(chosen)
-    analysis_books = chosen
     cleanup = cleanup_only and not same_library
     unreadable: dict[int, dict[str, str]] = {}  # id(book) -> its formats Calibre can't open, once checked
 
@@ -744,10 +917,9 @@ def build_plan(
             f: "" for f in b.formats if f not in CALIBRE_INPUT_FORMATS}
         return -_format_rank(b, bad), _metadata_richness(b)
 
-    if same_library or cleanup:
-        # Of two copies, the one decided first is kept. A fake file found only in its turn
-        # can make a copy come first that shouldn't: see the check after _plan_one.
-        analysis_books = sorted(chosen, key=keep_rank, reverse=True)
+    # Of two copies, the one decided first is moved or kept. A fake file found only in its
+    # turn can make a copy come first that shouldn't: see the check after _plan_one.
+    analysis_books = sorted(chosen, key=keep_rank, reverse=True)
     # The source copy each book indexed in one library stands for: id(indexed book) -> record.
     records: dict[int, tuple[_Candidate, Book]] = {}
     # One library, with a tag filter: the books it leaves out are copies that stay, matched
@@ -761,7 +933,7 @@ def build_plan(
             book = replace(ob, formats={f: p for f, p in ob.formats.items() if f not in bad}) if bad else ob
             book = put_right(book) or book
             c = _Candidate(book, metadata_identity(book, same_series), planned=False)
-            add_to_index(c)
+            add_staying(c)
             others[id(book)] = (c, ob)
     libraries = [Path(source, "metadata.db")] + ([Path(target, "metadata.db")] if target_books else [])
     checked = time.monotonic()
@@ -772,6 +944,10 @@ def build_plan(
 
     stats: Counter[str] = Counter()
     down = {"text AI": 0, "image AI": 0}  # the book at which that AI was turned off
+    ctx = _Context(index, main_index, resolver, stats, ignore_subtitle=ignore_subtitle, same_library=same_library,
+                   similar_matching=similar_matching, cover_check=cover_check, recheck_years=recheck_years,
+                   same_series=same_series, always_cover=always_cover, similar=similar, by_title=by_title,
+                   persons=swaps, generic=generic, files=files, texts=texts, named=named, add_titles=add_titles)
 
     perf.run_start("dedup", total, getattr(resolver, "provider", None), getattr(resolver, "vision", None))
     for n, sb in enumerate(analysis_books, 1):
@@ -796,16 +972,13 @@ def build_plan(
                 book = replace(seen, formats={f: p for f, p in seen.formats.items() if f not in bad}) if bad else seen
                 fixed = put_right(book)
                 book = fixed or book
-                item = _plan_one(book, index, main_index, resolver, ignore_subtitle, same_library,
-                                 similar_matching, cover_check, recheck_years, same_series, stats, similar,
-                                 always_cover, by_title, swaps)
+                item = _plan_one(book, ctx)
                 item.source = sb  # the record itself (the executor acts on it)
                 if fixed is not None:
                     item.swapped = True
                     stats["swapped"] += 1
                     item.reason = item.planned_reason = _join(
                         item.reason, [f"{SWAPPED_NOTE} (was {sb.title!r} by {' & '.join(sb.authors)!r})"])
-                extractor = getattr(resolver, "extractor", None)
                 if hasattr(extractor, "failed_formats"):  # files that failed to open while deciding
                     bad.update(extractor.failed_formats(book.formats))
                 if bad and set(bad) >= set(seen.formats):
@@ -867,6 +1040,9 @@ def build_plan(
             resolver.cache.save()
     perf.run_end(len(plan.items), plan.stopped)
     file_checks.save()  # those of the books analyzed one by one
+    hashes.save()
+    if texts is not None:
+        texts.save()
     if resolver:
         resolver.cache.save()
         stats.update(resolver.stats)
@@ -877,9 +1053,8 @@ def build_plan(
                     else "")
             plan.ai_down.append(f"The {what} stopped responding at book {n} of {total}{rest}.")
     progress(len(plan.items), total, "Analysis stopped" if plan.stopped else "Analysis complete")
-    if same_library or cleanup:
-        order = {id(b): i for i, b in enumerate(source_books)}
-        plan.items.sort(key=lambda item: order[id(item.source)])
+    order = {id(b): i for i, b in enumerate(source_books)}
+    plan.items.sort(key=lambda item: order[id(item.source)])
     return plan
 
 
@@ -911,6 +1086,14 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
         parts.append(f"{s['year_rechecks']} year re-checks")
     if s.get("swapped"):
         parts.append(f"{s['swapped']} books with title and author swapped")
+    if s.get("identical_files"):
+        parts.append(f"{s['identical_files']} duplicates by identical files")
+    if s.get("no_edition"):
+        parts.append(f"{s['no_edition']} duplicates without edition data (covers not different)")
+    if s.get("file_name_titles"):
+        parts.append(f"{s['file_name_titles']} file-name titles read by AI")
+    if s.get("other_language"):
+        parts.append(f"{s['other_language']} copies in another language")
     counts = Counter(k for it in plan.items for k in it.skipped)
     warnings = list(plan.ai_down)
     warnings += [f"{n} book(s): {SKIP_EXPLAINED[k]}" for k, n in counts.items()]
@@ -996,47 +1179,25 @@ def _metadata_richness(book: Book) -> int:
     )
 
 
-def _plan_one(sb: Book, index, main_index, resolver: AIResolver | None,
-              ignore_subtitle: bool, same_library: bool = False,
-              similar_matching: bool = False, cover_check: bool = False,
-              recheck_years: bool = False, same_series: bool = False,
-              stats: Counter[str] | None = None, similar: _SimilarIndex | None = None,
-              always_cover: bool = False, by_title: dict | None = None,
-              persons: SwapDetector | None = None) -> PlanItem:
-    """`similar` turns on similar-title matching; `by_title` (title key -> books)
-    the check for authors written differently; `persons`: what tells a title that is a
-    person's name (no AI question about it)."""
+def _plan_one(sb: Book, ctx: _Context) -> PlanItem:
     skipped: list[str] = []
-    item = _decide_one(sb, index, main_index, resolver, ignore_subtitle, same_library, similar_matching,
-                       cover_check, recheck_years, same_series, Counter() if stats is None else stats, skipped,
-                       similar, always_cover, by_title, persons)
+    item = _decide_one(sb, ctx, skipped)
+    if not is_unknown(sb.title) and looks_like_file_name(sb.title):
+        if item.action is Action.MOVE and item.identity.title == sb.title:  # the AI didn't read the real one
+            why = "AI is off" if ctx.resolver is None else "the AI could not read the real one"
+            item = _logged(replace(item, action=Action.LEAVE, reason=(
+                f"the title looks like a file name, and {why}: not moved without a real title; {item.reason}")))
+        item.file_name_title = sb.title
     item.skipped = list(dict.fromkeys(skipped))
     return item
 
 
-def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore_subtitle: bool,
-                same_library: bool, similar_matching: bool, cover_check: bool, recheck_years: bool,
-                same_series: bool, stats: Counter[str], skipped: list[str],
-                similar: _SimilarIndex | None = None, always_cover: bool = False,
-                by_title: dict | None = None, persons: SwapDetector | None = None) -> PlanItem:
+def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
     """`skipped` collects the checks wanted for this book that could not run."""
-    ident = metadata_identity(sb, same_series)
+    resolver = ctx.resolver
+    ident = metadata_identity(sb, ctx.same_series)
     notes: list[str] = []
     ai_used = False
-
-    # 0. Same series and number, with the title or an author in common: proof, so
-    # looked up first; a match decides the book and nothing else is checked (no AI
-    # either). Unrelated books at the same number go through the other checks.
-    if ident.series is not None:
-        candidates = _lookup(index, [_series_key(ident)])
-        clash = next((c for c in candidates if not _series_agrees(ident, c.identity)), None)
-        candidates = [c for c in candidates if _series_agrees(ident, c.identity)]
-        if clash is not None and not candidates:
-            notes.append(f"same series and number as {clash.book.label()!r}, but another title "
-                         "and authors: not taken as a duplicate")
-        if candidates:
-            decision = decide(ident, [c.identity for c in candidates])
-            return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used)
 
     def enrich(book: Book, i: Identity, need: Callable[[Identity], bool]) -> tuple[Identity, list[str]]:
         i, n = resolver.enrich(book, i, need)
@@ -1048,7 +1209,50 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
             skipped.append(SKIP_SCANNED)
         return i, n
 
-    # 1. Title and authors
+    # 0. One of its files in another book: the same book, whatever their metadata say.
+    found = ctx.files.match(sb) if ctx.files is not None else None
+    if found is not None:
+        c, fmt = found
+        ctx.stats["identical_files"] += 1
+        return _duplicate_item(sb, ident, c, f"identical {fmt} file", notes, ai_used)
+
+    # 1. Same series and number, with the title or an author in common: proof, so
+    # looked up first; a match decides the book and nothing else is checked (no AI
+    # either). Unrelated books at the same number go through the other checks, and so
+    # do copies in another language.
+    if ident.series is not None:
+        candidates = _lookup(ctx.index, [_series_key(ident)])
+        clash = next((c for c in candidates if not _series_agrees(ident, c.identity)), None)
+        candidates = [c for c in candidates if _series_agrees(ident, c.identity)]
+        if clash is not None and not candidates:
+            notes.append(f"same series and number as {clash.book.label()!r}, but another title "
+                         "and authors: not taken as a duplicate")
+        for c in list(candidates):
+            other = _other_language(ctx, sb, c.book)
+            if other:
+                notes.append(f"same series and number as {c.book.label()!r}, but {other}")
+                candidates.remove(c)
+        if candidates:
+            decision = decide(ident, [c.identity for c in candidates])
+            return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used)
+
+    # 2. A title made from a file name ("ITABOOK 0052 - Hemingway") finds no copy, and is
+    # no title for the target: the AI reads the real one, and the book is matched with it.
+    # If it can't, the book is matched as it is, but never moved (see _plan_one).
+    if resolver and ident.title and looks_like_file_name(ident.title):
+        file_name = ident.title
+        ident.title = None
+        ident, n = enrich(sb, ident, _needs_title_authors)
+        notes += n
+        ai_used = True
+        if ident.title and not looks_like_file_name(ident.title):
+            notes.append(f"the title {file_name!r} looks like a file name: the AI read {ident.title!r}")
+            ctx.stats["file_name_titles"] += 1
+        else:
+            ident.title = file_name
+            ident.ai_fields.discard("title")
+
+    # 3. Title and authors
     if not ident.has_title_authors:
         if not resolver:
             return PlanItem(sb, Action.LEAVE, "title/authors missing and AI is off", ident)
@@ -1058,95 +1262,115 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
         if not ident.has_title_authors:
             return PlanItem(sb, Action.LEAVE, _join("title/authors could not be determined", notes), ident, ai_used=True)
 
-    keys = _keys(ident, ignore_subtitle, similar_matching)
+    keys = _keys(ident, ctx.ignore_subtitle, ctx.similar_matching)
     if not keys:
         return PlanItem(sb, Action.LEAVE, "title/authors unusable after normalization", ident, ai_used=ai_used)
-    candidates = _lookup(index, keys)
-    if not candidates and by_title is not None:
-        candidates, n, called = _author_variant_candidates(sb, ident, by_title, resolver, ignore_subtitle, persons)
+    candidates = _lookup(ctx.index, keys)
+    if not candidates and ctx.by_title is not None:
+        candidates, n, called = _author_variant_candidates(sb, ident, ctx.by_title, resolver, ctx.ignore_subtitle,
+                                                           ctx.persons)
+        notes += n
+        ai_used = ai_used or called
+    if not candidates and ctx.named:
+        candidates, n, called = _file_name_candidates(sb, ident, ctx, enrich)
         notes += n
         ai_used = ai_used or called
 
     if not candidates:
-        if ident.ai_fields & {"title", "authors"} and not ignore_subtitle:
-            near = _lookup(main_index, _keys(ident, True, similar_matching))
+        if ident.ai_fields & {"title", "authors"} and not ctx.ignore_subtitle:
+            near = _lookup(ctx.main_index, _keys(ident, True, ctx.similar_matching))
             if near:
                 return _logged(PlanItem(
                     sb, Action.LEAVE,
                     _join(f"AI-found title matches {near[0].book.label()!r} only when ignoring the subtitle; check manually", notes),
                     ident, match=near[0].book, match_planned=near[0].planned, ai_used=ai_used))
-        if similar is not None:
-            alike = [(c, how) for c in _lookup(similar.by_author, _author_keys(ident, similar_matching))
-                     if c.book is not sb and (how := _similar_title(sb, ident, c, similar.collections))]
+        if ctx.similar is not None:
+            alike = [(c, how) for c in _lookup(ctx.similar.by_author, _author_keys(ident, ctx.similar_matching))
+                     if c.book is not sb and (how := _similar_title(sb, ident, c, ctx.similar.collections))]
             if alike:
-                return _decide_similar(sb, ident, alike, resolver, cover_check, same_library,
-                                       notes, skipped, ai_used, always_cover)
-        action = Action.LEAVE if same_library else Action.MOVE
-        reason = "no duplicate in this library" if same_library else "not in target"
+                return _decide_similar(sb, ident, alike, ctx, notes, skipped, ai_used)
+        action = Action.LEAVE if ctx.same_library else Action.MOVE
+        reason = "no duplicate in this library" if ctx.same_library else "not in target"
         return PlanItem(sb, action, _join(reason, notes), ident, ai_used=ai_used)
 
-    # 2. Same title/authors exist: compare edition and publisher
-    decision = decide(ident, [c.identity for c in candidates])
-    if decision.verdict is Verdict.UNKNOWN:
-        decision = _same_text(sb, ident, candidates) or decision
-    if decision.verdict is Verdict.UNKNOWN and resolver:
-        if _needs_edition_publisher(ident):
-            ident, n = enrich(sb, ident, _needs_edition_publisher)
-            notes += n
-            ai_used = True
-        for c in candidates:
-            if not c.ai_done and _needs_edition_publisher(c.identity):
-                c.identity, _ = enrich(c.book, c.identity, _needs_edition_publisher)
-                c.ai_done = True
-                ai_used = True
-        decision = decide(ident, [c.identity for c in candidates])
+    # 4. Same title/authors exist: compare them (evaluate). A copy whose text is in
+    # another language is another book: the others are compared again without it.
+    rechecked = False
 
-    # 3. Different only by metadata year: Calibre's date is often the original
-    # publication, so read both books and compare the years printed in them.
-    if recheck_years and decision.verdict is not Verdict.DUPLICATE:
-        weak = [c for c in candidates if compare(ident, c.identity).year_only]
-        if weak and not resolver:
-            notes.append("year re-check skipped: AI is off")
-            skipped.append(SKIP_YEARS)
-        elif weak:
-            stats["year_rechecks"] += 1
-            if _needs_ai_year_publisher(ident):
-                ident, n = enrich(sb, ident, _needs_ai_year_publisher)
-                notes += n
+    def evaluate(cands: list[_Candidate]) -> _Outcome:
+        """Edition and publisher, by the metadata, else by what the AI reads in both
+        books; the years printed in them; then the covers (see _by_covers)."""
+        nonlocal ident, ai_used, rechecked
+        decision = decide(ident, [c.identity for c in cands])
+        if decision.verdict is Verdict.UNKNOWN:
+            same = _same_text(sb, ident, cands)
+            if same is not None:
+                return _Outcome(same, content=True)
+        if decision.verdict is Verdict.UNKNOWN and resolver:
+            if _needs_edition_publisher(ident):
+                ident, n = enrich(sb, ident, _needs_edition_publisher)
+                notes.extend(n)
                 ai_used = True
-            for c in weak:
-                if not c.year_rechecked and _needs_ai_year_publisher(c.identity):
-                    c.identity, _ = enrich(c.book, c.identity, _needs_ai_year_publisher)
+            for c in cands:
+                if not c.ai_done and _needs_edition_publisher(c.identity):
+                    c.identity, _ = enrich(c.book, c.identity, _needs_edition_publisher)
+                    c.ai_done = True
                     ai_used = True
-                c.year_rechecked = True
-            decision = decide(ident, [c.identity for c in candidates])
+            decision = decide(ident, [c.identity for c in cands])
 
-    # 4. Still undecided: the same cover proves the same book. With "always compare
-    # covers", also against books the metadata calls different (see _cover_decides).
-    by_cover = override = False
-    if decision.verdict is not Verdict.DUPLICATE and (cover_check or always_cover) and sb.has_cover:
-        wanted = (Verdict.UNKNOWN, Verdict.DISTINCT) if always_cover else (Verdict.UNKNOWN,)
-        pairs = [(i, c, comp) for i, c in enumerate(candidates)
-                 if c.book.has_cover and (comp := compare(ident, c.identity)).verdict in wanted]
-        if pairs and (resolver is None or resolver.vision is None):
-            notes.append(f"cover check skipped: {'AI is off' if resolver is None else 'no Image AI'}")
-            skipped.append(SKIP_COVER)
-            pairs = []
-        for i, c, comp in pairs:
-            same, called = _cover_decides(resolver, sb, c.book, comp, notes, skipped)
-            ai_used = ai_used or called
-            if same:
-                by_cover, override = True, comp.verdict is Verdict.DISTINCT
-                why = f"same cover; metadata differs: {comp.reason}" if override else "same cover"
-                decision = Decision(Verdict.DUPLICATE, why, i)
-                break
+        # Different only by metadata year: Calibre's date is often the original
+        # publication, so read both books and compare the years printed in them.
+        unconfirmed: set[int] = set()
+        if ctx.recheck_years and decision.verdict is not Verdict.DUPLICATE:
+            weak = [c for c in cands if compare(ident, c.identity).year_only]
+            if weak and not resolver:
+                notes.append("year re-check skipped: AI is off")
+                skipped.append(SKIP_YEARS)
+            elif weak:
+                if not rechecked:
+                    ctx.stats["year_rechecks"] += 1
+                    rechecked = True
+                if _needs_ai_year_publisher(ident):
+                    ident, n = enrich(sb, ident, _needs_ai_year_publisher)
+                    notes.extend(n)
+                    ai_used = True
+                for c in weak:
+                    if not c.year_rechecked and _needs_ai_year_publisher(c.identity):
+                        c.identity, _ = enrich(c.book, c.identity, _needs_ai_year_publisher)
+                        ai_used = True
+                    c.year_rechecked = True
+                decision = decide(ident, [c.identity for c in cands])
+            unconfirmed = {id(c) for c in weak if compare(ident, c.identity).year_only}
+        if decision.verdict is Verdict.DUPLICATE:
+            return _Outcome(decision)
+        outcome = _by_covers(ctx, sb, ident, cands, unconfirmed, decision, notes, skipped)
+        ai_used = ai_used or outcome.called
+        return outcome
 
-    if decision.verdict is Verdict.DUPLICATE:
-        return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used,
-                               by_cover, override)
+    other_language: list[_Candidate] = []
+    while True:
+        outcome = evaluate(candidates)
+        if outcome.decision.verdict is not Verdict.DUPLICATE:
+            break
+        c = candidates[outcome.decision.match_index]
+        other = "" if outcome.content else _other_language(ctx, sb, c.book)
+        if not other:
+            return _duplicate_item(sb, ident, c, outcome.decision.reason, notes, ai_used, outcome.by_cover,
+                                   outcome.override, outcome.no_edition)
+        notes.append(f"{c.book.label()!r} is {other}: another book")
+        ctx.stats["other_language"] += 1
+        other_language.append(c)
+        candidates = [x for x in candidates if x is not c]
+        if not candidates:  # every copy is in another language
+            reason = "no duplicate in this library" if ctx.same_library else "not in target"
+            return _logged(PlanItem(sb, Action.LEAVE if ctx.same_library else Action.MOVE, _join(reason, notes),
+                                    ident, match=other_language[0].book, match_planned=other_language[0].planned,
+                                    different=True, ai_used=ai_used))
+
+    decision = outcome.decision
     if decision.verdict is Verdict.DISTINCT:
-        action = Action.LEAVE if same_library else Action.MOVE
-        reason = (f"different from existing books: {decision.reason}" if same_library
+        action = Action.LEAVE if ctx.same_library else Action.MOVE
+        reason = (f"different from existing books: {decision.reason}" if ctx.same_library
                   else f"different from target copies: {decision.reason}")
         return _logged(PlanItem(sb, action, _join(reason, notes), ident, match=candidates[0].book,
                                 match_planned=candidates[0].planned, different=True, ai_used=ai_used))
@@ -1156,11 +1380,99 @@ def _decide_one(sb: Book, index, main_index, resolver: AIResolver | None, ignore
         ident, match=candidates[0].book, match_planned=candidates[0].planned, ai_used=ai_used))
 
 
+# How the metadata left a pair open, for the covers to settle (see _by_covers).
+_OPEN = "open"  # no edition data to compare
+_INCOMPARABLE = "incomparable"  # edition data on both, that can't be compared
+_WEAK = "weak"  # only Calibre's years differ, not confirmed by reading the books
+_DIFFERENT = "different"  # the metadata differs ("always compare covers")
+
+
+def _by_covers(ctx: _Context, sb: Book, ident: Identity, cands: list[_Candidate], unconfirmed: set[int],
+               decision: Decision, notes: list[str], skipped: list[str]) -> _Outcome:
+    """What the covers say about the books the metadata left open (README: How two books
+    are compared). With no edition data to compare (on one copy or both), two books are
+    the same unless their covers differ: a cover missing, not a real one, or the AI unsure
+    changes nothing, but a copy LENGTH_RATIO times longer is another content. With
+    edition data on both that can't be compared, only the same cover makes a duplicate.
+    When only Calibre's years differ and reading the books didn't confirm it, the same
+    cover makes a duplicate, another cover another edition; unclear, the book stays. With
+    "always compare covers", the same cover also overrules a difference in the metadata.
+    Covers that can't be checked here (cover check off, no Image AI, the AI down) say
+    nothing: the book stays."""
+    called = False
+    open_pairs: list[tuple[int, _Candidate, str]] = []  # no edition data, covers not different
+    stays: list[str] = []  # why the book can't be decided
+    for i, c in enumerate(cands):
+        comp = compare(ident, c.identity)
+        if comp.verdict is Verdict.UNKNOWN:
+            kind = _INCOMPARABLE if comp.incomparable else _OPEN
+        elif comp.verdict is Verdict.DISTINCT and id(c) in unconfirmed:
+            kind = _WEAK
+        elif comp.verdict is Verdict.DISTINCT and ctx.always_cover:
+            kind = _DIFFERENT
+        else:
+            continue
+        verdict, note, asked, skip = _covers(ctx, sb, c.book)
+        called = called or asked
+        notes.append(note)
+        if skip:
+            skipped.append(skip)
+        if verdict == SAME:
+            override = comp.verdict is Verdict.DISTINCT
+            why = f"same cover; metadata differs: {comp.reason}" if override else "same cover"
+            return _Outcome(Decision(Verdict.DUPLICATE, why, i), by_cover=True, override=override, called=called)
+        if kind == _OPEN and verdict == UNCLEAR:
+            open_pairs.append((i, c, comp.reason))
+        elif kind == _OPEN and verdict == DIFFERENT:
+            stays.append(f"{comp.reason}, and another cover: another edition?")
+        elif kind in (_OPEN, _INCOMPARABLE):
+            stays.append(comp.reason)
+        elif kind == _WEAK and verdict != DIFFERENT:
+            stays.append(f"{comp.reason} in Calibre only, not confirmed by reading the books")
+    for i, c, reason in open_pairs:
+        longer = _longer(ctx, sb, c.book)
+        if longer:
+            stays.append(f"{reason}, but {longer}")
+            continue
+        ctx.stats["no_edition"] += 1
+        return _Outcome(Decision(Verdict.DUPLICATE, f"{reason}: nothing tells them apart, and the covers "
+                                                    "don't differ", i), no_edition=True, called=called)
+    if stays:
+        return _Outcome(Decision(Verdict.UNKNOWN, "; ".join(dict.fromkeys(stays))), called=called)
+    return _Outcome(decision, called=called)
+
+
+def _file_name_candidates(sb: Book, ident: Identity, ctx: _Context, enrich) -> tuple[list[_Candidate], list[str], bool]:
+    """Books that stay as they are (the target's), by the same author, whose title is a file
+    name ("ITABOOK 0052 - Hemingway"): the AI reads their real title, once each, they are
+    indexed with it, and those with this book's title are its candidates. Returns
+    (candidates, notes, model called)."""
+    called = False
+    for key in _author_keys(ident, ctx.similar_matching):
+        for c in ctx.named.get(key, []):
+            if c.title_read or c.book is sb:
+                continue
+            c.title_read = True
+            read = c.identity.copy()
+            read.title = None
+            read, _ = enrich(c.book, read, _needs_title_authors)
+            called = True
+            if read.title and not looks_like_file_name(read.title):
+                c.identity, c._variants = read, None
+                ctx.add_titles(c)
+    found = [c for c in _lookup(ctx.index, _keys(ident, ctx.ignore_subtitle, ctx.similar_matching))
+             if c.book is not sb]
+    notes = [f"the title {c.book.title!r} looks like a file name: the AI read {c.identity.title!r}"
+             for c in found if c.title_read]
+    return found, notes, called
+
+
 def _duplicate_item(sb: Book, ident: Identity, cand: _Candidate, why: str, notes: list[str], ai_used: bool,
-                    by_cover: bool = False, override: bool = False) -> PlanItem:
+                    by_cover: bool = False, override: bool = False, no_edition: bool = False) -> PlanItem:
     """`sb` is a duplicate of `cand`: to trash, adding the formats the kept copy lacks.
     `override`: a cover overruling the metadata; the same book, but its files may be
-    another edition's, so nothing is added to the other copy (Trash only)."""
+    another edition's, so nothing is added to the other copy (Trash only).
+    `no_edition`: see PlanItem.no_edition."""
     missing = [] if override else [f for f in sb.formats if f not in cand.formats and f != "PDF"]
     cand.formats.update(missing)  # later duplicates must not add the same format again
     reason = f"duplicate of {cand.book.label()!r} ({why})"
@@ -1168,7 +1480,7 @@ def _duplicate_item(sb: Book, ident: Identity, cand: _Candidate, why: str, notes
         reason += f"; adding {', '.join(missing)} to target copy"
     return _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=cand.book,
                             match_planned=cand.planned, add_formats=missing, ai_used=ai_used,
-                            by_cover=by_cover))
+                            by_cover=by_cover, no_edition=no_edition))
 
 
 def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolver: AIResolver | None,
@@ -1210,63 +1522,66 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
     return found, notes, called
 
 
-def _cover_decides(resolver: AIResolver, sb: Book, other: Book, comp, notes: list[str],
-                   skipped: list[str], confirm_inside: bool = False) -> tuple[bool, bool]:
-    """Whether the covers prove the same book: (same, model called). With the same
-    title and authors, the same cover is enough, whatever year or publisher the
-    metadata says. `confirm_inside` (similar titles only): when the metadata says
-    the books differ, Calibre's cover.jpg alone isn't trusted there (it may be a
-    downloaded picture), so the covers inside the files must match too."""
-    same, note, called = resolver.same_cover(sb, other)
+def _inside(ctx: _Context, a: Book, b: Book, notes: list[str], skipped: list[str]) -> tuple[str, bool]:
+    """The covers stored inside both books' files (SAME, DIFFERENT or UNCLEAR): for similar
+    titles whose metadata differ, Calibre's cover.jpg alone isn't trusted (it may be a
+    downloaded picture). Returns (verdict, model called)."""
+    resolver = ctx.resolver
+    if resolver is None:
+        notes.append("covers inside the files not compared: AI is off")
+        return UNCLEAR, False
+    same, note, called = resolver.same_embedded_cover(a, b)
     notes.append(note)
     if note and note == resolver.image_disabled_reason:
         skipped.append(SKIP_IMAGE_AI)
-    if not same or not confirm_inside or comp.verdict is not Verdict.DISTINCT:
-        return same, called
-    same, note, called_inside = resolver.same_embedded_cover(sb, other)
-    notes.append(note)
-    if note and note == resolver.image_disabled_reason:
-        skipped.append(SKIP_IMAGE_AI)
-    return same, called or called_inside
+    if same:
+        return SAME, called
+    return (DIFFERENT if note.startswith("covers inside the files: different") else UNCLEAR), called
 
 
-def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, str]],
-                    resolver: AIResolver | None, cover_check: bool, same_library: bool,
-                    notes: list[str], skipped: list[str], ai_used: bool, always_cover: bool = False) -> PlanItem:
+def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, str]], ctx: _Context,
+                    notes: list[str], skipped: list[str], ai_used: bool) -> PlanItem:
     """Books by the same author whose title contains this one's (or the other way
     round): "(Gutenberg - 0411- Brother Jacob - George Eliot)" and "Brother Jacob".
     Titles alike are weaker than the same title, so only proof makes a duplicate:
     the same ISBN, ASIN or series number, identical EPUB text, or the same cover.
-    A real difference in metadata (not only the year) or a different cover rules
-    a book out, unless "always compare covers" finds the same cover (inside the
-    files too). Anything else is left for the user to check."""
+    A real difference in metadata (not only the year), a different cover or a text in
+    another language rules a book out, unless "always compare covers" finds the same
+    cover (inside the files too). Anything else is left for the user to check."""
     unproven: list[tuple[_Candidate, str]] = []
     mine = _epub_digest(sb)
     for c, how in similar:
         comp = compare(ident, c.identity)
         proof = comp.reason if comp.proof else ""
-        if not proof and mine and _epub_digest(c.book) == mine:
+        same_text = not proof and bool(mine) and _epub_digest(c.book) == mine
+        if same_text:
             proof = "identical EPUB text"
-        if not proof and comp.verdict is Verdict.DISTINCT and not comp.year_only and not always_cover:
+        if not proof and comp.verdict is Verdict.DISTINCT and not comp.year_only and not ctx.always_cover:
             notes.append(f"similar title {c.book.label()!r} is another book: {comp.reason}")
             continue
         by_cover = False
-        if not proof and (cover_check or always_cover) and sb.has_cover and c.book.has_cover:
-            if resolver is None or resolver.vision is None:
-                notes.append(f"cover check skipped: {'AI is off' if resolver is None else 'no Image AI'}")
-                skipped.append(SKIP_COVER)
-            else:
-                same, called = _cover_decides(resolver, sb, c.book, comp, notes, skipped, confirm_inside=True)
+        if not proof and (ctx.cover_check or ctx.always_cover) and sb.has_cover and c.book.has_cover:
+            verdict, note, called, skip = _covers(ctx, sb, c.book)
+            ai_used = ai_used or called
+            notes.append(note)
+            if skip:
+                skipped.append(skip)
+            if verdict == SAME and comp.verdict is Verdict.DISTINCT:
+                verdict, called = _inside(ctx, sb, c.book, notes, skipped)
                 ai_used = ai_used or called
-                if same:
-                    proof, by_cover = "same cover", True
-                    if comp.verdict is Verdict.DISTINCT:
-                        proof += f", also inside the files; metadata differs: {comp.reason}"
-                elif notes[-1].startswith(("AI cover check: different", "covers inside the files: different")):
-                    notes.append(f"similar title {c.book.label()!r} has another cover")
-                    continue
+            if verdict == SAME:
+                proof, by_cover = "same cover", True
+                if comp.verdict is Verdict.DISTINCT:
+                    proof += f", also inside the files; metadata differs: {comp.reason}"
+            elif verdict == DIFFERENT:
+                notes.append(f"similar title {c.book.label()!r} has another cover")
+                continue
         if not proof and comp.verdict is Verdict.DISTINCT and not comp.year_only:
             notes.append(f"similar title {c.book.label()!r} is another book: {comp.reason}")
+            continue
+        other = _other_language(ctx, sb, c.book) if proof and not same_text else ""
+        if other:
+            notes.append(f"similar title {c.book.label()!r} is {other}: another book")
             continue
         if proof:
             # Books whose metadata differ: nothing is added to the other copy (Trash only).
@@ -1286,8 +1601,8 @@ def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, s
             sb, Action.LEAVE,
             _join(f"similar title to {c.book.label()!r} ({how}), not proven the same book: check manually", notes),
             ident, match=c.book, match_planned=c.planned, ai_used=ai_used))
-    action = Action.LEAVE if same_library else Action.MOVE
-    reason = "no duplicate in this library" if same_library else "not in target"
+    action = Action.LEAVE if ctx.same_library else Action.MOVE
+    reason = "no duplicate in this library" if ctx.same_library else "not in target"
     c = similar[0][0]
     return _logged(PlanItem(sb, action, _join(reason, notes), ident, match=c.book, match_planned=c.planned,
                             different=True, ai_used=ai_used))

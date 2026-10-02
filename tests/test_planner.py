@@ -79,16 +79,25 @@ def make_library(path: Path, books: list[dict]) -> str:
             conn.execute("INSERT INTO identifiers (book, type, val) VALUES (?,?,?)", (i, "isbn", b["isbn"]))
         for kind, val in b.get("ids", {}).items():
             conn.execute("INSERT INTO identifiers (book, type, val) VALUES (?,?,?)", (i, kind, val))
+        folder = path / f"a/b ({i})"
         if "text" in b:  # a real EPUB with this text and a per-book OPF and cover
-            folder = path / f"a/b ({i})"
             folder.mkdir(parents=True)
             with zipfile.ZipFile(folder / "book.epub", "w") as z:
                 z.writestr("content.opf", f"<package>{b['title']} {i}</package>")
                 body = b["text"] if b["text"].startswith("<") else f"<p>{b['text'] * 200}</p>"
                 z.writestr("text/ch1.xhtml", f"<html><head><style>p {{ x: y }}</style></head><body>{body}</body></html>")
                 z.writestr("cover.jpeg", bytes([i]) * 50)
-        for fmt in b.get("formats", ["EPUB"]):
-            conn.execute("INSERT INTO data (book, format, name) VALUES (?,?,?)", (i, fmt, "book"))
+        if b.get("cover"):  # a cover.jpg of its own: no two books' are the same file
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "cover.jpg").write_bytes(f"cover of {path.name} {i}".encode() * 10)
+        sizes = {}
+        for fmt, data in b.get("files", {}).items():  # real files, with their size in metadata.db
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"book.{fmt.lower()}").write_bytes(data)
+            sizes[fmt] = len(data)
+        for fmt in b.get("formats", list(b.get("files", {})) or ["EPUB"]):
+            conn.execute("INSERT INTO data (book, format, name, uncompressed_size) VALUES (?,?,?,?)",
+                         (i, fmt, "book", sizes.get(fmt)))
     conn.commit()
     conn.close()
     return str(path)
@@ -256,14 +265,17 @@ def test_similar_matching_needs_only_one_shared_author(libs):
 
 
 class CoverResolver(FakeResolver):
-    def __init__(self, same: bool):
+    """The Image AI calls every pair of covers the same (or different, or unsure)."""
+
+    def __init__(self, same: bool | None):
         super().__init__({})
-        self.same = same
+        self.same = same  # None: unsure
         self.cover_calls: list[tuple[str, str]] = []
 
-    def same_cover(self, a, b):
+    def ai_cover_verdict(self, a, b):
         self.cover_calls.append((a.title, b.title))
-        return self.same, f"AI cover check: {'same' if self.same else 'different'}", True
+        verdict = {True: "same", False: "different", None: "unclear"}[self.same]
+        return verdict, f"AI cover check: {'unsure' if self.same is None else verdict}", True
 
 
 def test_same_cover_proves_duplicate_when_metadata_cannot_decide(libs):
@@ -280,7 +292,7 @@ def test_same_cover_proves_duplicate_when_metadata_cannot_decide(libs):
     assert item.action is Action.LEAVE and "AI cover check: different" in item.reason
 
 
-def test_cover_check_skips_decided_pairs_and_missing_covers(libs):
+def test_cover_check_skips_decided_pairs_and_a_missing_cover_differs_in_nothing(libs):
     src, tgt, trash = libs(
         source=[{"title": "Dune", "publisher": "Ace", "year": 1990, "cover": True},
                 {"title": "Children of Dune", "cover": True}],
@@ -289,7 +301,9 @@ def test_cover_check_skips_decided_pairs_and_missing_covers(libs):
     )
     resolver = CoverResolver(same=True)
     plan = build_plan(src, tgt, trash, resolver, cover_check=True)
-    assert actions(plan) == [("Dune", Action.MOVE), ("Children of Dune", Action.LEAVE)]
+    assert actions(plan) == [("Dune", Action.MOVE), ("Children of Dune", Action.TRASH)]
+    children = plan.items[1]  # no edition data on the source copy, and no cover on the target's
+    assert children.no_edition and not children.by_cover and "no cover on 'Children of Dune" in children.reason
     assert resolver.cover_calls == []
 
 
@@ -409,8 +423,9 @@ def test_year_only_difference_is_rechecked_by_reading_both_books(libs):
     item = build_plan(src, tgt, trash, LibraryResolver(different), recheck_years=True).items[0]
     assert item.action is Action.MOVE and "1965 vs 2005, read by AI" in item.reason
 
-    nothing = LibraryResolver({})  # the AI finds no year: the metadata verdict stands
-    assert build_plan(src, tgt, trash, nothing, recheck_years=True).items[0].action is Action.MOVE
+    nothing = LibraryResolver({})  # the AI finds no year: not confirmed, and no cover check to settle it
+    item = build_plan(src, tgt, trash, nothing, recheck_years=True).items[0]
+    assert item.action is Action.LEAVE and "in Calibre only, not confirmed by reading the books" in item.reason
 
 
 def test_publisher_difference_is_not_rechecked(libs):
@@ -721,7 +736,7 @@ def test_year_recheck_without_ai_is_reported(libs):
         target=[{"title": "Dune", "publisher": "Ace", "year": 2005}],
     )
     item = build_plan(src, tgt, trash, None, recheck_years=True).items[0]
-    assert item.action is Action.MOVE and item.skipped == [SKIP_YEARS]
+    assert item.action is Action.LEAVE and item.skipped == [SKIP_YEARS]  # not confirmed: not moved
     assert "year re-check skipped: AI is off" in item.reason
 
 

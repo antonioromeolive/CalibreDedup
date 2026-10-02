@@ -433,6 +433,12 @@ class SettingsDialog(QDialog):
         self.a_similar = QCheckBox("Similar author matching (ignore initials; one shared author is enough)")
         self.a_similar.setChecked(s.similar_matching)
         self.a_cover = QCheckBox("Compare covers when metadata can't decide (needs an Image AI)")
+        self.a_cover.setToolTip(
+            "When edition and publisher can't be compared, the covers decide. With no edition data\n"
+            "to compare, two copies are the same book unless their covers differ: a missing cover, a\n"
+            "generic one or an unsure AI changes nothing (unless one copy is 3 times longer: another\n"
+            "content). Identical cover files need no AI. Without an Image AI, these books stay in the\n"
+            "source. List the books decided this way with the 'No edition data' filter.")
         self.a_cover.setChecked(s.cover_check)
         self.a_always_cover = QCheckBox("Always compare covers: the same cover means the same book, even when "
                                         "year, publisher or edition differ")
@@ -454,7 +460,9 @@ class SettingsDialog(QDialog):
         self.a_years = QCheckBox("Re-check year differences by reading both books (AI)")
         self.a_years.setToolTip("Calibre's publication date is often the original publication, not this "
                                 "edition's.\nWhen only the years differ, the AI reads the year printed in "
-                                "both books and that decides.")
+                                "both books and that decides.\nIf it can't find them, the covers decide: "
+                                "the same cover is the same book, another cover another\nedition; "
+                                "otherwise the book stays in the source.")
         self.a_years.setChecked(s.recheck_years)
         # An option that is on but won't take effect says so, and why; its value is kept.
         if not s.use_ai:

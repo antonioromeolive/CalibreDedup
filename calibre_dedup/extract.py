@@ -49,6 +49,7 @@ from xml.etree import ElementTree
 
 from . import archive_tool
 from .calibre_env import CREATE_NO_WINDOW, tool
+from .language import detect_language
 from .tempdirs import RunDir
 
 log = logging.getLogger(__name__)
@@ -60,6 +61,8 @@ EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
 MIN_TEXT = 200  # below this a PDF is considered scanned (image only)
 MIN_EPUB_TEXT = 2000  # below this an EPUB is taken as images only (no text fingerprint)
+SAMPLE_CHARS = 20000  # text read from the middle of a book, for its language
+PDF_SAMPLE_PAGES = 3  # pages read from the middle of a PDF, for its language and length
 
 
 # What a file should start with, for the formats with a clear signature (others are not checked).
@@ -148,7 +151,7 @@ class TextExtractor:
         self.text_chars = text_chars
         self.render_images = render_images
         self._converted: dict[str, str] = {}  # path -> full text (ebook-convert cache)
-        self._conversion_failed: set[str] = set()
+        self._conversion_failed: dict[str, str] = {}  # path -> the error, given again without converting
         self._covers: dict[str, bytes | None] = {}  # path -> cover inside the file
         # path -> why its text could not be read (corrupt, DRM, no Calibre reader...)
         self.failed: dict[str, str] = {}
@@ -193,6 +196,46 @@ class TextExtractor:
     def failed_formats(self, formats: dict[str, str]) -> dict[str, str]:
         """The book's formats whose text could not be read so far, with why."""
         return {fmt: self.failed[path] for fmt, path in formats.items() if path in self.failed}
+
+    def text_profile(self, formats: dict[str, str]) -> tuple[str | None, int | None]:
+        """The language of the book's text (language.detect_language) and its length in
+        characters, spaces not counted (as _visible_chars), from its best format with text:
+        (None, None) when none has any (a scanned PDF, files that can't be read). The
+        language is read in the middle of the
+        book, since front or back matter may be in another one (a Project Gutenberg
+        licence, a copyright page); a PDF's length is estimated from a few pages there.
+        A file that fails here is not marked unreadable: only the AI's reading does that."""
+        for fmt in FORMAT_PRIORITY:
+            path = formats.get(fmt)
+            if not path or not Path(path).is_file():
+                continue
+            try:
+                sample, chars = self._sample(fmt, path)
+            except Exception as e:  # corrupt, DRM, unsupported...
+                log.info("Cannot read the text of %s: %s", path, _error_line(str(e)))
+                continue
+            if len(sample.strip()) >= MIN_TEXT:
+                return detect_language(sample), chars
+        return None, None
+
+    def _sample(self, fmt: str, path: str) -> tuple[str, int | None]:
+        """(text from the middle of the book, the whole text's length)."""
+        if fmt in ("EPUB", "KEPUB"):
+            return _epub_sample(path, SAMPLE_CHARS)
+        if fmt == "PDF":
+            total = self._pdf_pages(path)
+            if total == 0:
+                return "", None
+            first = max(1, (total - PDF_SAMPLE_PAGES) // 2 + 1)
+            last = min(total, first + PDF_SAMPLE_PAGES - 1)
+            text = _clean(self._run("pdftotext", ["-f", str(first), "-l", str(last), "-enc", "UTF-8", path, "-"])
+                          .decode("utf-8", "replace"))
+            return text[:SAMPLE_CHARS], round(_letters(text) / (last - first + 1) * total)
+        if fmt == "TXT":
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        else:
+            text = self._convert(path)
+        return _middle(text, SAMPLE_CHARS), _letters(text)
 
     def embedded_cover(self, formats: dict[str, str]) -> tuple[str, bytes] | None:
         """The cover image stored inside the book's file (not Calibre's cover.jpg,
@@ -255,14 +298,14 @@ class TextExtractor:
 
     # --- other formats ---------------------------------------------------------
     def _convert(self, path: str) -> str:
-        if path in self._conversion_failed:
-            return ""
+        if path in self._conversion_failed:  # converting again would only fail again, slowly
+            raise RuntimeError(self._conversion_failed[path])
         if path not in self._converted:
             out = Path(self._tmp.name) / f"c{len(self._converted)}.txt"
             try:
                 self._run("ebook-convert", [path, str(out)], timeout=600)
-            except Exception:
-                self._conversion_failed.add(path)
+            except Exception as e:
+                self._conversion_failed[path] = str(e)
                 raise
             self._converted[path] = _clean(out.read_text(encoding="utf-8", errors="replace"))
             out.unlink(missing_ok=True)
@@ -324,6 +367,16 @@ def _slice(text: str, part: str, chars: int) -> str:
     return text[:chars] if part == "start" else text[-chars:]
 
 
+def _middle(text: str, chars: int) -> str:
+    start = max(0, (len(text) - chars) // 2)
+    return text[start:start + chars]
+
+
+def _letters(text: str) -> int:
+    """The length of a text without its spaces, as _visible_chars counts an EPUB's."""
+    return len(text) - sum(1 for c in text if c.isspace())
+
+
 def _clean(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
@@ -362,24 +415,27 @@ def _html_to_text(markup: str) -> str:
     return "".join(parser.parts)
 
 
+def _epub_spine(z: zipfile.ZipFile) -> list[str]:
+    """The names of an EPUB's text documents, in reading order."""
+    container = ElementTree.fromstring(z.read("META-INF/container.xml"))
+    opf_path = next(el.get("full-path") for el in container.iter() if el.tag.endswith("rootfile"))
+    opf = ElementTree.fromstring(z.read(opf_path))
+    base = posixpath.dirname(opf_path)
+    manifest = {el.get("id"): el.get("href") for el in opf.iter() if el.tag.endswith("}item")}
+    names = set(z.namelist())
+    spine = (posixpath.normpath(posixpath.join(base, unquote(manifest[el.get("idref")].split("#")[0])))
+             for el in opf.iter() if el.tag.endswith("}itemref") and el.get("idref") in manifest)
+    return [name for name in spine if name in names]
+
+
 def _epub_text(path: str, part: str, chars: int) -> str:
     with zipfile.ZipFile(path) as z:
-        container = ElementTree.fromstring(z.read("META-INF/container.xml"))
-        opf_path = next(el.get("full-path") for el in container.iter() if el.tag.endswith("rootfile"))
-        opf = ElementTree.fromstring(z.read(opf_path))
-        base = posixpath.dirname(opf_path)
-        manifest = {el.get("id"): el.get("href") for el in opf.iter() if el.tag.endswith("}item")}
-        spine = [manifest[el.get("idref")] for el in opf.iter()
-                 if el.tag.endswith("}itemref") and el.get("idref") in manifest]
-        names = set(z.namelist())
+        spine = _epub_spine(z)
         if part == "end":
-            spine = list(reversed(spine))
+            spine.reverse()
         collected: list[str] = []
         total = 0
-        for href in spine:
-            name = posixpath.normpath(posixpath.join(base, unquote(href.split("#")[0])))
-            if name not in names:
-                continue
+        for name in spine:
             text = _clean(_html_to_text(z.read(name).decode("utf-8", "replace")))
             if not text:
                 continue
@@ -390,6 +446,27 @@ def _epub_text(path: str, part: str, chars: int) -> str:
     if part == "end":
         collected.reverse()
     return _slice("\n\n".join(collected), part, chars)
+
+
+def _epub_sample(path: str, chars: int) -> tuple[str, int]:
+    """About `chars` of text from the middle of an EPUB, and the length of its whole text
+    (counted without parsing every page)."""
+    with zipfile.ZipFile(path) as z:
+        spine = _epub_spine(z)
+        sizes = [_visible_chars(z.read(name)) for name in spine]
+        total, seen, middle = sum(sizes), 0, 0
+        for middle, size in enumerate(sizes):  # the page where the middle of the text is
+            if seen + size >= total / 2:
+                break
+            seen += size
+        texts: dict[int, str] = {}
+        count = 0
+        for i in list(range(middle, len(spine))) + list(range(middle - 1, -1, -1)):  # then before it, if short
+            texts[i] = _clean(_html_to_text(z.read(spine[i]).decode("utf-8", "replace")))
+            count += len(texts[i])
+            if count >= chars:
+                break
+    return "\n\n".join(texts[i] for i in sorted(texts))[:chars], total
 
 
 def _epub_cover(path: str) -> bytes | None:

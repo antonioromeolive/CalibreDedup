@@ -47,6 +47,8 @@ class Book:
     series_index: float | None = None  # only meaningful with a series
     tags: set[str] = field(default_factory=set)
     last_modified: str = ""  # Calibre's, changed with the metadata or the cover
+    sizes: dict[str, int] = field(default_factory=dict)  # format -> file size, as metadata.db has it
+    languages: list[str] = field(default_factory=list)  # Calibre's codes ("ita"), in its order
 
     def label(self) -> str:
         return f"{self.title} — {' & '.join(self.authors)}"
@@ -112,6 +114,12 @@ class PlanItem:
     # e.g. the cover check with no Image AI, or the AI turned off after errors.
     skipped: list[str] = field(default_factory=list)
     by_cover: bool = False  # a duplicate because the covers are the same
+    # A duplicate only because nothing tells the copies apart: no edition data to compare,
+    # and the covers don't differ (one missing, not a real cover, or the AI unsure). Not proof.
+    no_edition: bool = False
+    # The record's title looked like a file name ("ITABOOK 0052 - Hemingway"): the book is
+    # matched with the title the AI read in it (identity.title), if it could.
+    file_name_title: str = ""
     # Title and author were swapped in the record: `identity` has them put right, and
     # Execute writes them (with "Write found metadata" on) to a moved or ticked book.
     swapped: bool = False

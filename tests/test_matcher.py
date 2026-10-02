@@ -113,3 +113,12 @@ def test_ai_readings_are_compared_like_with_like():
     c = compare(ident(year=2005, publisher="Amazon", ai_publisher="Mondadori"),
                 ident(year=2005, publisher="Mondadori", ai_publisher="Arnoldo Mondadori Editore"))
     assert c.verdict is Verdict.DUPLICATE
+
+
+def test_edition_data_that_cant_be_compared_is_a_doubt_not_a_lack():
+    # Both have data, but nothing to compare it by: an edition number and a year, a publisher and a year
+    assert compare(ident(edition=2, publisher="Ace"), ident(year=1965, publisher="Ace")).incomparable
+    assert compare(ident(publisher="Ace"), ident(year=1965)).incomparable
+    # One copy has none, or what can be compared agrees: no edition data tells them apart
+    assert not compare(ident(), ident(year=1965, publisher="Ace")).incomparable
+    assert not compare(ident(publisher="Ace"), ident(publisher="Ace", year=1965)).incomparable

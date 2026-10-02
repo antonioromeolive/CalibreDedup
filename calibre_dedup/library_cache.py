@@ -21,13 +21,15 @@
 # SOFTWARE.
 
 
-"""What was found in the files of each book (its cover, its formats), kept between
-runs: a library on a network drive is not read again, file by file, at each analysis.
+"""What was found in the files of each book (its cover, its formats, their hashes, the
+language and length of its text), kept between runs: a library on a network drive is
+not read again, file by file, at each analysis.
 An entry holds while the book's last_modified is the same: Calibre changes it when
 the book's cover or formats change (not when a file is replaced by hand)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -131,3 +133,70 @@ class FileChecks:
 
     def save(self, whole: bool = False) -> None:
         self.cache.save(whole)
+
+
+class FileHashes:
+    """The SHA-1 of a book's files, kept: read only for books that have a file of the
+    same format and size as another (the sizes come from metadata.db), to tell whether
+    it is the same file. A file that can't be read has none."""
+
+    def __init__(self, folder: Path | None):
+        self.cache = LibraryCache(folder, "hashes")
+        self._read: dict[str, str | None] = {}  # path -> digest, this run (also without last_modified)
+
+    def digest(self, b: Book, fmt: str) -> str | None:
+        path = b.formats.get(fmt)
+        if not path:
+            return None
+        if path in self._read:
+            return self._read[path]
+        name, size = Path(path).name, b.sizes.get(fmt)
+        known = self.cache.get(b)
+        entries = dict(known) if isinstance(known, dict) else {}
+        entry = entries.get(name)
+        if isinstance(entry, list) and len(entry) == 2 and entry[0] == size:
+            digest = entry[1]
+        else:
+            try:
+                h = hashlib.sha1()
+                with open(path, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
+                digest = h.hexdigest()
+            except OSError as e:
+                log.info("Cannot read %s: %s", path, e)
+                digest = None
+            if digest is not None:
+                entries[name] = [size, digest]
+                self.cache.put(b, entries)
+        self._read[path] = digest
+        return digest
+
+    def save(self) -> None:
+        self.cache.save()
+
+
+class TextFacts:
+    """The language and length of each book's text (extract.TextExtractor.text_profile),
+    kept: read again when the book's formats change."""
+
+    def __init__(self, folder: Path | None, extractor):
+        self.cache = LibraryCache(folder, "text")
+        self.extractor = extractor
+        self._read: dict[tuple, tuple[str | None, int | None]] = {}  # this run
+
+    def get(self, b: Book) -> tuple[str | None, int | None]:
+        names = {fmt: Path(path).name for fmt, path in b.formats.items()}
+        key = (b.library, b.path, tuple(sorted(b.formats.items())))
+        if key not in self._read:
+            known = self.cache.get(b)
+            if isinstance(known, dict) and known.get("formats") == names:
+                self._read[key] = (known.get("language"), known.get("chars"))
+            else:
+                language, chars = self.extractor.text_profile(b.formats)
+                self.cache.put(b, {"formats": names, "language": language, "chars": chars})
+                self._read[key] = (language, chars)
+        return self._read[key]
+
+    def save(self) -> None:
+        self.cache.save()

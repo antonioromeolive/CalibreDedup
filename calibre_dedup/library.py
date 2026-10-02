@@ -72,6 +72,13 @@ def read_books(library: str | Path) -> list[Book]:
         series = dict(conn.execute(
             "SELECT l.book, s.name FROM books_series_link l JOIN series s ON s.id = l.series"
         )) if {"books_series_link", "series"} <= tables else {}
+        languages: dict[int, list[str]] = defaultdict(list)
+        if {"books_languages_link", "languages"} <= tables:
+            for book, code in conn.execute(
+                "SELECT l.book, g.lang_code FROM books_languages_link l JOIN languages g ON g.id = l.lang_code "
+                "ORDER BY l.book, l.item_order"
+            ):
+                languages[book].append(code)
         tags: dict[int, set[str]] = defaultdict(set)
         if {"books_tags_link", "tags"} <= tables:
             for book, name in conn.execute(
@@ -108,9 +115,14 @@ def read_books(library: str | Path) -> list[Book]:
         paths = {row[0]: row[3] for row in rows}
 
         formats: dict[int, dict[str, str]] = defaultdict(dict)
-        for book, fmt, name in conn.execute("SELECT book, format, name FROM data"):
+        sizes: dict[int, dict[str, int]] = defaultdict(dict)
+        size = "uncompressed_size" if "uncompressed_size" in {
+            row[1] for row in conn.execute("PRAGMA table_info(data)")} else "NULL"
+        for book, fmt, name, length in conn.execute(f"SELECT book, format, name, {size} FROM data"):
             if book in paths:
                 formats[book][fmt.upper()] = str(library / paths[book] / f"{name}.{fmt.lower()}")
+                if length:
+                    sizes[book][fmt.upper()] = int(length)
     except sqlite3.Error as e:
         raise LibraryError(f"Cannot read {db_path}: {e}") from e
     finally:
@@ -132,7 +144,9 @@ def read_books(library: str | Path) -> list[Book]:
             series=series.get(bid) or None,
             series_index=metadata.get("series_index") if series.get(bid) else None,
             tags=tags.get(bid, set()),
+            languages=languages.get(bid, []),
             formats=formats.get(bid, {}),
+            sizes=sizes.get(bid, {}),
             has_cover=bool(metadata.get("has_cover", 0)),
             comments=metadata.get("comments") or None,
             uuid=uuid or "",

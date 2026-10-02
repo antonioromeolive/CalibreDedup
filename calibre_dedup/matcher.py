@@ -32,7 +32,9 @@ it is the same edition from the same publisher:
   the title or an author agrees too (see planner._series_agrees);
 * otherwise edition (edition number, falling back to publication year) and
   publisher are compared. If either differs, the books are distinct. If either
-  is unknown, no decision is possible.
+  is unknown, no decision is possible here: the covers decide (see planner),
+  unless both books have edition data that can't be compared (`incomparable`:
+  an edition number on one and a year on the other).
 
 Year and publisher are compared like with like: when the AI read them in both
 books, those readings are compared; otherwise the metadata of both. A
@@ -63,6 +65,10 @@ class Comparison:
     # Duplicate by an identifier (ISBN, ASIN, series and number), whatever the
     # title: enough even for books whose titles only look alike.
     proof: bool = False
+    # Unknown, but both books have edition data that can't be compared: an edition
+    # number on one and a year on the other ("2nd edition" / 1965), or a publisher on
+    # one and a year on the other. Unlike a book with none, this is a doubt.
+    incomparable: bool = False
 
 
 def _like_with_like(meta_a, ai_a, meta_b, ai_b) -> tuple:
@@ -83,7 +89,17 @@ def compare_edition(a: Identity, b: Identity) -> Comparison:
         if ya == yb:
             return Comparison(Verdict.DUPLICATE, f"same year ({ya}{source})")
         return Comparison(Verdict.DISTINCT, f"different year ({ya} vs {yb}{source})", year_only=not by_ai)
+    if (a.edition is not None or ya is not None) and (b.edition is not None or yb is not None):
+        def shown(i: Identity, year: int | None) -> str:
+            return f"edition {i.edition}" if i.edition is not None else str(year)
+        return Comparison(Verdict.UNKNOWN, f"edition not comparable ({shown(a, ya)} vs {shown(b, yb)})",
+                          incomparable=True)
     return Comparison(Verdict.UNKNOWN, "edition unknown")
+
+
+def _has_edition_data(i: Identity) -> bool:
+    return (i.edition is not None or i.year is not None or i.ai_year is not None
+            or bool(i.publisher) or bool(i.ai_publisher))
 
 
 def compare_publisher(a: Identity, b: Identity) -> Comparison:
@@ -125,7 +141,9 @@ def compare(src: Identity, tgt: Identity) -> Comparison:
     # Different ISBNs alone prove nothing: e-book and print ISBNs of the same
     # edition differ, so fall through to "unknown".
     missing = [c.reason for c in (ed, pub) if c.verdict is Verdict.UNKNOWN]
-    return Comparison(Verdict.UNKNOWN, ", ".join(missing))
+    compared = Verdict.DUPLICATE in (ed.verdict, pub.verdict)
+    incomparable = ed.incomparable or (not compared and _has_edition_data(src) and _has_edition_data(tgt))
+    return Comparison(Verdict.UNKNOWN, ", ".join(missing), incomparable=incomparable)
 
 
 @dataclass

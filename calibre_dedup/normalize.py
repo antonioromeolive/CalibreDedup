@@ -163,6 +163,23 @@ def _strip_trailing_groups(title: str) -> str:
         title = rest
 
 
+# A title Calibre took from a file name: a file extension ("Moby Dick.epub"), words joined by
+# underscores ("il_vecchio_e_il_mare"), a number padded with zeros ("ITABOOK 0052 - Hemingway",
+# "scan0012") or a code of letters and digits ("B00ABC1234"). "1984", "Fahrenheit 451" and
+# "1Q84" are titles.
+_FILE_NAME_RES = [
+    re.compile(r"\.(?:epub|kepub|pdf|mobi|azw3?|txt|rtf|docx?|odt|lit|djvu|fb2|html?|htmlz|prc|pdb|lrf|"
+               r"cb[rz7]|zip|rar|7z)\b", re.I),
+    re.compile(r"[^\W_]_+[^\W_]"),
+    re.compile(r"(?<!\d)0\d{2,}(?!\d)"),
+    re.compile(r"\b(?=[^\W\d_]*\d)(?=\d*[^\W\d_])[^\W_]{6,}\b"),
+]
+
+
+def looks_like_file_name(title: str) -> bool:
+    return any(r.search(title) for r in _FILE_NAME_RES)
+
+
 def series_key(name: str) -> str:
     """Series names compared loosely: "Gutenberg" == "gutenberg", "I casi di X" == "I Casi Di X"."""
     return " ".join(_tokens(name))

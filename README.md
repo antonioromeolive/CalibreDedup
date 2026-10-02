@@ -114,10 +114,10 @@ book:
 
 | Action | When |
 |---|---|
-| **Move to target** | The target has no book with the same title and authors, or only different editions of it. |
+| **Move to target** | The target has no book with the same title and authors, or only different editions of it (or copies in another language). |
 | **Merge & Trash** | A duplicate that has formats the target copy lacks: they are added to the target copy (except PDF), then the book goes to the trash library. |
 | **Trash only** | A duplicate with nothing to add: the book goes to the trash library. |
-| **Leave in source** | The program can't be sure: title or authors unknown, or edition and publisher can't be compared, even with AI. The reason says why, and the likely match is shown. |
+| **Leave in source** | The program can't be sure: title or authors unknown, a title made from a file name that the AI can't read, edition data that can't be compared, or no edition data but different covers. The reason says why, and the likely match is shown. |
 
 How a duplicate is recognised is explained in [How duplicates are found](#how-duplicates-are-found).
 
@@ -145,7 +145,9 @@ be ticked unless you change their action.
     usually most books), *Leave: to check* (undecided).
   - **Books:** *AI used*, *Adds formats*, *Reduced checks* (decided with fewer checks than the
     settings ask for, see [When a setting can't take effect](#when-a-setting-cant-take-effect)),
-    *Decided by cover* (see *Always compare covers*), *Unreadable files* (see
+    *Decided by cover* (see *Always compare covers*), *No edition data* (duplicates only
+    because nothing tells the copies apart, see [the covers](#how-two-books-are-compared):
+    check them before executing), *File-name title*, *Unreadable files* (see
     [Files Calibre can't open](#files-calibre-cant-open)), *Archives*, *Title/author swapped*,
     and *Other books* (none of these). A book can be of several kinds.
   - **Status:** *Checked*, *Not checked*, *Done*, *Failed* (on Execute).
@@ -199,7 +201,21 @@ empty are deleted; folders with files in them are never touched.
 
 #### Which books are compared
 
-Only books with the **same title and authors**, after normalization:
+**The same file** in two books (byte for byte: the same EPUB, PDF…) makes them duplicates
+whatever their titles and authors, without AI: "ITABOOK 0052 - Hemingway" and "Il vecchio e
+il mare" with one EPUB. Only files of the same format and size (as `metadata.db` has it) are
+read to tell, and a file shared by books of 3 or more titles *and* authors is a placeholder
+(a "file not found" page), never proof.
+
+**A title made from a file name** ("ITABOOK 0052 - Hemingway", "il_vecchio_e_il_mare",
+"Moby Dick.epub", "scan0012": a number padded with zeros, words joined by underscores, a
+file extension, a code of letters and digits) finds no copy, and is no title for the target:
+the AI reads the real title in the book, and the book is matched with that. If the AI can't
+(or is off), the book is matched as it is but **never moved**: it stays in the source. A
+target book with such a title is read by the AI when a source book by the same author finds
+no copy. The record keeps its title: the Metadata Review corrects it.
+
+Otherwise only books with the **same title and authors** are compared, after normalization:
 
 - case, accents, punctuation and a leading "The/A/An" are ignored; an apostrophe separates
   words ("Mary's" = "Mary s", as titles from file names often have it);
@@ -242,15 +258,25 @@ In this order; the first rule that decides wins:
      they are compared again.
    - **Only the years differ**: Calibre's date is often the original publication, not this
      edition's. With *Re-check year differences* (on by default) the AI reads both books and
-     the years printed in them decide; if it can't find a year in both, the metadata
-     decision stands.
+     the years printed in them decide; if it can't find a year in both, the covers decide
+     (below).
 
    Years and publishers are compared **like with like**: the AI's readings of both books,
    or else the metadata of both. The reason says so, e.g. "same year (2005, read by AI)".
-3. **Still undecided: the covers.** With *Compare covers* on and an Image AI, the same cover
-   means a duplicate. Different, unclear or missing covers decide nothing: the book stays in
-   the source. Covers are only compared between books whose title and authors already match
-   (or similar titles by the same author), and a **generic cover** is never proof: the same
+3. **Still undecided: the covers** (*Compare covers*, on by default; needs an Image AI):
+
+   | The two copies | Same cover | Different covers | A cover missing, generic, or the AI unsure |
+   |---|---|---|---|
+   | No edition data to compare (on one copy, or on both) | duplicate | stays in the source | **duplicate** |
+   | Edition data on both that can't be compared ("2nd edition" / 1965) | duplicate | stays | stays |
+   | Only Calibre's years differ, not confirmed in the books | duplicate (Trash only) | moved | stays |
+
+   With no edition data, nothing tells the two copies apart: they are the same book unless
+   their covers differ. The *No edition data* filter lists these duplicates, to check before
+   executing. Without an Image AI (or with *Compare covers* off) the covers say nothing and
+   these books stay in the source; **identical cover files** need no AI.
+   Covers are only compared between books whose title and authors already match
+   (or similar titles by the same author), and a **generic cover** is never a real cover: the same
    image on books of 3 or more different titles *and* authors, e.g. the "Microsoft Word 2000"
    logo a converter took from a document, or a publisher's stock picture.
    To find them, every cover of both libraries is looked at before the first book. What is
@@ -258,6 +284,16 @@ In this order; the first rule that decides wins:
    look at new or changed books; the first time, a big library on a network drive can take
    minutes. *Skip looking for generic covers* (settings) skips this step, for tests only:
    a placeholder cover may then make two different books duplicates.
+
+**Another language, another content.** A duplicate found this way is not one when the two
+texts are in different languages, even with the same ISBN (a translation, or a wrong ISBN):
+the book is moved (or, within one library, left). The language is told from the book's own
+text, by its most common words, read in the middle of the book (Italian, English, French,
+German, Spanish, Portuguese, Dutch; no AI): Calibre's *Languages* field is often wrong. And a
+copy found only because nothing tells it apart (no edition data) is not a duplicate when one
+copy is **3 times longer** than the other (a collection and one of its stories, a complete
+and an abridged edition): it stays in the source. The text is read only with an AI selected
+(the analysis reads nothing else with the AI off); what is found is remembered per library.
 
 A duplicate is **Merge & Trash** when it has formats the kept copy lacks (except PDF), which
 are added to the kept copy first; otherwise it is **Trash only**.
@@ -306,7 +342,8 @@ dropping the author, bare numbers and a collection name followed by a number. So
 But "Dune Messiah" and "Dune" don't: "Messiah" is part of the title. Alike titles are weaker
 than the same title, so **only proof makes a duplicate**: the same ISBN, ASIN or series
 number, identical EPUB text, or the same cover. A real difference in edition or publisher
-(not only the year), or a different cover, rules the book out: it is moved. Anything else is
+(not only the year), a different cover, or a text in another language rules the book out: it
+is moved. Anything else is
 left in the source, "similar title to …, not proven the same book: check manually", with the
 match shown so you can open both.
 
@@ -329,6 +366,8 @@ Books are not compared with every other book (billions of pairs in a large libra
 1. **Best copy first.** Books are sorted by format, then by how much metadata they have
    (formats, cover, description, publisher, year, ISBNs). A book with an EPUB comes first,
    then MOBI, then AZW/AZW3, then the rest. The first copy of each group is the one kept.
+   Between two libraries the source books are sorted the same way: of two source copies of
+   one book, the best is moved and the other is trashed into it.
 2. **Look up, then add.** Each book's title and authors give a key; a dictionary from key to
    the books already analyzed gives its candidates in one lookup, and the book is added only
    after its decision. So a book never meets itself, and each pair is compared once.
@@ -397,9 +436,9 @@ RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
 | PDF pages to read / Characters to read | 6 / 12,000 | How much of a book the AI reads, from the start (and the end). |
 | Ignore subtitles when comparing titles | off | "Dune: Messiah" = "Dune". |
 | Similar author matching | on | Initials ignored; one shared author is enough. |
-| Compare covers when metadata can't decide | on | Needs an Image AI. |
+| Compare covers when metadata can't decide | on | With no edition data, the same book unless the covers differ. Needs an Image AI. |
 | Always compare covers | off | The same cover makes a duplicate even when the metadata differs. |
-| Re-check year differences by reading both books | on | The years printed in the books decide. |
+| Re-check year differences by reading both books | on | The years printed in the books decide; if not found, the covers. |
 | Same title, author written differently | on | "Frederickk Marryat" / "Frederick Marryat"; AI for other spellings. |
 | Match similar titles by the same author | on | Needs proof: ISBN, same text or same cover. |
 | Same series + same number = same book | off | For reliably numbered collections only. |
@@ -436,8 +475,9 @@ also saves it as CSV.
 
 It reads **every** book of one library with the AI (the first pages and, with an Image AI,
 the cover) and compares what it read with Calibre's metadata. Where they differ, it proposes
-an update of **title, authors, publisher, year and series (with its number)**, as printed in
-the book itself.
+an update of **title, authors, publisher, year, series (with its number), ISBN and
+language**, as printed in the book itself. **In doubt, the metadata stays as it is**: a
+value is replaced only when the book supports the change (see *Which changes are ticked*).
 
 Choose the **library to review** and the **trash library**, then **1. Analyze (dry run)**.
 
@@ -462,10 +502,35 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   Remover (any ticked entry within a list, all lists together):
   - **Actions:** *Update*, *Keep*, *Trash*.
   - **Books:** *With differences* (ticked at the start; also books that Execute changes
-    anyway: sent to the trash, archive unpacked), *Not read* (no file, no text, errors),
-    *Unreadable files*, *Archives*, *Generic cover*, *Other books* (none of these).
+    anyway: sent to the trash, archive unpacked), *Changes left out* (see below), *Not read*
+    (no file, no text, errors), *Unreadable files*, *Archives*, *Bad cover*, *Other books*
+    (none of these).
   - **Status:** *Checked*, *Not checked*, *Done*, *Failed*.
-- **Choosing:** books with differences are proposed for **Update** and ticked.
+- **Which changes are ticked.** An empty field filled loses nothing: ticked. A value
+  replaced must be **supported by the book**: the value the AI read is printed in the pages
+  it read, and Calibre's is not (the evidence is taken when the AI reads the book, and kept
+  with its answer). The others are **left out**: shown struck through, with the reason on
+  mouse-over, and never written unless you turn them on (right-click → *Change … again*):
+  - *Calibre's value is printed in the book* ("Polluce Quinto" is in the book: not replaced by
+    the title of the magazine issue that holds it);
+  - *the new value is not in the book's text* (e.g. read from the cover only);
+  - *an author would be lost* ("Heinlein, Bradbury, Amis" or "F. Brown e altri" cut to one name);
+  - *the issue or volume number would be lost* ("Galaxy N 04" → "Galaxy"), unless it becomes
+    the series number;
+  - *a series name, not a publisher* ("Galassia", "Urania": any series of the library or read
+    by the AI), *an author's name, not a publisher*;
+  - *not checked against the book*: no text to check (a scanned book), or Calibre's value
+    changed since the AI read it.
+
+  A record with **title and author swapped** (the title in the author field, or the author's
+  name as title) is put right. The **ISBN** is proposed only for a book that has none, and only
+  one printed in its pages (several: the print and the e-book's, or other books listed). The
+  **language** is the one of the book's own text, told by its common words without AI (Calibre's
+  field is often the library's default): a different language is ticked only when the text tells
+  it; for a scanned book the AI's answer fills an empty field only. The *Changes left out* filter
+  lists the books with changes left out; the Execute confirmation counts them.
+- **Choosing:** books with differences are proposed for **Update**, ticked when they have
+  something to write.
   - The **Change:** boxes turn a field on or off for all books (e.g. never change the
     publisher).
   - Right-click turns one field off for the selected books ("Don't change publisher", shown
@@ -686,6 +751,7 @@ there automatically.
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
 | `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes |
 | `selections.json` | Merge and Dedup | remembered ticks and changes, per source/target pair |
+| `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
 
@@ -752,6 +818,9 @@ authors and no other book of the same title sends nothing.
   (colophon) only if what was needed is still missing.
 - **Sent when**, for each book:
   - it has **no title or no authors** in Calibre;
+  - its **title looks like a file name** ("ITABOOK 0052 - Hemingway"): for the real title. A
+    target book with such a title is read too (once), when a source book by the same author
+    finds no copy;
   - another book has the **same title and authors**, the metadata can't decide and the EPUB
     text isn't identical: this book is read if its edition or publisher is missing, and so is
     each other copy missing them;

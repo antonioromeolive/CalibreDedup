@@ -520,6 +520,11 @@ BOOK_ENTRIES: list[Entry] = [
     ("reduced", "Reduced checks", "Decided with fewer checks than the settings ask for (no Image AI, AI off or "
                                   "stopped): analyze again once that is fixed."),
     ("cover", "Decided by cover", "Duplicates proven by the same cover: check those whose metadata differ."),
+    ("no_edition", "No edition data", "Duplicates only because nothing tells the copies apart: no edition data to "
+                                      "compare, and the covers don't differ (one missing, not a real cover, or the "
+                                      "AI unsure). Check them before executing."),
+    ("file_name", "File-name title", "The title in Calibre is a file name: the book was matched with the title the "
+                                     "AI read in it, or is not moved without one."),
     ("unreadable", "Unreadable files", "Files Calibre can't open (a format it doesn't read, a fake PDF)."),
     ("archives", "Archives", "Books stored as RAR/ZIP/7Z: their archive can be unpacked on Execute."),
     ("swapped", "Title/author swapped", "Title and author were swapped in Calibre: the list shows them put "
@@ -535,8 +540,9 @@ def action_key(it: PlanItem) -> str:
 
 def book_kinds(it: PlanItem) -> set[str]:
     kinds = {k for k, on in (("ai", it.ai_used), ("formats", it.add_formats), ("reduced", it.skipped),
-                             ("cover", it.by_cover), ("unreadable", it.bad_formats), ("archives", it.archives),
-                             ("swapped", it.swapped)) if on}
+                             ("cover", it.by_cover), ("no_edition", it.no_edition),
+                             ("file_name", it.file_name_title), ("unreadable", it.bad_formats),
+                             ("archives", it.archives), ("swapped", it.swapped)) if on}
     return kinds or {"other"}
 
 

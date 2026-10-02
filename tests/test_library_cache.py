@@ -73,3 +73,33 @@ def test_without_last_modified_or_a_folder_nothing_is_kept(tmp_path, monkeypatch
     checks.save()
     assert len(checked) == 2 and not (tmp_path / "cache").exists()
     FileChecks(None).bad(replace(b, last_modified="x"))
+
+
+def test_file_hashes_are_kept_until_the_book_changes(tmp_path):
+    from pathlib import Path
+    from calibre_dedup.library_cache import FileHashes
+    b = replace(book(tmp_path, {"EPUB": b"PK one"}), sizes={"EPUB": 6})
+    hashes = FileHashes(tmp_path / "cache")
+    first = hashes.digest(b, "EPUB")
+    hashes.save()
+    Path(b.formats["EPUB"]).write_bytes(b"PK two")  # the same size: only the cache can tell
+    assert FileHashes(tmp_path / "cache").digest(b, "EPUB") == first
+    assert FileHashes(tmp_path / "cache").digest(replace(b, last_modified="2026-02-02"), "EPUB") != first
+    gone = replace(b, formats={"EPUB": str(tmp_path / "gone.epub")})
+    assert FileHashes(None).digest(gone, "EPUB") is None  # a file that can't be read has none
+
+
+def test_the_text_of_a_book_is_read_once(tmp_path):
+    from calibre_dedup.library_cache import TextFacts
+    calls = []
+
+    class Reader:
+        def text_profile(self, formats):
+            calls.append(formats)
+            return "ita", 1234
+
+    b = book(tmp_path, {"EPUB": b"PK"})
+    facts = TextFacts(tmp_path / "cache", Reader())
+    assert facts.get(b) == facts.get(b) == ("ita", 1234) and len(calls) == 1
+    facts.save()
+    assert TextFacts(tmp_path / "cache", Reader()).get(b) == ("ita", 1234) and len(calls) == 1
