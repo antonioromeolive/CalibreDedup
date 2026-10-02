@@ -22,7 +22,8 @@
 
 """Persistent settings, stored as JSON in the user's config folder.
 
-API keys go to the OS credential store (keyring) when available.
+Each program keeps its own settings file; the list of AI providers is shared
+(ai_profiles.json). API keys go to the OS credential store (keyring) when available.
 """
 
 from __future__ import annotations
@@ -45,8 +46,9 @@ ANTHROPIC = "anthropic"
 
 
 DATA_DIR_NAME = ".CalibreDedup"
-SETTINGS_FILE = "settings.json"  # the duplicate remover
+SETTINGS_FILE = "settings.json"  # Merge and Dedup
 REVIEW_SETTINGS_FILE = "review_settings.json"  # calibre-review: its own copy, see load_review_settings
+PROFILES_FILE = "ai_profiles.json"  # the AI providers, shared by both programs
 
 
 def config_dir() -> Path:
@@ -126,6 +128,8 @@ class Settings:
     # Cleanup of the source: nothing is copied to the target; only the source books already
     # in the target go to the trash library (not those whose target copy lacks a format).
     cleanup_only: bool = False
+    only_tag: str = ""  # analyze only the source books with this tag; "" = all
+    only_tag_exclude: bool = False  # ... all the source books except those with it, instead
     update_metadata: bool = True  # write AI-found title/authors/publisher to moved books
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""
@@ -139,6 +143,8 @@ class Settings:
     review_fields: list[str] = field(default_factory=lambda: ["title", "authors", "publisher", "year", "series"])
     review_window_geometry: str = ""
     review_skip_reviewed: bool = True  # skip books tagged AIReviewed (review.REVIEWED_TAG)
+    review_tag: str = ""  # review only the books with this tag; "" = all
+    review_tag_exclude: bool = False  # ... all the books except those with it, instead
 
     def profile(self, name: str | None = None) -> ProviderProfile | None:
         name = self.text_profile if name is None else name
@@ -155,14 +161,47 @@ class Settings:
         p = self.profile(self.image_profile)
         return p if p is not None and p.vision else None
 
+    def _fix_choices(self) -> None:
+        """A Text/Image AI the other program renamed or removed: the first profile / none."""
+        names = [p.name for p in self.profiles]
+        if self.text_profile and self.text_profile not in names:
+            log.info("Text AI %r no longer exists", self.text_profile)
+            self.text_profile = names[0] if names else ""
+        if self.image_profile and self.image_profile not in names:
+            log.info("Image AI %r no longer exists", self.image_profile)
+            self.image_profile = ""
+
     # --- persistence -------------------------------------------------------
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":
-        """Settings from `path` (default: the duplicate remover's); save() writes them back there."""
+        """Settings from `path` (default: Merge and Dedup's); save() writes them back there.
+        The AI profiles come from ai_profiles.json in the same folder."""
         path = path or config_dir() / SETTINGS_FILE
         settings = cls._read(path)
         settings._path = path  # not a field: never saved
+        shared = _load_profiles(path)
+        if shared is not None:
+            settings.profiles = shared
+        settings._fix_choices()
         return settings
+
+    def _settings_path(self) -> Path:
+        return getattr(self, "_path", None) or config_dir() / SETTINGS_FILE
+
+    def reload_profiles(self) -> bool:
+        """Take in the profiles as saved now (perhaps edited by the other program).
+        True if they changed; the Text/Image AI choices are fixed if they no longer exist."""
+        shared = _load_profiles(self._settings_path())
+        if shared is None or [asdict(p) for p in shared] == [asdict(p) for p in self.profiles]:
+            return False
+        self.profiles = shared
+        self._fix_choices()
+        return True
+
+    def save_profiles(self) -> None:
+        """Write the AI profiles for both programs (only the Settings dialog changes them)."""
+        _write_json(self._settings_path().parent / PROFILES_FILE,
+                    {"profiles": [asdict(p) for p in self.profiles]})
 
     @classmethod
     def _read(cls, path: Path) -> "Settings":
@@ -174,27 +213,76 @@ class Settings:
             log.warning("Ignoring unreadable settings %s: %s", path, e)
             return cls()
         known = {f.name for f in fields(cls)}
-        pknown = {f.name for f in fields(ProviderProfile)}
         settings = cls(**{k: v for k, v in data.items() if k in known and k != "profiles"})
-        if "profiles" in data:
-            settings.profiles = [
-                ProviderProfile(**{k: v for k, v in p.items() if k in pknown}) for p in data["profiles"]
-            ]
+        if "profiles" in data:  # saved before ai_profiles.json
+            settings.profiles = _profiles_from(data["profiles"])
         if "text_profile" not in data:  # settings saved before text/image profiles
             settings.text_profile = data.get("active_profile", settings.text_profile) if data.get("use_ai", True) else ""
             settings.image_profile = data.get("vision_profile", "")
         return settings
 
     def save(self, path: Path | None = None) -> None:
-        path = path or getattr(self, "_path", None) or config_dir() / SETTINGS_FILE
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        """Everything but the AI profiles (see save_profiles): a program left open with
+        an old list must not undo the other's changes. They stay in the file only while
+        ai_profiles.json couldn't be written."""
+        path = path or self._settings_path()
+        data = asdict(self)
+        if (path.parent / PROFILES_FILE).is_file():
+            del data["profiles"]
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _profiles_from(items: list) -> list[ProviderProfile]:
+    known = {f.name for f in fields(ProviderProfile)}
+    return [ProviderProfile(**{k: v for k, v in p.items() if k in known}) for p in items]
+
+
+def _read_json(path: Path):
+    """The file's data; None if it is missing or unreadable."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log.warning("Ignoring unreadable %s: %s", path, e)
+        return None
+
+
+def _write_json(path: Path, data) -> None:
+    tmp = path.with_name(path.name + ".tmp")  # the other program never reads half a file
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_profiles(settings_path: Path) -> list[ProviderProfile] | None:
+    """The shared AI profiles (ai_profiles.json next to the settings); None = none saved.
+    The first time, they are made from calibre-review's list, else Merge and Dedup's,
+    as both programs kept their own copy before."""
+    folder = settings_path.parent
+    shared = folder / PROFILES_FILE
+    if shared.exists():
+        data = _read_json(shared)
+        if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+            return _profiles_from(data["profiles"])
+        return None
+    for source in (folder / REVIEW_SETTINGS_FILE, folder / SETTINGS_FILE, settings_path):
+        data = _read_json(source)
+        if isinstance(data, dict) and "profiles" in data:
+            profiles = _profiles_from(data["profiles"])
+            try:
+                _write_json(shared, {"profiles": [asdict(p) for p in profiles]})
+                log.info("AI profiles shared in %s, taken from %s", shared, source)
+            except OSError as e:
+                log.warning("Could not write %s: %s", shared, e)
+            return profiles
+    return None
 
 
 def load_review_settings() -> Settings:
-    """calibre-review's settings, separate from the duplicate remover's so that both can
+    """calibre-review's settings, separate from Merge and Dedup's so that both can
     run at the same time. The first time, they start as a copy of the duplicate
-    remover's (AI profiles, trash library, Calibre folder…); after that each program
-    keeps its own. API keys stay shared: they are stored per profile name."""
+    remover's (trash library, Calibre folder…); after that each program keeps its
+    own. The AI profiles (ai_profiles.json) and API keys (per profile name) are shared."""
     path = config_dir() / REVIEW_SETTINGS_FILE
     dedup = config_dir() / SETTINGS_FILE
     if not path.exists() and dedup.is_file():

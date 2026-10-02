@@ -38,7 +38,7 @@ from .library_use import LibraryInUse, LibraryUse
 from .models import Action
 from .planner import build_plan, run_summary
 from .report import write_csv
-from .session import make_resolver, require_calibre_dir
+from .session import make_resolver, require_calibre_dir, tag_option
 
 
 def run(argv: list[str]) -> int:
@@ -61,6 +61,10 @@ def _run(argv: list[str]) -> int:
     ap.add_argument("--cleanup-only", action="store_true", default=None,
                     help="only send the source books already in the target to the trash library; "
                          "copy nothing to the target (default: as set in the GUI)")
+    by_tag = ap.add_mutually_exclusive_group()
+    by_tag.add_argument("--tag", help="analyze only the source books with this tag; '' for all "
+                                      "(default: as set in the GUI)")
+    by_tag.add_argument("--except-tag", help="analyze all the source books except those with this tag")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
     ap.add_argument("--no-cache", action="store_true",
@@ -77,6 +81,7 @@ def _run(argv: list[str]) -> int:
                         format="%(levelname)s %(message)s")
     perf.configure("calibre_dedup_perf.log")
     tempdirs.sweep()
+    tag, tag_exclude = tag_option(args, settings.only_tag, settings.only_tag_exclude)
     if args.text_profile:
         settings.text_profile = args.text_profile
     if args.image_profile is not None:
@@ -105,6 +110,7 @@ def _run(argv: list[str]) -> int:
                           author_variants=settings.author_variants, fix_swapped=settings.fix_swapped,
                           trash_unreadable=settings.trash_unreadable,
                           cleanup_only=settings.cleanup_only if args.cleanup_only is None else True,
+                          tag=tag, tag_exclude=tag_exclude,
                           unpack=(lambda n: True) if args.unpack else None)
         print(file=sys.stderr)
     finally:

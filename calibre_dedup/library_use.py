@@ -45,7 +45,7 @@ from .tempdirs import lock, unlock
 
 ANALYZED, TRASH, EXECUTING = "analyzed", "trash", "exec"
 _CONFLICTS = {ANALYZED: TRASH, TRASH: ANALYZED}
-PROGRAM_NAMES = {"dedup": "Calibre Duplicate Remover", "review": "calibre-review"}
+PROGRAM_NAMES = {"dedup": "Calibre Merge and Dedup", "review": "calibre-review"}
 
 
 class LibraryInUse(Exception):

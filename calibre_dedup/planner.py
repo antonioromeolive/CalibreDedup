@@ -58,7 +58,7 @@ from .ai import (
 )
 from .covers import generic_covers, generic_note
 from .extract import TextExtractor, cover_png, epub_text_digest, unreadable_formats
-from .library import read_books
+from .library import read_books, tag_filter_text, tag_selects
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
 from .normalize import (
@@ -646,6 +646,8 @@ def build_plan(
     fix_swapped: bool = False,
     trash_unreadable: bool = False,
     cleanup_only: bool = False,
+    tag: str = "",
+    tag_exclude: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
     unpack: Callable[[int], bool] | None = None,
 ) -> Plan:
@@ -665,14 +667,24 @@ def build_plan(
     analyzed, and matched, with them put right (PlanItem.swapped).
     `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
     (RAR, ZIP, 7Z) of the n books that have one (see archives.ask_once); None: archives
-    are left as they are. Needs the AI's resolver (its extractor)."""
+    are left as they are. Needs the AI's resolver (its extractor).
+    `tag`: only the source books with this tag (with `tag_exclude`, without it) get an
+    item; the others are still matched against (in one library, as copies that stay:
+    see _keep_chosen). The target is always read whole."""
     check_libraries(source, target, trash)
     progress = progress or (lambda *_: None)
+    tag = tag.strip()
+    tag_exclude = tag_exclude and bool(tag)
     source_books = read_books(source)
-    unpack = ask_once(source_books, unpack) if resolver is not None else None
+    chosen = [b for b in source_books if tag_selects(b, tag, tag_exclude)]
+    unpack = ask_once(chosen, unpack) if resolver is not None else None
     same_library = str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
     target_books = read_books(target) if Path(target, "metadata.db").is_file() else []
-    plan = Plan(source, target, trash, total_books=len(source_books), same_library=same_library)
+    plan = Plan(source, target, trash, total_books=len(chosen), same_library=same_library,
+                tag=tag, tag_exclude=tag_exclude)
+    if tag:
+        log.info("Only the %d of %d source books %s are analyzed", len(chosen), len(source_books),
+                 tag_filter_text(tag, tag_exclude))
     if resolver is not None and (cover_check or always_cover):
         resolver.generic = generic_covers(source_books + target_books)
 
@@ -708,16 +720,32 @@ def build_plan(
             tb = put_right(tb) or tb
             add_to_index(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
 
-    total = len(source_books)
-    analysis_books = source_books
+    total = len(chosen)
+    analysis_books = chosen
     cleanup = cleanup_only and not same_library
     unreadable: dict[int, dict[str, str]] = {}  # id(book) -> its formats Calibre can't open
+
+    def keep_rank(b: Book) -> tuple:
+        """Of two copies, the one to keep: the best format (EPUB, MOBI, AZW), then the richer metadata."""
+        return -_format_rank(b, unreadable[id(b)]), _metadata_richness(b)
+
     if same_library or cleanup:
-        # Of two copies, the one decided first is kept: the best format (EPUB, MOBI, AZW),
-        # then the richer metadata.
+        # Of two copies, the one decided first is kept.
         unreadable = {id(b): unreadable_formats(b.formats) for b in source_books}
-        analysis_books = sorted(source_books, key=lambda b: (-_format_rank(b, unreadable[id(b)]),
-                                                             _metadata_richness(b)), reverse=True)
+        analysis_books = sorted(chosen, key=keep_rank, reverse=True)
+    # One library, with a tag filter: the books it leaves out are copies that stay, matched
+    # as they are (no AI reads them unless a chosen book needs it). candidate book -> record
+    others: dict[int, tuple[_Candidate, Book]] = {}
+    if same_library and tag:
+        for ob in source_books:
+            bad = unreadable[id(ob)]
+            if tag_selects(ob, tag, tag_exclude) or (bad and set(bad) >= set(ob.formats)):
+                continue  # an unreadable book is no copy to keep
+            book = replace(ob, formats={f: p for f, p in ob.formats.items() if f not in bad}) if bad else ob
+            book = put_right(book) or book
+            c = _Candidate(book, metadata_identity(book, same_series), planned=False)
+            add_to_index(c)
+            others[id(book)] = (c, ob)
     libraries = [Path(source, "metadata.db")] + ([Path(target, "metadata.db")] if target_books else [])
     checked = time.monotonic()
 
@@ -785,6 +813,10 @@ def build_plan(
                 break
             log.warning("File error on %s: %s", sb.label(), e)
             item = PlanItem(sb, Action.LEAVE, f"file error: {e}", metadata_identity(sb))
+        if item.action is Action.TRASH and item.match is not None and id(item.match) in others:
+            c, record = others[id(item.match)]
+            if keep_rank(sb) > keep_rank(record):
+                item = _keep_chosen(item, c, tag_filter_text(tag, not tag_exclude))
         # File errors are also caught (as "unreadable") deeper down: a vanished
         # drive would quietly leave books undecided. Check, at most once a second.
         if time.monotonic() - checked >= 1:
@@ -862,6 +894,18 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
 
 UNREADABLE_REASON = "no file Calibre can open"
 CLEANUP = "cleanup only"
+
+
+def _keep_chosen(item: PlanItem, cand: _Candidate, other: str) -> PlanItem:
+    """In one library, a book the tag filter chose whose duplicate it left out (`other`:
+    "not tagged 'New'"), when the chosen one is the copy to keep (better format or
+    metadata). The other one is not handled, so neither is trashed: left, with the
+    match, so the user can still Trash it into it."""
+    cand.formats.difference_update(item.add_formats)  # nothing is added to it after all
+    base, bracket, notes = item.reason.partition(" [")
+    reason = (f"{base.split('; adding ')[0]}; this copy is the one to keep (better format or "
+              f"metadata), and the other is {other}: neither is handled{bracket}{notes}")
+    return _logged(replace(item, action=Action.LEAVE, add_formats=[], reason=reason))
 
 
 def _cleanup_only(item: PlanItem) -> bool:

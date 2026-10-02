@@ -140,6 +140,40 @@ def read_books(library: str | Path) -> list[Book]:
     return books
 
 
+def library_tags(library: str | Path) -> list[str]:
+    """The tags used by the library's books, sorted; [] if it can't be read."""
+    db_path = Path(library, "metadata.db")
+    if not db_path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            names = [row[0] for row in conn.execute(
+                "SELECT DISTINCT t.name FROM tags t JOIN books_tags_link l ON l.tag = t.id")]
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return []
+    return sorted((n for n in names if n), key=str.casefold)
+
+
+def has_tag(book: Book, tag: str) -> bool:
+    """`tag` (any case) is one of the book's tags; an empty tag matches every book."""
+    tag = tag.strip().casefold()
+    return not tag or tag in {t.casefold() for t in book.tags}
+
+
+def tag_selects(book: Book, tag: str, exclude: bool = False) -> bool:
+    """The tag filter keeps the book: it has `tag` (with `exclude`, it hasn't); no tag keeps all."""
+    return not tag.strip() or has_tag(book, tag) != exclude
+
+
+def tag_filter_text(tag: str, exclude: bool = False) -> str:
+    """The filter as shown to the user: "tagged 'New'", "not tagged 'New'"; "" for none."""
+    tag = tag.strip()
+    return f"{'not ' if exclude else ''}tagged {tag!r}" if tag else ""
+
+
 def _year(pubdate: str | None) -> int | None:
     # Calibre stores an undefined date as year 101.
     try:

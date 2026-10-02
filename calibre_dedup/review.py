@@ -50,7 +50,7 @@ from .calibre_env import calibre_is_running
 from .config import config_dir
 from .covers import BAD_COVER_TAG, cover_file, generic_covers, generic_note
 from .extract import cover_png, unreadable_formats
-from .library import LibraryError, read_books
+from .library import LibraryError, read_books, tag_filter_text, tag_selects
 from .models import Book
 from .normalize import authors_key, is_unknown, same_publisher, series_key, strip_accents
 from .planner import MAX_LIBRARY_PATH, AIResolver
@@ -204,7 +204,7 @@ REVIEW_CACHE_FILE = "review_cache.json"
 
 
 def review_cache(off: bool = False) -> AICache:
-    """calibre-review's own AI cache, so that it can run with the duplicate remover
+    """calibre-review's own AI cache, so that it can run with Merge and Dedup
     (each writes its whole cache back). The first time it starts as a copy of the
     shared ai_cache.json, which holds the answers of reviews made before the split.
     `off`: no cache (see AICache)."""
@@ -348,6 +348,8 @@ class ReviewResult:
     items: list[ReviewItem] = field(default_factory=list)
     total_books: int = 0  # books to review (not counting the skipped ones)
     skipped: int = 0  # books already tagged REVIEWED_TAG, not read again
+    tag: str = ""  # only the books with this tag were reviewed; "" = all
+    tag_exclude: bool = False  # ... without this tag, instead
     stopped: bool = False
     stats: dict[str, int] = field(default_factory=dict)
     ai_down: list[str] = field(default_factory=list)
@@ -379,18 +381,25 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  cancel: threading.Event | None = None,
                  on_item: Callable[[ReviewItem], None] | None = None,
                  skip_reviewed: bool = True,
-                 unpack: Callable[[int], bool] | None = None) -> ReviewResult:
+                 unpack: Callable[[int], bool] | None = None,
+                 tag: str = "", tag_exclude: bool = False) -> ReviewResult:
     """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
     `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
-    of the n books that have one (see archives.ask_once); None: archives are read as they are."""
+    of the n books that have one (see archives.ask_once); None: archives are read as they are.
+    `tag`: review only the books with this tag (with `tag_exclude`, without it); "" = all."""
     check_libraries(library, trash)
     books = read_books(library)
     generic = generic_covers(books)  # over the whole library: reviewed books show the image too
+    tag = tag.strip()
+    tag_exclude = tag_exclude and bool(tag)
+    books = [b for b in books if tag_selects(b, tag, tag_exclude)]
     skipped = sum(1 for b in books if is_reviewed(b)) if skip_reviewed else 0
     if skipped:
         books = [b for b in books if not is_reviewed(b)]
-    result = ReviewResult(library, trash, total_books=len(books), skipped=skipped)
-    log.info("Reviewing %d books of %s%s", len(books), library,
+    result = ReviewResult(library, trash, total_books=len(books), skipped=skipped, tag=tag,
+                          tag_exclude=tag_exclude)
+    filtered = tag_filter_text(tag, tag_exclude)
+    log.info("Reviewing %d books of %s%s%s", len(books), library, f" {filtered}" if filtered else "",
              f" ({skipped} tagged {REVIEWED_TAG} skipped)" if skipped else "")
     unpack = ask_once(books, unpack)
     perf.run_start("review", len(books), reviewer.provider, reviewer.vision)
@@ -500,7 +509,8 @@ def summary(result: ReviewResult) -> str:
     failed = sum(1 for i in result.items if i.found is None)
     changed = sum(1 for i in result.items if i.changes)
     head = (f"Stopped after {len(result.items)} of {result.total_books} books" if result.stopped
-            else f"{len(result.items)} books reviewed")
+            else f"{len(result.items)} books reviewed") + (
+        f" ({tag_filter_text(result.tag, result.tag_exclude)})" if result.tag else "")
     skipped = f" · {result.skipped} already {REVIEWED_TAG}, skipped" if result.skipped else ""
     return (f"{head}: {changed} with differences, {failed} not read{skipped} · AI: {read} read, "
             f"{cached} from cache" + "".join(f" · {r}" for r in result.ai_down))

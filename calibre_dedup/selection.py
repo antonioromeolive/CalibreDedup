@@ -174,7 +174,9 @@ def has_metadata_update(i: PlanItem) -> bool:
 
 # --- remembering choices --------------------------------------------------------
 class SelectionStore:
-    """Remembers unchecked items and overrides per (source, target) pair, keyed by book UUID."""
+    """Remembers unchecked items and overrides per (source, target) pair, keyed by book UUID.
+    An analysis of only the books with a tag counts as another pair: its choices are
+    kept apart, and never replace those of the whole library (or of another tag)."""
 
     def __init__(self, path: Path | None = None):
         self.path = path or config_dir() / "selections.json"
@@ -182,7 +184,8 @@ class SelectionStore:
     @staticmethod
     def _key(plan: Plan) -> str:
         norm = [str(Path(p).resolve()).casefold() for p in (plan.source_library, plan.target_library)]
-        return " -> ".join(norm)
+        tag = plan.tag.strip().casefold()
+        return " -> ".join(norm) + (f" #{'not-' if plan.tag_exclude else ''}tag:{tag}" if tag else "")
 
     def _read(self) -> dict:
         try:

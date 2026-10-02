@@ -21,7 +21,7 @@
 # SOFTWARE.
 
 """The cover(s) of the selected row, beside the table: one book (calibre-review), or
-a book and its match stacked (the duplicate remover), to compare them at a glance."""
+a book and its match stacked (Merge and Dedup), to compare them at a glance."""
 
 from __future__ import annotations
 

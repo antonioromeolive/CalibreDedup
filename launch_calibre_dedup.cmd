@@ -54,6 +54,6 @@ exit /b 0
 %PYTHON% -m calibre_dedup %*
 if errorlevel 1 (
     echo.
-    echo Calibre Duplicate Remover ended with an error.
+    echo Calibre Merge and Dedup ended with an error.
     pause
 )

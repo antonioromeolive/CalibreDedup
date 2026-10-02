@@ -26,7 +26,10 @@ providers (calls, tokens, time). Holds no book metadata: a book is only its
 number in the run, and texts and images only their sizes.
 
 Events: "run_start" / "run_end" around an analysis or a review scan, and "call"
-for each AI request (the connection test's too, with "book": null)."""
+for each AI request (the connection test's too, with "book": null). A run belongs to
+the thread that started it, so that two can run at once (a review scan and the AI
+asked again about some books): each call counts in its own thread's run, and names
+its program."""
 
 from __future__ import annotations
 
@@ -45,8 +48,8 @@ log.setLevel(logging.INFO)
 log.propagate = False  # never in the main log or the window
 
 _lock = threading.Lock()
-_run: dict | None = None  # the run in progress
-_book: int | None = None  # the book being worked on: its number in the run
+# thread id -> the run in progress, with "book": the book being worked on (its number in the run)
+_runs: dict[int, dict] = {}
 
 
 def configure(filename: str) -> None:
@@ -74,22 +77,23 @@ def _describe(provider) -> dict | None:
 def run_start(program: str, books: int, text_provider=None, image_provider=None) -> None:
     """A run of `program` ("dedup", "review", or "review-ask": the AI asked again
     about some books) over `books` books begins."""
-    global _run, _book
     with _lock:
-        if _run is not None:  # the last one ended with an exception
+        if threading.get_ident() in _runs:  # the last one ended with an exception
             _end_locked(done=None, stopped=True, aborted=True)
-        _run = {"program": program, "books": books, "started": time.monotonic(), "calls": 0, "ok": 0,
-                "ai_seconds": 0.0, "books_with_ai": set(), "input_tokens": 0, "output_tokens": 0,
-                "reasoning_tokens": 0}
-        _book = None
+        _runs[threading.get_ident()] = {
+            "program": program, "books": books, "started": time.monotonic(), "book": None, "calls": 0, "ok": 0,
+            "ai_seconds": 0.0, "books_with_ai": set(), "input_tokens": 0, "output_tokens": 0,
+            "reasoning_tokens": 0}
     _write("run_start", program=program, version=app_version(), books=books,
            text_ai=_describe(text_provider), image_ai=_describe(image_provider))
 
 
 def book(n: int) -> None:
-    """The following AI calls are for the run's `n`-th book."""
-    global _book
-    _book = n
+    """The following AI calls (of this thread) are for the run's `n`-th book."""
+    with _lock:
+        r = _runs.get(threading.get_ident())
+        if r is not None:
+            r["book"] = n
 
 
 def run_end(done: int, stopped: bool = False) -> None:
@@ -98,8 +102,7 @@ def run_end(done: int, stopped: bool = False) -> None:
 
 
 def _end_locked(done: int | None, stopped: bool, aborted: bool = False) -> None:
-    global _run, _book
-    r, _run, _book = _run, None, None
+    r = _runs.pop(threading.get_ident(), None)
     if r is None:
         return
     _write("run_end", program=r["program"], books=r["books"], books_done=done, stopped=stopped,
@@ -121,17 +124,18 @@ def call(provider, seconds: float, system: str, user: str, images: list[str] | N
     else:
         outcome = "error"
     with _lock:
-        n = _book if _run is not None else None
-        if _run is not None:
-            _run["calls"] += 1
-            _run["ok"] += outcome == "ok"
-            _run["ai_seconds"] += seconds
+        r = _runs.get(threading.get_ident())
+        n = r["book"] if r is not None else None
+        if r is not None:
+            r["calls"] += 1
+            r["ok"] += outcome == "ok"
+            r["ai_seconds"] += seconds
             if n is not None:
-                _run["books_with_ai"].add(n)
+                r["books_with_ai"].add(n)
             for k in ("input_tokens", "output_tokens", "reasoning_tokens"):
-                _run[k] += info.get(k) or 0
+                r[k] += info.get(k) or 0
     p = provider.profile
-    fields = {"book": n, "provider": p.kind, "model": p.model or "(default)", "outcome": outcome,
+    fields = {"program": r["program"] if r is not None else None, "book": n, "provider": p.kind, "model": p.model or "(default)", "outcome": outcome,
               "http_status": getattr(error, "status", None), "seconds": round(seconds, 3),
               "system_chars": len(system), "text_chars": len(user), "images": len(images or []),
               # base64 -> bytes

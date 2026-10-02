@@ -73,7 +73,7 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None, dedup_options: bool = True,
                  cache_path: Path | None = None, cache_busy: bool = False):
         """`dedup_options`: False hides the duplicate-finding options (calibre-review).
-        `cache_path`: this program's AI cache (default: the duplicate remover's), which
+        `cache_path`: this program's AI cache (default: Merge and Dedup's), which
         "Clear AI cache" empties; `cache_busy`: an analysis is running, so it can't."""
         super().__init__(parent)
         self.dedup_options = dedup_options
@@ -654,5 +654,6 @@ class SettingsDialog(QDialog):
             s.dismissed_warnings = []
         for name, key in self.keys.items():
             set_secret(name, key if name in names else "")
+        s.save_profiles()  # shared with the other program
         s.save()
         super().accept()

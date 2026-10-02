@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The programs' icons, drawn here (no image files): the Duplicate Remover is two
+"""The programs' icons, drawn here (no image files): Merge and Dedup is two
 copies of a book, one of them crossed out; the Metadata Review a book under a
 magnifying glass. Also the Windows taskbar identity, so the taskbar shows these
 icons instead of Python's."""

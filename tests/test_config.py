@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
 from pathlib import Path
 
 from calibre_dedup import config
@@ -39,8 +40,10 @@ def test_data_dir_is_in_user_home(monkeypatch, tmp_path):
     home = _fake_home(monkeypatch, tmp_path)
     assert config.config_dir() == home / ".CalibreDedup"
     s = Settings(profiles=[ProviderProfile(name="Azure", kind=config.AZURE, model="gpt-4o")])
+    s.save_profiles()
     s.save()
     assert (home / ".CalibreDedup" / "settings.json").is_file()
+    assert (home / ".CalibreDedup" / "ai_profiles.json").is_file()
     assert Settings.load().profile("Azure").model == "gpt-4o"
 
 
@@ -91,6 +94,57 @@ def test_review_settings_start_as_a_copy_then_are_separate(monkeypatch, tmp_path
     assert config.Settings.load().trash_library == "D:/Trash"
     again = config.load_review_settings()  # not copied again
     assert (again.trash_library, again.source_library) == ("E:/ReviewTrash", "D:/Inbox")
+
+
+def _write(path, data):
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_profiles_are_shared_from_the_review_list_first(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    folder = config.config_dir()
+    _write(folder / "settings.json", {"profiles": [{"name": "Old"}], "text_profile": "Old"})
+    _write(folder / "review_settings.json", {"profiles": [{"name": "R1"}, {"name": "R2", "vision": True}],
+                                             "text_profile": "R2", "image_profile": "R2"})
+    dedup = config.Settings.load()
+    assert [p.name for p in dedup.profiles] == ["R1", "R2"]
+    assert dedup.text_profile == "R1"  # "Old" is gone: the first profile
+    review = config.load_review_settings()
+    assert [p.name for p in review.profiles] == ["R1", "R2"]
+    assert (review.text_profile, review.image_profile) == ("R2", "R2")  # each keeps its own choice
+    dedup.save()
+    assert "profiles" not in json.loads((folder / "settings.json").read_text(encoding="utf-8"))
+    assert (folder / "ai_profiles.json").is_file()
+
+
+def test_old_profile_list_is_used_when_there_is_no_review_list(tmp_path):
+    _write(tmp_path / "settings.json", {"profiles": [{"name": "A"}], "text_profile": "A"})
+    assert [p.name for p in Settings.load(tmp_path / "settings.json").profiles] == ["A"]
+    assert (tmp_path / "ai_profiles.json").is_file()
+
+
+def test_saving_settings_does_not_undo_the_other_programs_profiles(tmp_path):
+    _write(tmp_path / "ai_profiles.json", {"profiles": [{"name": "A"}]})
+    dedup = Settings.load(tmp_path / "settings.json")
+    review = Settings.load(tmp_path / "review_settings.json")
+    review.profiles.append(ProviderProfile(name="B", model="m"))
+    review.save_profiles()
+    dedup.trash_library = "D:/Trash"
+    dedup.save()  # its list is old, but only the dialog writes the list
+    assert [p.name for p in Settings.load(tmp_path / "settings.json").profiles] == ["A", "B"]
+
+
+def test_reload_takes_in_the_other_programs_changes(tmp_path):
+    _write(tmp_path / "ai_profiles.json", {"profiles": [{"name": "A"}, {"name": "G", "vision": True}]})
+    dedup = Settings.load(tmp_path / "settings.json")
+    dedup.text_profile, dedup.image_profile = "A", "G"
+    assert not dedup.reload_profiles()  # nothing changed
+    review = Settings.load(tmp_path / "review_settings.json")
+    review.profiles = [ProviderProfile(name="B", model="m")]
+    review.save_profiles()
+    assert dedup.reload_profiles()
+    assert [p.name for p in dedup.profiles] == ["B"]
+    assert (dedup.text_profile, dedup.image_profile) == ("B", "")
 
 
 def test_review_cache_starts_as_a_copy_then_is_separate(monkeypatch, tmp_path):

@@ -37,7 +37,8 @@ from collections import Counter
 from dataclasses import replace
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QByteArray, QModelIndex, QRect, QSortFilterProxyModel, Qt, QThread, QTimer, Signal,
+    QAbstractTableModel, QByteArray, QEvent, QModelIndex, QRect, QSortFilterProxyModel, Qt, QThread, QTimer,
+    Signal,
 )
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
@@ -68,8 +69,8 @@ from .filters import filter_row as make_filter_row
 from .icons import REVIEW, app_icon, set_taskbar_identity
 from .main_window import (
     AI_LOG_COLOR, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
-    add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, no_cache_box,
-    open_file, with_eta,
+    add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, fill_tags,
+    no_cache_box, open_file, tag_box, tag_mode_box, with_eta,
 )
 from ..planner import AI_OFF
 from .cover_preview import CoverPreview
@@ -427,7 +428,8 @@ class ScanWorker(QThread, UnpackQuestion):
                     sent = time.monotonic()
 
             result = scan_library(self.library, self.trash, reviewer, self.progress.emit, self.cancel, on_item,
-                                  skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack)
+                                  skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack,
+                                  tag=self.settings.review_tag, tag_exclude=self.settings.review_tag_exclude)
             if batch:
                 self.items_ready.emit(batch.copy())
             if self.no_cache:  # a run from scratch: keep its results
@@ -502,8 +504,11 @@ class ReviewWindow(QMainWindow):
         super().__init__()
         self.settings = settings
         self.result: ReviewResult | None = None
-        self.worker: QThread | None = None
+        self.worker: QThread | None = None  # the scan or the execution
         self._operation = ""
+        # The AI asked again about some books: on its own, or alongside the scan.
+        self.ask_worker: AskWorker | None = None
+        self._ask_msg, self._ask_stopping = "", False
         self._stopping = self._close_pending = False
         self._library_use: LibraryUse | None = None  # the libraries of the review shown (see library_use)
         self._busy = False
@@ -537,6 +542,17 @@ class ReviewWindow(QMainWindow):
             grid.addWidget(box, r, 1)
             grid.addWidget(browse, r, 2)
             self.lib_boxes[key] = box
+        tip = "Review only the books with this tag, or all of them except those with it (empty: all of them)."
+        self.tag_mode = tag_mode_box(settings.review_tag_exclude, "books", tip)
+        self.tag_box = tag_box(settings.review_tag, tip)
+        library_box = self.lib_boxes["library"]
+        library_box.editTextChanged.connect(lambda text: fill_tags(self.tag_box, text))
+        fill_tags(self.tag_box, library_box.currentText())
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(self.tag_box)
+        tag_row.addStretch(1)
+        grid.addWidget(self.tag_mode, len(rows), 0)
+        grid.addLayout(tag_row, len(rows), 1, 1, 2)
         grid.setColumnStretch(1, 1)
 
         # AI
@@ -566,9 +582,14 @@ class ReviewWindow(QMainWindow):
         self.scan_btn.clicked.connect(self._scan)
         self.execute_btn.clicked.connect(self._execute)
         self.stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setToolTip("Stop what is running (the analysis, and the AI asked again) after the current book")
+        self.stop_ask_btn = QPushButton("Stop asking")
+        self.stop_ask_btn.setToolTip("Stop asking the AI again after the current book; the analysis goes on")
+        self.stop_ask_btn.clicked.connect(self._stop_ask)
+        self.stop_ask_btn.setVisible(False)
         self.summary_label = _elastic(QLabel())
         btn_row = QHBoxLayout()
-        for w in (self.scan_btn, self.execute_btn, self.stop_btn):
+        for w in (self.scan_btn, self.execute_btn, self.stop_btn, self.stop_ask_btn):
             btn_row.addWidget(w)
         self.skip_reviewed = QCheckBox(f"Skip books tagged {REVIEWED_TAG}")
         self.skip_reviewed.setChecked(settings.review_skip_reviewed)
@@ -750,13 +771,30 @@ class ReviewWindow(QMainWindow):
         s.image_profile = self.image_box.currentData() or ""
         s.review_fields = [f for f in FIELDS if f in self.fields_on]
         s.review_skip_reviewed = self.skip_reviewed.isChecked()
+        s.review_tag = self.tag_box.currentText().strip()
+        s.review_tag_exclude = bool(self.tag_mode.currentData())
         s.save()
 
+    def _refresh_profiles(self):
+        """AI profiles edited in Merge and Dedup (ai_profiles.json is shared): list them."""
+        s = self.settings
+        s.text_profile = self.text_box.currentData() or ""
+        s.image_profile = self.image_box.currentData() or ""
+        if s.reload_profiles():
+            self._fill_profiles()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._refresh_profiles()
+
     def _open_settings(self):
+        self._refresh_profiles()
         self._sync_settings()
         dialog = SettingsDialog(self.settings, self, dedup_options=False,
                                 cache_path=config_dir() / REVIEW_CACHE_FILE,
-                                cache_busy=self.worker is not None and self._operation in ("scan", "ask"))
+                                cache_busy=self.ask_worker is not None
+                                           or (self.worker is not None and self._operation == "scan"))
         try:
             if dialog.exec():
                 self._fill_profiles()
@@ -788,19 +826,28 @@ class ReviewWindow(QMainWindow):
 
     # --- state ---------------------------------------------------------------------------
     def _set_busy(self, busy: bool):
+        """`busy`: the scan or the execution is running. Asking the AI again (ask_worker)
+        runs alongside: it only keeps a new scan, the execution and sorting waiting."""
         self._busy = busy
+        asking = self.ask_worker is not None
         finishing = not busy and self.worker is not None
         scanning = self.worker is not None and self._operation == "scan"
-        self.scan_btn.setEnabled(not busy and self.worker is None)
+        self.scan_btn.setEnabled(not busy and self.worker is None and not asking)
         self.scan_btn.setText(("Finishing…" if finishing else "Analyzing…") if scanning else "1. Analyze (dry run)")
         set_running(self.scan_btn, scanning)
-        self.stop_btn.setText("Stopping…" if busy and self._stopping else "Stop")
-        set_running(self.stop_btn, busy and self._stopping)
-        self.stop_btn.setEnabled(busy and not self._stopping)
-        self.table.setSortingEnabled(not busy)
+        stopping = (busy and self._stopping) or (not busy and asking and self._ask_stopping)
+        self.stop_btn.setText("Stopping…" if stopping else "Stop")
+        set_running(self.stop_btn, stopping)
+        self.stop_btn.setEnabled((busy and not self._stopping) or (asking and not self._ask_stopping))
+        self.stop_ask_btn.setVisible(busy and asking)  # alone, the Stop button stops it
+        self.stop_ask_btn.setEnabled(not self._ask_stopping)
+        self.stop_ask_btn.setText("Stopping asking…" if self._ask_stopping else "Stop asking")
+        self.table.setSortingEnabled(not busy and not asking)
         for box in self.lib_boxes.values():
-            box.setEnabled(not busy)
+            box.setEnabled(not busy and not asking)
         self.skip_reviewed.setEnabled(not busy)
+        self.tag_box.setEnabled(not busy)
+        self.tag_mode.setEnabled(not busy)
         for btn in (self.check_btn, self.uncheck_btn):
             btn.setEnabled(self._can_edit())
         self._update_summary()
@@ -847,7 +894,8 @@ class ReviewWindow(QMainWindow):
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
                                  else f"2. Execute and mark reviewed ({updates + trashes + tags})")
         set_running(self.execute_btn, executing)
-        self.execute_btn.setEnabled(not self._busy and self.worker is None and self.result is not None
+        self.execute_btn.setEnabled(not self._busy and self.worker is None and self.ask_worker is None
+                                    and self.result is not None
                                     and bool(updates + trashes + tags + formats + unpacks + covers))
 
     # --- table interaction ------------------------------------------------------------------
@@ -904,9 +952,15 @@ class ReviewWindow(QMainWindow):
             menu.addSeparator()
             readable = [i for i in items if i.book.formats and not i.broken]
             # never from the cache: with the AIs selected above, or with one picked here
-            ask = menu.addMenu(f"Ask the AI ({len(readable)})" if len(items) > 1 else "Ask the AI")
-            ask.setEnabled(bool(readable) and self.worker is None and not self.model.locked
-                           and self.result is not None)
+            # also while analyzing (alongside), never while executing; one at a time
+            why = ("already asking" if self.ask_worker is not None
+                   else "executing" if self.model.locked
+                   else "no file Calibre can open" if not readable
+                   else "no analysis yet" if self.result is None else "")
+            count = f"{len(readable)}" if len(items) > 1 else ""
+            note = ", ".join(x for x in (count, why) if x)
+            ask = menu.addMenu(f"Ask the AI ({note})" if note else "Ask the AI")
+            ask.setEnabled(not why)
             for label, name in self._ask_choices():
                 act = ask.addAction(label)
                 act.triggered.connect(lambda _=False, r=readable, n=name: self._ask_ai(r, n))
@@ -1094,17 +1148,23 @@ class ReviewWindow(QMainWindow):
         self._show_status()
 
     def _show_status(self):
-        if not self._busy or not self._status_msg:
-            return
-        status = with_eta(self._status_msg, self._eta.text() if self._operation == "scan" else "")
-        text = f"Stopping after the current book… · {status}" if self._stopping else status
-        elapsed = int(time.monotonic() - self._status_since)
-        self.status_label.setText(text + (f" · {elapsed} s" if elapsed >= 3 else ""))
+        parts = []
+        if self._busy and self._status_msg:
+            status = with_eta(self._status_msg, self._eta.text() if self._operation == "scan" else "")
+            text = f"Stopping after the current book… · {status}" if self._stopping else status
+            elapsed = int(time.monotonic() - self._status_since)
+            parts.append(text + (f" · {elapsed} s" if elapsed >= 3 else ""))
+        if self.ask_worker is not None and self._ask_msg:
+            parts.append(f"Stopping asking after the current book… · {self._ask_msg}" if self._ask_stopping
+                         else self._ask_msg)
+        if parts:
+            self.status_label.setText("   ‖   ".join(parts))
 
     def _scan_done(self, result: ReviewResult):
-        # Keep the rows already shown (and what the user did with them during the scan).
-        shown = {id(i) for i in self.model.items}
-        self.model.append_items([i for i in result.items if id(i) not in shown])
+        # Keep the rows already shown (and what the user did with them during the scan), by
+        # book: a row the AI was asked again about meanwhile is a new row for the same book.
+        shown = {i.book.id for i in self.model.items}
+        self.model.append_items([i for i in result.items if i.book.id not in shown])
         result.items = list(self.model.items)
         self.result = result
         self.model.reset(result.items)
@@ -1137,16 +1197,28 @@ class ReviewWindow(QMainWindow):
         settings = self._ask_settings(profile)
         if not self._preflight_ok(settings, warn_no_image=profile is None):
             return
-        self._eta.reset()
+        if self.ask_worker is not None or self.model.locked:  # started meanwhile
+            return
+        ais = " + ".join(dict.fromkeys(n for n in (settings.text_profile, settings.image_profile) if n))
         worker = AskWorker(settings, items, self.no_cache.isChecked())
-        worker.progress.connect(self._on_progress)
+        worker.progress.connect(lambda done, total, msg, a=ais: self._on_ask_progress(a, done, total, msg))
         worker.replaced.connect(self._on_replaced)
         worker.asked.connect(self._ask_done)
-        worker.failed.connect(self._worker_failed)
-        worker.ai_down.connect(self._on_ai_down)
-        self._start(worker, "ask")
-        log.info("Asking the AI about %d books (%s)", len(items),
-                 " + ".join(dict.fromkeys(n for n in (settings.text_profile, settings.image_profile) if n)))
+        worker.failed.connect(self._ask_failed)
+        worker.ai_down.connect(lambda message, image, w=worker: self._on_ai_down(message, image, w))
+        worker.finished.connect(lambda w=worker: self._ask_finished(w))
+        self.ask_worker, self._ask_msg, self._ask_stopping = worker, f"Asking {ais} again…", False
+        self._set_busy(self._busy)
+        self._show_status()
+        worker.start()
+        log.info("Asking the AI about %d books (%s)", len(items), ais)
+
+    def _on_ask_progress(self, ais: str, done: int, total: int, msg: str):
+        if not self._busy:  # alongside the scan, the bar stays the scan's
+            self.progress.setMaximum(max(total, 1))
+            self.progress.setValue(done)
+        self._ask_msg = f"Asking {ais} again, book {min(done + 1, total)} of {total}: " + msg.removeprefix("Reading ")
+        self._show_status()
 
     def _on_replaced(self, old: ReviewItem, new: ReviewItem):
         self.model.replace(old, new)
@@ -1154,10 +1226,30 @@ class ReviewWindow(QMainWindow):
             self.result.items = [new if i is old else i for i in self.result.items]
 
     def _ask_done(self, count: int):
-        self._finish()
         msg = f"The AI was asked again about {count} books"
-        self.status_label.setText(msg)
+        if not self._busy:
+            self.status_label.setText(msg)
         log.info(msg)
+
+    def _ask_failed(self, message: str):
+        log.error(message)
+        if not self._close_pending:
+            QMessageBox.warning(self, "Error", message)
+
+    def _ask_finished(self, worker: QThread):
+        if self.ask_worker is worker:
+            self.ask_worker, self._ask_msg, self._ask_stopping = None, "", False
+        worker.deleteLater()
+        self._set_busy(self._busy)
+        if self._close_pending and self.worker is None and self.ask_worker is None:
+            QTimer.singleShot(0, self.close)
+
+    def _stop_ask(self):
+        if self.ask_worker is not None:
+            self.ask_worker.cancel.set()
+            self._ask_stopping = True
+            self._set_busy(self._busy)
+            self._show_status()
 
     def _on_unpack_asked(self, count: int):
         worker = self.worker
@@ -1168,19 +1260,25 @@ class ReviewWindow(QMainWindow):
             return
         worker.answer_unpack(ask_unpack(self, count))
 
-    def _on_ai_down(self, message: str, image: bool):
-        worker = self.worker
+    def _on_ai_down(self, message: str, image: bool, worker: ScanWorker | None = None):
+        """`worker`: the one whose AI is down, the asking one or (None) the scan."""
+        asking = worker is not None
+        worker = worker or self.worker
         if not isinstance(worker, ScanWorker):
             return
         if self._close_pending:
             worker.answer(AI_OFF)
             return
         what = "image AI" if image else "text AI"
-        choice = ask_ai_down(self, message, what,
+        choice = ask_ai_down(self, ("Asking the AI again: " if asking and self._busy else "") + message, what,
                              f"Continue without the {what}: the rest of the books are read without it.\n"
-                             "Stop: keep the books read so far.")
+                             + ("Stop: stop asking; the books asked so far keep their new answer." if asking
+                                else "Stop: keep the books read so far."))
         if choice is None:
-            self._stop()
+            if asking:
+                self._stop_ask()
+            else:
+                self._stop_main()
         worker.answer(choice or AI_OFF)
 
     # --- execute ----------------------------------------------------------------------------
@@ -1278,7 +1376,7 @@ class ReviewWindow(QMainWindow):
             self.worker, self._operation = None, ""
         worker.deleteLater()
         self._set_busy(self._busy)
-        if self._close_pending and self.worker is None:
+        if self._close_pending and self.worker is None and self.ask_worker is None:
             QTimer.singleShot(0, self.close)
 
     def _worker_failed(self, message: str):
@@ -1293,6 +1391,11 @@ class ReviewWindow(QMainWindow):
             QMessageBox.warning(self, "Error", message)
 
     def _stop(self):
+        """Stop everything running."""
+        self._stop_ask()
+        self._stop_main()
+
+    def _stop_main(self):
         if self.worker is not None:
             self.worker.cancel.set()
             self._stopping = True
@@ -1300,7 +1403,7 @@ class ReviewWindow(QMainWindow):
             self.status_label.setText("Stopping after the current book…")
 
     def closeEvent(self, event):
-        if self.worker is not None:
+        if self.worker is not None or self.ask_worker is not None:
             event.ignore()
             if self._close_pending:
                 return

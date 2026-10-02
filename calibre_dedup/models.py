@@ -159,7 +159,9 @@ class Plan:
     target_library: str
     trash_library: str
     items: list[PlanItem] = field(default_factory=list)
-    total_books: int = 0  # books in the source library
+    total_books: int = 0  # source books to analyze (only those with `tag`, if given)
+    tag: str = ""  # only the source books with this tag were analyzed; "" = all
+    tag_exclude: bool = False  # ... without this tag, instead
     stopped: bool = False  # analysis was stopped: only some source books have an item
     stop_reason: str = ""  # why it stopped by itself (e.g. a disk error); empty when the user stopped it
     same_library: bool = False  # duplicates within one library (source == target)

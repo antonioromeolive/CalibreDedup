@@ -48,7 +48,7 @@ def _run_cli(argv: list[str]) -> int:
         FIELDS, REVIEW_CACHE_FILE, ReviewAction, Reviewer, current_value, execute_review, format_value,
         review_cache, scan_library, summary, write_run_csv,
     )
-    from .session import make_resolver, require_calibre_dir
+    from .session import make_resolver, require_calibre_dir, tag_option
 
     for stream in (sys.stdout, sys.stderr):  # titles may not fit the console code page
         stream.reconfigure(errors="replace")
@@ -62,6 +62,9 @@ def _run_cli(argv: list[str]) -> int:
                     help=f"fields to change, comma-separated (of {','.join(FIELDS)})")
     ap.add_argument("--include-reviewed", action="store_true",
                     help="also read the books tagged AIReviewed (default: as set in the GUI)")
+    by_tag = ap.add_mutually_exclusive_group()
+    by_tag.add_argument("--tag", help="review only the books with this tag; '' for all (default: as set in the GUI)")
+    by_tag.add_argument("--except-tag", help="review all the books except those with this tag")
     ap.add_argument("--execute", action="store_true",
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
     ap.add_argument("--clear-cache", action="store_true",
@@ -81,6 +84,7 @@ def _run_cli(argv: list[str]) -> int:
     if args.image_profile is not None:
         settings.image_profile = args.image_profile
     fields = {f.strip() for f in args.fields.split(",") if f.strip() in FIELDS}
+    tag, tag_exclude = tag_option(args, settings.review_tag, settings.review_tag_exclude)
 
     use = LibraryUse("review")
     try:
@@ -101,7 +105,7 @@ def _run_cli(argv: list[str]) -> int:
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
         result = scan_library(args.library, args.trash, reviewer, progress,
                               skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed,
-                              unpack=(lambda n: True) if args.unpack else None)
+                              unpack=(lambda n: True) if args.unpack else None, tag=tag, tag_exclude=tag_exclude)
         print(file=sys.stderr)
     finally:
         reviewer.cache.save()

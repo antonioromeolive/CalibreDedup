@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Calibre Duplicate Remover: move books from a source library to a target
+"""Calibre Merge and Dedup: move books from a source library to a target
 library, sending books already present in the target to a trash library."""
 
 __version__ = "0.1.0"

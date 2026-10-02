@@ -34,8 +34,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QByteArray, QModelIndex, QObject, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl,
-    Signal,
+    QAbstractTableModel, QByteArray, QEvent, QModelIndex, QObject, QSortFilterProxyModel, Qt, QThread, QTimer,
+    QUrl, Signal,
 )
 from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
@@ -51,6 +51,7 @@ from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG, execute_plan, plan_actions
+from ..library import library_tags, tag_filter_text
 from ..library_use import Conflict, LibraryInUse, LibraryUse, execution_conflicts, same_library
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
@@ -92,6 +93,49 @@ def _compact(combo: QComboBox, chars: int) -> QComboBox:
     combo.model().rowsInserted.connect(fit_list)
     combo.currentTextChanged.connect(combo.setToolTip)
     return combo
+
+
+TAG_PLACEHOLDER = "all books"
+
+
+def tag_box(value: str, tip: str) -> QComboBox:
+    """The "Only books tagged" box: type a tag or pick one of the library's (see fill_tags)."""
+    box = QComboBox()
+    box.setEditable(True)
+    box.setInsertPolicy(QComboBox.NoInsert)
+    box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    box.setMinimumContentsLength(20)
+    box.lineEdit().setPlaceholderText(TAG_PLACEHOLDER)
+    box.lineEdit().setClearButtonEnabled(True)
+    box.setEditText(value)
+    box.setToolTip(tip)
+    box.setProperty("tags_of", "")
+    return box
+
+
+def tag_mode_box(exclude: bool, books: str, tip: str) -> QComboBox:
+    """In front of the tag box: "Only <books> tagged" or "All <books> except tagged"."""
+    box = QComboBox()
+    box.addItem(f"Only {books} tagged", False)
+    box.addItem(f"All {books} except tagged", True)
+    box.setCurrentIndex(1 if exclude else 0)
+    box.setToolTip(tip)
+    return box
+
+
+def fill_tags(box: QComboBox, library: str) -> None:
+    """List the tags of `library` in the box (once per library), keeping what is typed."""
+    library = library.strip()
+    if box.property("tags_of") == library:
+        return
+    box.setProperty("tags_of", library)
+    text = box.currentText()
+    box.blockSignals(True)
+    box.clear()
+    box.addItem("")  # all books
+    box.addItems(library_tags(library) if library else [])
+    box.setEditText(text)
+    box.blockSignals(False)
 
 
 def _elastic(label: QLabel) -> QLabel:
@@ -653,6 +697,7 @@ class AnalyzeWorker(QThread, UnpackQuestion):
                               fix_swapped=self.settings.fix_swapped,
                               trash_unreadable=self.settings.trash_unreadable,
                               cleanup_only=self.settings.cleanup_only,
+                              tag=self.settings.only_tag, tag_exclude=self.settings.only_tag_exclude,
                               on_item=on_item, unpack=self.ask_unpack)
             if batch:
                 self.items_ready.emit(batch.copy())
@@ -709,7 +754,7 @@ class MainWindow(QMainWindow):
         self._progress_max = 1
         self._status_msg, self._status_since = "", 0.0  # current book, for the seconds counter
         self._eta = Eta()  # time left of the analysis
-        self.setWindowTitle(f"Calibre Duplicate Remover {app_version()}")
+        self.setWindowTitle(f"Calibre Merge & Dedup {app_version()}")
         self._restore_geometry()
         # Warnings about the shown plan: settings changed since, an AI that stopped
         # responding, checks that could not run. Hidden when there is nothing to say.
@@ -743,6 +788,23 @@ class MainWindow(QMainWindow):
             grid.addWidget(box, r, 1)
             grid.addWidget(browse, r, 2)
             self.lib_boxes[key] = box
+        tip = ("Analyze only the source books with this tag, or all of them except those with it\n"
+               "(empty: all of them). The target is always read whole: the books analyzed are\n"
+               "still compared with every book in it, or, in one library, with the books the\n"
+               "filter leaves out, which are never moved or trashed.\n"
+               "Their ticks are remembered apart from those of the whole library.")
+        self.tag_mode = tag_mode_box(settings.only_tag_exclude, "source books", tip)
+        self.tag_mode.currentIndexChanged.connect(self._update_notices)
+        self.tag_box = tag_box(settings.only_tag, tip)
+        self.tag_box.editTextChanged.connect(self._update_notices)
+        source_box = self.lib_boxes["source"]
+        source_box.editTextChanged.connect(lambda text: fill_tags(self.tag_box, text))
+        fill_tags(self.tag_box, source_box.currentText())
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(self.tag_box)
+        tag_row.addStretch(1)
+        grid.addWidget(self.tag_mode, len(rows), 0)
+        grid.addLayout(tag_row, len(rows), 1, 1, 2)
         self.cleanup_box = QCheckBox("Cleanup source only (don't copy anything to the target)")
         self.cleanup_box.setToolTip(
             "Only the source books already in the target are handled: they go to the trash library.\n"
@@ -751,7 +813,7 @@ class MainWindow(QMainWindow):
             "format from both libraries): right-click to Merge & Trash them, or leave them.")
         self.cleanup_box.setChecked(settings.cleanup_only)
         self.cleanup_box.toggled.connect(self._update_notices)
-        grid.addWidget(self.cleanup_box, len(rows), 1, 1, 2)
+        grid.addWidget(self.cleanup_box, len(rows) + 1, 1, 1, 2)
         grid.setColumnStretch(1, 1)
 
         # AI row
@@ -970,7 +1032,8 @@ class MainWindow(QMainWindow):
         return replace(
             self.settings, source_library=self._library("source"), target_library=self._library("target"),
             trash_library=self._library("trash"), text_profile=self.text_box.currentData() or "",
-            image_profile=self.image_box.currentData() or "", cleanup_only=self.cleanup_box.isChecked())
+            image_profile=self.image_box.currentData() or "", cleanup_only=self.cleanup_box.isChecked(),
+            only_tag=self.tag_box.currentText().strip(), only_tag_exclude=bool(self.tag_mode.currentData()))
 
     def _update_notices(self, *_):
         """The amber bar above the table: what the user should know about the shown plan."""
@@ -1036,6 +1099,8 @@ class MainWindow(QMainWindow):
         s.text_profile = self.text_box.currentData() or ""
         s.image_profile = self.image_box.currentData() or ""
         s.cleanup_only = self.cleanup_box.isChecked()
+        s.only_tag = self.tag_box.currentText().strip()
+        s.only_tag_exclude = bool(self.tag_mode.currentData())
         s.save()
 
     def _set_busy(self, busy: bool):
@@ -1062,6 +1127,8 @@ class MainWindow(QMainWindow):
         for box in self.lib_boxes.values():
             box.setEnabled(not busy)
         self.cleanup_box.setEnabled(not busy)
+        self.tag_box.setEnabled(not busy)
+        self.tag_mode.setEnabled(not busy)
         editable = self._can_edit()
         for btn in (self.check_btn, self.uncheck_btn, self.invert_btn, self.revert_all_btn):
             btn.setEnabled(editable)
@@ -1155,6 +1222,8 @@ class MainWindow(QMainWindow):
             unique = sum(1 for it in self.plan.items if has_no_duplicate(it))
             text += f" ({leave - unique} to review, {unique} with no duplicate)"
         text += f" · total {total}"
+        if self.plan.tag:
+            text += f" {tag_filter_text(self.plan.tag, self.plan.tag_exclude)}"
         hidden = total - self.proxy.rowCount()
         if hidden:
             text += f" · {hidden} hidden by filters"
@@ -1337,7 +1406,21 @@ class MainWindow(QMainWindow):
         else:
             self.log_view.appendHtml(f"<span style='white-space:pre-wrap'>{html.escape(text)}</span>")
 
+    def _refresh_profiles(self):
+        """AI profiles edited in calibre-review (ai_profiles.json is shared): list them."""
+        s = self.settings
+        s.text_profile = self.text_box.currentData() or ""
+        s.image_profile = self.image_box.currentData() or ""
+        if s.reload_profiles():
+            self._fill_profiles()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._refresh_profiles()
+
     def _open_settings(self):
+        self._refresh_profiles()
         self._sync_settings()
         dialog = SettingsDialog(self.settings, self,
                                 cache_busy=self.worker is not None and self._operation == "analyze")
@@ -1424,7 +1507,8 @@ class MainWindow(QMainWindow):
             return
         same = bool(source) and str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
         # Rows appear as books are decided; the table is read-only and unsorted until the end.
-        self.plan = Plan(source, target, trash, same_library=same)
+        self.plan = Plan(source, target, trash, same_library=same, tag=self.settings.only_tag,
+                         tag_exclude=self.settings.only_tag_exclude and bool(self.settings.only_tag))
         self._eta.reset()
         self.model.start_live(self.plan)
         self._restored = 0
@@ -1700,7 +1784,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Closing after the current book is finished…")
             return
         if not self._close_pending and QMessageBox.question(
-                self, "Quit", "Close Calibre Duplicate Remover?") != QMessageBox.Yes:
+                self, "Quit", "Close Calibre Merge and Dedup?") != QMessageBox.Yes:
             event.ignore()
             return
         self.settings.window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
@@ -1715,13 +1799,13 @@ def run_gui() -> int:
 
     set_taskbar_identity(DEDUP)
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Calibre Duplicate Remover")
+    app.setApplicationName("Calibre Merge and Dedup")
     app.setWindowIcon(app_icon(DEDUP))
-    log.info("Calibre Duplicate Remover %s", app_version())
+    log.info("Calibre Merge and Dedup %s", app_version())
 
     def _excepthook(exc_type, exc, tb):
         log.critical("Unhandled exception", exc_info=(exc_type, exc, tb))
-        msg = f"Calibre Duplicate Remover hit an unexpected error:\n\n{exc_type.__name__}: {exc}"
+        msg = f"Calibre Merge and Dedup hit an unexpected error:\n\n{exc_type.__name__}: {exc}"
         if QApplication.instance() is not None:
             QMessageBox.critical(None, "Unexpected error", msg)
 

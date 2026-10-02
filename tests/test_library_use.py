@@ -38,7 +38,7 @@ def folder(tmp_path, monkeypatch):
 def test_a_library_being_analyzed_cannot_be_another_programs_trash(tmp_path):
     dedup = LibraryUse("dedup")
     dedup.claim([str(tmp_path / "Source"), str(tmp_path / "Target")], str(tmp_path / "Trash"))
-    with pytest.raises(LibraryInUse, match="being analyzed by Calibre Duplicate Remover"):
+    with pytest.raises(LibraryInUse, match="being analyzed by Calibre Merge and Dedup"):
         LibraryUse("review").claim([str(tmp_path / "Other")], str(tmp_path / "Target"))
 
 

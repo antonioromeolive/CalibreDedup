@@ -156,6 +156,7 @@ ANALYSIS_SETTINGS = {
     "fix_swapped": "title and author swapped",
     "trash_unreadable": "move unreadable files to the trash library",
     "cleanup_only": "cleanup source only",
+    "only_tag": "tag filter",  # the tag and its mode (only / all except)
 }
 
 
@@ -166,7 +167,18 @@ def analysis_signature(settings: Settings) -> dict:
         sig[k] = (sig[k], p.kind, p.model, p.base_url, p.vision) if p else sig[k]
     for k in ("source_library", "target_library"):
         sig[k] = str(sig[k]).strip().replace("\\", "/").rstrip("/").casefold()
+    tag = sig["only_tag"].strip().casefold()
+    sig["only_tag"] = (tag, settings.only_tag_exclude) if tag else ""
     return sig
+
+
+def tag_option(args, tag: str, exclude: bool) -> tuple[str, bool]:
+    """(tag, exclude) from a command line's --tag / --except-tag; neither: as set in the GUI."""
+    if args.tag is not None:
+        return args.tag, False
+    if args.except_tag is not None:
+        return args.except_tag, True
+    return tag, exclude
 
 
 def changed_settings(before: dict, after: dict) -> list[str]:

@@ -102,3 +102,31 @@ def test_a_run_left_open_by_an_exception_is_closed_by_the_next(records):
     perf.run_start("review", 5)
     assert [r["event"] for r in records()] == ["run_start", "run_end", "run_start"]
     assert records()[1]["aborted"]
+
+
+def test_two_runs_at_once_count_their_own_calls(records, monkeypatch):
+    import threading
+    ollama = provider(OLLAMA, monkeypatch, OLLAMA_REPLY)
+    perf.run_start("review", 10, ollama)
+    perf.book(7)
+    started, go_on = threading.Event(), threading.Event()
+
+    def ask():  # the AI asked again about 2 books, in its own thread, during the scan
+        perf.run_start("review-ask", 2, ollama)
+        perf.book(1)
+        started.set()
+        go_on.wait()
+        ollama.chat("s", "u")
+        perf.run_end(1)
+
+    t = threading.Thread(target=ask)
+    t.start()
+    started.wait()
+    ollama.chat("s", "u")  # the scan's call, while the other run is open
+    go_on.set()
+    t.join()
+    perf.run_end(10)
+    calls = [r for r in records() if r["event"] == "call"]
+    assert [(c["program"], c["book"]) for c in calls] == [("review", 7), ("review-ask", 1)]
+    ends = {r["program"]: r for r in records() if r["event"] == "run_end"}
+    assert ends["review"]["calls"] == ends["review-ask"]["calls"] == 1

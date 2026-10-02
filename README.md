@@ -8,7 +8,7 @@ libraries. Both work on your own computer, read your libraries without changing 
 you press *Execute*, and can use an AI (local with Ollama, or in the cloud) when a book's
 metadata isn't enough.
 
-| | **Duplicate Remover** (`calibre-dedup`) | **Metadata Review** (`calibre-review`) |
+| | **Merge and Dedup** (`calibre-dedup`) | **Metadata Review** (`calibre-review`) |
 |---|---|---|
 | **Job** | Brings books from one library into another **without creating duplicates**, or finds the duplicates inside one library. | Checks **every book** of one library and proposes corrections to its **title, authors, publisher, year and series**. |
 | **Libraries** | a source, a target and a trash library | the library to review and a trash library |
@@ -33,7 +33,7 @@ Nothing is converted or repaired: the files stay as they are.
 **Contents**
 
 - [Installation](#installation)
-- [Duplicate Remover](#duplicate-remover)
+- [Merge and Dedup](#merge-and-dedup)
 - [Metadata Review](#metadata-review)
 - [AI](#ai)
 - [Data files and logs](#data-files-and-logs)
@@ -73,7 +73,7 @@ ends, the idle timer starts again from zero: the computer sleeps after its usual
 *Sleep after* time.
 
 
-## Duplicate Remover
+## Merge and Dedup
 
 ### Three ways to use it
 
@@ -89,6 +89,20 @@ ends, the idle timer starts again from zero: the computer sleeps after its usual
   in the source. A duplicate whose target copy lacks one of its formats stays too, since
   trashing it would lose that format from both libraries: right-click → *Merge & Trash* to
   add the format to the target copy first, or leave it.
+- **Tag filter** (under the libraries; it applies to the **source** library only): choose
+  *Only source books tagged* or *All source books except tagged*, then type a tag or pick one
+  of the source library's (any case; empty = all books). The target is always read whole.
+  The books the filter keeps are still compared with every other book:
+  - between two libraries, with the whole target;
+  - within one library, with the books the filter leaves out, which are never moved or
+    trashed. A kept book is trashed into a left-out copy only when the left-out one is the
+    copy to keep (better format, then richer metadata); when the kept book is the better
+    one, both are left, and the row says so (right-click → *Trash* to trash it anyway).
+
+  Each filter (*only* or *except*, per tag) remembers its ticks apart from the whole
+  library's and from the other filters, so none replaces another. Changing the tag or the
+  mode after an analysis shows the *Settings changed* warning. AI answers are cached per
+  book file, so they are shared between runs with and without a filter.
 
 ### Step 1: Analyze
 
@@ -386,7 +400,7 @@ RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
 | Delete permanently from source | off | Else Calibre's recycle bin. |
 | Calibre program folder | found automatically | Where `calibre-debug` and the converters are. |
 
-On the main window: the three libraries, *Cleanup source only*, and the **Text AI** and
+On the main window: the three libraries, the source tag filter, *Cleanup source only*, and the **Text AI** and
 **Image AI** (see [AI](#ai)).
 
 ### Command line
@@ -397,6 +411,8 @@ python -m calibre_dedup --cli ... --execute        # perform the plan (default: 
 python -m calibre_dedup --cli ... --text-profile "Azure gpt-4o" --image-profile ""
 python -m calibre_dedup --cli ... --no-ai          # metadata only
 python -m calibre_dedup --cli ... --cleanup-only   # nothing copied to the target
+python -m calibre_dedup --cli ... --tag New        # only the source books tagged New; --tag "" for all
+python -m calibre_dedup --cli ... --except-tag Done  # all source books except those tagged Done
 python -m calibre_dedup --cli ... --unpack         # unpack every clear RAR/ZIP/7Z archive
 python -m calibre_dedup --cli ... --clear-cache    # ask the AI again
 python -m calibre_dedup --cli ... --no-cache       # ask the AI again, save the new answers (tests)
@@ -451,7 +467,9 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   - Right-click → **Ask the AI** reads the selected books again, never from the cache: with the
     Text AI / Image AI selected above, or with any configured AI picked in its submenu (just for
     this question: the choice above stays as it is). An AI that reads images reads the text and
-    the cover; a text-only one reads the text only. Each row
+    the cover; a text-only one reads the text only. It also works while the analysis runs,
+    alongside it (best with another AI than the analysis's; *Stop asking* stops only it), but
+    not while executing, and one at a time. Each row
     is replaced as if this were the first answer, and the answer is cached for that model:
     the other models' answers are kept. Handy for books the AI failed on, or for a second
     opinion; e.g. filter *Not read*, select all, right-click.
@@ -461,7 +479,7 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   others, and those files are proposed for the trash library (the record is copied there
   first). See [Files Calibre can't open](#files-calibre-cant-open).
 - **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
-  the Duplicate Remover (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
+  Merge and Dedup (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
   an unpacked book stays visible with *With differences*, since Execute changes it.
 - **Books with a generic cover** (the same image on books of 3 or more different titles and
   authors, see above) say so in the *Read* column, and Execute tags them **`BadCover`**
@@ -486,15 +504,17 @@ is*): the next analysis tries them again. To review a book again, remove the tag
 Calibre.
 
 The books whose metadata was actually written also get the tag **`AIUpdated`** (as with the
-Duplicate Remover): search `tags:AIUpdated` in Calibre to check what the AI changed.
+Merge and Dedup): search `tags:AIUpdated` in Calibre to check what the AI changed.
 
 ### Settings
 
 The review has its own settings (`review_settings.json`) and its own AI cache
-(`review_cache.json`), so it can run at the same time as the Duplicate Remover. The first
-time, both start as a copy of the Duplicate Remover's: the same AI profiles, trash library,
-Calibre folder and reading limits (Settings → *Reading*). After that a change in one program
-doesn't reach the other; API keys stay shared (they are stored per profile name). AI answers
+(`review_cache.json`), so it can run at the same time as Merge and Dedup. The first
+time, both start as a copy of Merge and Dedup's: the same trash library, Calibre folder and
+reading limits (Settings → *Reading*). After that a change in one program doesn't reach the
+other. The **AI providers are shared** (`ai_profiles.json`): a profile added or edited in
+one program shows up in the other, while each program keeps its own choice of Text and Image
+AI. API keys are shared too (they are stored per profile name). AI answers
 are cached per book and cover, so a second analysis is quick, even after an update renamed the
 book's files.
 
@@ -504,7 +524,12 @@ book's files.
 python -m calibre_dedup.review_app --cli --library D:\Books\Main                  # dry run: prints the differences
 python -m calibre_dedup.review_app --cli ... --fields title,authors --execute    # write only these fields
 python -m calibre_dedup.review_app --cli ... --include-reviewed                  # also books tagged AIReviewed
+python -m calibre_dedup.review_app --cli ... --tag New                           # only the books tagged New
+python -m calibre_dedup.review_app --cli ... --except-tag Checked                # all books except those tagged Checked
 ```
+
+The **tag filter** (under the libraries) works as in Merge and Dedup: *Only books tagged* or
+*All books except tagged*; *Skip books tagged AIReviewed* still applies on top.
 
 Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
 clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ask the AI again
@@ -583,7 +608,7 @@ this order: EPUB, KEPUB, AZW3, MOBI, AZW, PDF, FB2, DOCX, RTF, HTMLZ, TXT, DJVU.
 | TXT | read directly | the first (or last) 12,000 characters |
 | others (MOBI, AZW3, FB2, DOCX…) | converted to text with Calibre's `ebook-convert`, into a temporary folder (the book is not changed) | the first (or last) 12,000 characters |
 
-The first pages (title page, copyright page) are read first; the Duplicate Remover reads the
+The first pages (title page, copyright page) are read first; Merge and Dedup reads the
 last pages (colophon) only if fields are still missing. A PDF with almost no text is taken as
 scanned: up to 4 pages are rendered with `pdftoppm` and sent as images to the Image AI. There
 is no OCR. Files with DRM or damaged files can't be read: such books stay where they are
@@ -593,7 +618,7 @@ The exact instructions sent are in the [Appendix](#appendix-ai-prompts).
 
 ### Cache
 
-Every AI answer is kept (`ai_cache.json` for the Duplicate Remover, `review_cache.json` for
+Every AI answer is kept (`ai_cache.json` for Merge and Dedup, `review_cache.json` for
 the review), so analyzing again, or after *Stop*, is fast.
 
 - A book is read again when its file changes (size or date). Switching the Duplicate
@@ -647,11 +672,12 @@ there automatically.
 
 | File | Program | Contents |
 |---|---|---|
-| `settings.json` | Duplicate Remover | libraries, options, AI profiles (no keys) |
+| `settings.json` | Merge and Dedup | libraries, options, chosen Text/Image AI |
 | `review_settings.json` | Review | its own settings |
+| `ai_profiles.json` | both | the AI providers (no keys: those are in Windows Credential Manager) |
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
 | `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes |
-| `selections.json` | Duplicate Remover | remembered ticks and changes, per source/target pair |
+| `selections.json` | Merge and Dedup | remembered ticks and changes, per source/target pair |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
 
@@ -698,14 +724,14 @@ Tick **No AI cache** to ask every question again. With *Text AI* set to None, no
 
 | # | Prompt | Program | AI | Sent when |
 |---|---|---|---|---|
-| 1 | Reading a book's metadata | Duplicate Remover | Text AI (Image AI for scanned pages) | The metadata can't decide |
-| 2 | Comparing two covers | Duplicate Remover | Image AI | The metadata can't decide, and both books have a cover |
-| 3 | Same person, name written differently | Duplicate Remover | Text AI | Same title, authors that don't match |
+| 1 | Reading a book's metadata | Merge and Dedup | Text AI (Image AI for scanned pages) | The metadata can't decide |
+| 2 | Comparing two covers | Merge and Dedup | Image AI | The metadata can't decide, and both books have a cover |
+| 3 | Same person, name written differently | Merge and Dedup | Text AI | Same title, authors that don't match |
 | 4 | Identifying a book | Metadata Review | Image AI if set, else Text AI | Every book analyzed |
 
-### Duplicate Remover
+### Merge and Dedup
 
-The Duplicate Remover decides from Calibre's metadata first, and asks the AI only for the
+Merge and Dedup decides from Calibre's metadata first, and asks the AI only for the
 books that metadata can't settle. Most books never reach the AI: a book with a title and
 authors and no other book of the same title sends nothing.
 
