@@ -48,7 +48,7 @@ from .. import perf, tempdirs
 from ..awake import keep_awake
 from ..ai import AICache
 from ..calibre_env import calibre_is_running, known_libraries
-from ..config import Settings, config_dir
+from ..config import Settings, config_dir, library_cache_dir
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG, execute_plan, plan_actions
 from ..library import library_tags, tag_filter_text
@@ -698,7 +698,9 @@ class AnalyzeWorker(QThread, UnpackQuestion):
                               trash_unreadable=self.settings.trash_unreadable,
                               cleanup_only=self.settings.cleanup_only,
                               tag=self.settings.only_tag, tag_exclude=self.settings.only_tag_exclude,
-                              on_item=on_item, unpack=self.ask_unpack)
+                              on_item=on_item, unpack=self.ask_unpack,
+                              generic_check=not self.settings.skip_generic_covers,
+                              library_cache=library_cache_dir())
             if batch:
                 self.items_ready.emit(batch.copy())
             self.finished_ok.emit(plan)
@@ -1534,7 +1536,7 @@ class MainWindow(QMainWindow):
         """Mark the libraries of the new analysis as used, replacing the previous
         plan's. False (and told) if another running program stands in the way."""
         try:
-            use.claim(analyzed, trash)
+            use.claim(analyzed, trash, replacing=self._library_use)
         except (LibraryInUse, OSError) as e:
             QMessageBox.warning(self, "Library in use", str(e))
             return False

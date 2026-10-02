@@ -20,8 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
+from dataclasses import replace
+
 from calibre_dedup.ai import AICache, ReviewMetadata
-from calibre_dedup.covers import BAD_COVER_TAG, generic_covers
+from calibre_dedup.covers import BAD_COVER_TAG, cover_file, generic_covers
 from calibre_dedup.models import Book
 from calibre_dedup.planner import AIResolver
 from calibre_dedup.review import ReviewAction, ReviewItem, Reviewer, _mark_generic, review_actions, scan_library
@@ -31,13 +34,14 @@ from tests.test_review import REPLY, FakeExtractor, FakeProvider
 LOGO = b"word 2000 logo" * 100
 
 
-def book(tmp_path, i, title, cover: bytes | None, tags=(), author=None) -> Book:
+def book(tmp_path, i, title, cover: bytes | None, tags=(), author=None, last_modified="") -> Book:
     folder = tmp_path / f"b{i}"
-    folder.mkdir()
+    folder.mkdir(exist_ok=True)
     if cover is not None:
         (folder / "cover.jpg").write_bytes(cover)
     return Book(i, title, [author or f"Author{'XYZW'[i % 4]} Surname{'abcd'[i % 4]}"], None, None, set(), {}, "",
-                f"b{i}", str(tmp_path), has_cover=cover is not None, tags=set(tags))
+                f"b{i}", str(tmp_path), has_cover=cover is not None, tags=set(tags),
+                last_modified=last_modified)
 
 
 def test_the_same_image_on_three_titles_and_authors_is_generic(tmp_path):
@@ -102,3 +106,68 @@ def test_a_book_already_tagged_bad_cover_is_not_tagged_again(tmp_path):
     _mark_generic(it, 34)
     assert it.generic_cover == 0 and "generic" not in it.note
     assert not [a for a in review_actions([it], set()) if a.get("tag") == BAD_COVER_TAG]
+
+
+def test_stopping_while_looking_at_the_covers_finds_none(tmp_path):
+    import threading
+    books = [book(tmp_path, i, t, LOGO, author=a) for i, (t, a) in enumerate(
+        (("I Malavoglia", "Giovanni Verga"), ("Il Paradiso Perduto", "John Milton"),
+         ("Dei delitti e delle pene", "Cesare Beccaria")), 1)]
+    cancel = threading.Event()
+    cancel.set()
+    assert generic_covers(books, cancel) == {}
+
+
+FOUR = (("I Malavoglia", "Giovanni Verga"), ("Il Paradiso Perduto", "John Milton"),
+        ("Dei delitti e delle pene", "Cesare Beccaria"), ("La coscienza di Zeno", "Italo Svevo"))
+
+
+def four_books(tmp_path, cover=LOGO, last_modified="2026-01-01"):
+    lib = tmp_path / "lib"
+    lib.mkdir(parents=True, exist_ok=True)
+    return [book(lib, i, t, cover, author=a, last_modified=last_modified) for i, (t, a) in enumerate(FOUR, 1)]
+
+
+def test_covers_looked_at_once_are_not_read_again(tmp_path):
+    cache = tmp_path / "cover_cache"
+    books = four_books(tmp_path)
+    first = generic_covers(books, cache_dir=cache)
+    assert len(first) == 4
+    for b in books:
+        cover_file(b).unlink()  # only the cache can say what they were
+    assert generic_covers(books, cache_dir=cache) == first
+
+
+def test_a_book_whose_cover_changed_is_looked_at_again(tmp_path):
+    cache = tmp_path / "cover_cache"
+    books = four_books(tmp_path)
+    generic_covers(books, cache_dir=cache)
+    cover_file(books[3]).write_bytes(b"a real cover" * 50)
+    books[3] = replace(books[3], last_modified="2026-02-02")  # Calibre changes it with the cover
+    assert sorted(generic_covers(books, cache_dir=cache)) == sorted(str(cover_file(b)) for b in books[:3])
+
+
+def test_books_gone_from_the_library_are_forgotten(tmp_path):
+    cache = tmp_path / "cover_cache"
+    books = four_books(tmp_path)
+    generic_covers(books, cache_dir=cache)
+    generic_covers(books[:3], cache_dir=cache)
+    [file] = cache.glob("*.json")
+    assert sorted(json.loads(file.read_text(encoding="utf-8"))["books"]) == ["b1", "b2", "b3"]
+
+
+def test_without_last_modified_or_a_cache_folder_nothing_is_kept(tmp_path):
+    cache = tmp_path / "cover_cache"
+    assert len(generic_covers(four_books(tmp_path, last_modified=""), cache_dir=cache)) == 4
+    assert not cache.exists()
+    assert len(generic_covers(four_books(tmp_path / "other"))) == 4
+
+
+def test_a_damaged_cache_is_ignored(tmp_path):
+    cache = tmp_path / "cover_cache"
+    books = four_books(tmp_path)
+    generic_covers(books, cache_dir=cache)
+    [file] = cache.glob("*.json")
+    file.write_text("{not json", encoding="utf-8")
+    assert len(generic_covers(books, cache_dir=cache)) == 4
+    assert json.loads(file.read_text(encoding="utf-8"))["version"] == 1

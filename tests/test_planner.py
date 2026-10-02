@@ -31,11 +31,13 @@ import pytest
 
 from calibre_dedup.ai import AIMetadata
 from calibre_dedup.models import Action
+from calibre_dedup import library_cache, planner
 from calibre_dedup.planner import build_plan
 
 SCHEMA = """
 CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, pubdate TEXT, path TEXT, uuid TEXT,
-                    has_cover INTEGER DEFAULT 0, comments TEXT, series_index REAL DEFAULT 1.0);
+                    has_cover INTEGER DEFAULT 0, comments TEXT, series_index REAL DEFAULT 1.0,
+                    last_modified TEXT DEFAULT '2026-01-01 00:00:00+00:00');
 CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE books_series_link (id INTEGER PRIMARY KEY, book INTEGER, series INTEGER);
 CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);
@@ -56,7 +58,8 @@ def make_library(path: Path, books: list[dict]) -> str:
     for i, b in enumerate(books, 1):
         year = b.get("year")
         pubdate = f"{year}-06-15 12:00:00+00:00" if year else "0101-01-01 00:00:00+00:00"
-        conn.execute("INSERT INTO books VALUES (?,?,?,?,?,?,?,?)", (
+        conn.execute("INSERT INTO books (id, title, pubdate, path, uuid, has_cover, comments, series_index) "
+                     "VALUES (?,?,?,?,?,?,?,?)", (
             i, b["title"], pubdate, f"a/b ({i})", f"u{i}",
             int(b.get("cover", False)), b.get("comments"), b.get("series_index", 1.0),
         ))
@@ -1099,3 +1102,31 @@ def test_swap_is_written_on_execute(libs):
     left.selected = True
     [a] = plan_actions(plan, True)
     assert a["op"] == "update" and a["swap"]["title"] == "Ben Hadden; or, Do Right Whatever Comes Of It" and "updated_tag" not in a
+
+
+def test_generic_covers_can_be_skipped(libs, monkeypatch, tmp_path):
+    src, tgt, trash = libs(source=[{"title": "Children of Dune", "cover": True}],
+                           target=[{"title": "Children of Dune", "publisher": "Ace", "year": 1991, "cover": True}])
+    looked = []
+    monkeypatch.setattr(planner, "generic_covers", lambda books, cancel, cache: looked.append(cache) or {})
+    build_plan(src, tgt, trash, CoverResolver(same=True), cover_check=True, library_cache=tmp_path / "cache")
+    assert looked == [tmp_path / "cache"]
+    item = build_plan(src, tgt, trash, CoverResolver(same=True), cover_check=True, generic_check=False).items[0]
+    assert looked == [tmp_path / "cache"] and item.action is Action.TRASH  # the covers are still compared
+
+
+def test_the_files_of_one_library_are_checked_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
+    library = make_library(tmp_path / "library", [
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["EPUB"]},
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["MOBI"]},
+    ])
+    cache = tmp_path / "cache"
+    checked = []
+    real = library_cache.unreadable_formats
+    monkeypatch.setattr(library_cache, "unreadable_formats", lambda f: checked.append(f) or real(f))
+    first = build_plan(library, library, str(tmp_path / "trash"), library_cache=cache)
+    assert len(checked) == 2
+    again = build_plan(library, library, str(tmp_path / "trash"), library_cache=cache)
+    assert len(checked) == 2  # from the cache
+    assert actions(again) == actions(first)

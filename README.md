@@ -63,8 +63,11 @@ console to see the error.
 **Libraries.** Calibre needs library paths shorter than 89 characters. A target or trash
 library is created when you choose an empty folder.
 
-**Both programs at once.** Analyses can run side by side. Executions take turns:
-while one program executes, the other's *Execute* waits until it is done.
+**Both programs at once.** Analyses of different libraries can run side by side, but a
+library can't be analyzed by two programs (or two windows) at once, nor analyzed while
+another uses it as its trash library: *Analyze* says which program has it. Programs may
+share a trash library. Executions take turns: while one program executes, the other's
+*Execute* waits until it is done.
 
 **Sleep.** While an analysis or an execution runs (GUI or command line), Windows won't
 go to sleep on its idle timer, so a run left overnight isn't paused halfway. The screen
@@ -250,6 +253,11 @@ In this order; the first rule that decides wins:
    (or similar titles by the same author), and a **generic cover** is never proof: the same
    image on books of 3 or more different titles *and* authors, e.g. the "Microsoft Word 2000"
    logo a converter took from a document, or a publisher's stock picture.
+   To find them, every cover of both libraries is looked at before the first book. What is
+   found is remembered per library (in `~/.CalibreDedup/library_cache`), so later analyses only
+   look at new or changed books; the first time, a big library on a network drive can take
+   minutes. *Skip looking for generic covers* (settings) skips this step, for tests only:
+   a placeholder cover may then make two different books duplicates.
 
 A duplicate is **Merge & Trash** when it has formats the kept copy lacks (except PDF), which
 are added to the kept copy first; otherwise it is **Trash only**.

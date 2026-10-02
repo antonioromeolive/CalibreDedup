@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 from ..awake import keep_awake
 from ..calibre_env import calibre_is_running, known_libraries
-from ..config import OLLAMA, Settings, config_dir, load_review_settings
+from ..config import OLLAMA, Settings, config_dir, library_cache_dir, load_review_settings
 from ..covers import BAD_COVER_TAG
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG
@@ -429,7 +429,8 @@ class ScanWorker(QThread, UnpackQuestion):
 
             result = scan_library(self.library, self.trash, reviewer, self.progress.emit, self.cancel, on_item,
                                   skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack,
-                                  tag=self.settings.review_tag, tag_exclude=self.settings.review_tag_exclude)
+                                  tag=self.settings.review_tag, tag_exclude=self.settings.review_tag_exclude,
+                                  library_cache=library_cache_dir())
             if batch:
                 self.items_ready.emit(batch.copy())
             if self.no_cache:  # a run from scratch: keep its results
@@ -1090,7 +1091,7 @@ class ReviewWindow(QMainWindow):
         """Mark the libraries of the new review as used, replacing the previous one's.
         False (and told) if another running program stands in the way."""
         try:
-            use.claim(analyzed, trash)
+            use.claim(analyzed, trash, replacing=self._library_use)
         except (LibraryInUse, OSError) as e:
             QMessageBox.warning(self, "Library in use", str(e))
             return False

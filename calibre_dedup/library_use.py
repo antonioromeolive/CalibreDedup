@@ -22,8 +22,9 @@
 
 
 """Which libraries the running copies of the programs use:
-- LibraryUse: no library is analyzed by one while another uses it as its trash
-  library. Several may share a trash library: it is written only when executing.
+- LibraryUse: no library is analyzed by one while another analyzes it or uses it as
+  its trash library. Several may share a trash library: it is written only when
+  executing (see ExecutionLock).
 - ExecutionLock: no library is written by two executions at once (Calibre expects
   one writer per library). Executions on different libraries run side by side.
 
@@ -44,7 +45,7 @@ from .config import config_dir
 from .tempdirs import lock, unlock
 
 ANALYZED, TRASH, EXECUTING = "analyzed", "trash", "exec"
-_CONFLICTS = {ANALYZED: TRASH, TRASH: ANALYZED}
+_CONFLICTS = {ANALYZED: (ANALYZED, TRASH), TRASH: (ANALYZED,)}
 PROGRAM_NAMES = {"dedup": "Calibre Merge and Dedup", "review": "calibre-review"}
 
 
@@ -57,10 +58,10 @@ def _folder() -> Path:
 
 
 def same_library(a: str, b: str) -> bool:
-    return a == b or (bool(a) and bool(b) and _library_hash(a) == _library_hash(b))
+    return a == b or (bool(a) and bool(b) and library_hash(a) == library_hash(b))
 
 
-def _library_hash(library: str) -> str:
+def library_hash(library: str) -> str:
     return hashlib.sha1(str(Path(library).resolve()).casefold().encode()).hexdigest()[:16]
 
 
@@ -94,6 +95,10 @@ def _release(held: list[tuple[Path, BinaryIO]]) -> None:
             pass
 
 
+def _is_own(marker: Path, ids: set[str]) -> bool:
+    return marker.name.split(".")[3] in ids
+
+
 class LibraryUse:
     """The markers of one analysis. `claim` takes them or raises LibraryInUse."""
 
@@ -102,28 +107,37 @@ class LibraryUse:
         self._id = uuid.uuid4().hex
         self._held: list[tuple[Path, BinaryIO]] = []
 
-    def claim(self, analyzed: list[str], trash: str = "") -> None:
+    def claim(self, analyzed: list[str], trash: str = "", replacing: LibraryUse | None = None) -> None:
         """Mark `analyzed` and `trash` (may be empty) as used by this program, then check
-        that no other program uses one of them in the conflicting role. Marking first:
-        of two programs starting together, at least one sees the other."""
+        that no other program uses one of them in a conflicting role. Marking first:
+        of two programs starting together, at least one sees the other. The markers of
+        `replacing` (the same window's previous analysis, released by the caller once
+        this succeeds) are not in the way."""
+        own = {self._id} | ({replacing._id} if replacing is not None else set())
         roles = [(lib, ANALYZED) for lib in dict.fromkeys(analyzed) if lib] + ([(trash, TRASH)] if trash else [])
         folder = _folder()
         folder.mkdir(parents=True, exist_ok=True)
         for marker in folder.glob("*.lock"):  # those left by crashed programs go
-            if self._id not in marker.name:
+            if not _is_own(marker, own):
                 _held_by_other(marker)
         try:
             for library, role in roles:
-                marker = folder / f"{_library_hash(library)}.{role}.{self.program}.{self._id}.lock"
+                marker = folder / f"{library_hash(library)}.{role}.{self.program}.{self._id}.lock"
                 f = marker.open("a+b")
                 lock(f)
                 self._held.append((marker, f))
             for library, role in roles:
-                other = _CONFLICTS[role]
-                for marker in folder.glob(f"{_library_hash(library)}.{other}.*.lock"):
-                    if self._id in marker.name or not _held_by_other(marker):
+                markers = [m for other in _CONFLICTS[role]
+                           for m in folder.glob(f"{library_hash(library)}.{other}.*.lock")]
+                for marker in markers:
+                    if _is_own(marker, own) or not _held_by_other(marker):
                         continue
-                    program = PROGRAM_NAMES.get(marker.name.split(".")[2], "another program")
+                    _, other, name, *_ = marker.name.split(".")
+                    program = PROGRAM_NAMES.get(name, "another program")
+                    if other == ANALYZED and role == ANALYZED:
+                        raise LibraryInUse(f"{library} is being analyzed by {program}: it can't be analyzed "
+                                           "by two programs at once. Wait until that program has finished "
+                                           "with it (or is closed).")
                     if role == TRASH:
                         raise LibraryInUse(f"The trash library {library} is being analyzed by {program}: "
                                            "choose another trash library, or wait until that program has "
@@ -171,7 +185,7 @@ class ExecutionLock:
         seen: set[str] = set()
         roles: list[tuple[str, str, str]] = []  # (role, library, hash): a library once
         for role, library in libraries.items():
-            h = _library_hash(library) if library else ""
+            h = library_hash(library) if library else ""
             if h and h not in seen:
                 seen.add(h)
                 roles.append((role, library, h))

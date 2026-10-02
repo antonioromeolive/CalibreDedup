@@ -57,7 +57,8 @@ from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
 from .covers import generic_covers, generic_note
-from .extract import TextExtractor, cover_png, epub_text_digest, unreadable_formats
+from .extract import CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, epub_text_digest, unreadable_formats
+from .library_cache import FileChecks
 from .library import read_books, tag_filter_text, tag_selects
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
@@ -650,6 +651,8 @@ def build_plan(
     tag_exclude: bool = False,
     on_item: Callable[[PlanItem], None] | None = None,
     unpack: Callable[[int], bool] | None = None,
+    generic_check: bool = True,
+    library_cache: Path | None = None,
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
     Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
@@ -668,6 +671,10 @@ def build_plan(
     `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
     (RAR, ZIP, 7Z) of the n books that have one (see archives.ask_once); None: archives
     are left as they are. Needs the AI's resolver (its extractor).
+    `generic_check`: look for generic covers (see covers.generic_covers), which are then
+    never proof; off (for tests on a big library), any cover can be. `library_cache`:
+    where what is found in the source's files (covers, unreadable formats) is kept
+    for the next time (see library_cache); None: not kept.
     `tag`: only the source books with this tag (with `tag_exclude`, without it) get an
     item; the others are still matched against (in one library, as copies that stay:
     see _keep_chosen). The target is always read whole."""
@@ -685,8 +692,13 @@ def build_plan(
     if tag:
         log.info("Only the %d of %d source books %s are analyzed", len(chosen), len(source_books),
                  tag_filter_text(tag, tag_exclude))
+    file_checks = FileChecks(library_cache)
     if resolver is not None and (cover_check or always_cover):
-        resolver.generic = generic_covers(source_books + target_books)
+        if generic_check:
+            progress(0, len(chosen), "Looking for generic covers…")
+            resolver.generic = generic_covers(source_books + target_books, cancel, library_cache)
+        else:
+            log.warning("Generic covers not looked for (setting): a placeholder cover may count as proof")
 
     index: dict[tuple, list[_Candidate]] = defaultdict(list)
     main_index: dict[tuple, list[_Candidate]] = defaultdict(list)  # subtitle ignored
@@ -723,22 +735,27 @@ def build_plan(
     total = len(chosen)
     analysis_books = chosen
     cleanup = cleanup_only and not same_library
-    unreadable: dict[int, dict[str, str]] = {}  # id(book) -> its formats Calibre can't open
+    unreadable: dict[int, dict[str, str]] = {}  # id(book) -> its formats Calibre can't open, once checked
 
     def keep_rank(b: Book) -> tuple:
-        """Of two copies, the one to keep: the best format (EPUB, MOBI, AZW), then the richer metadata."""
-        return -_format_rank(b, unreadable[id(b)]), _metadata_richness(b)
+        """Of two copies, the one to keep: the best format (EPUB, MOBI, AZW), then the richer metadata.
+        Before its turn, a book's files are not opened: only the formats Calibre can't read count."""
+        bad = unreadable[id(b)] if id(b) in unreadable else {
+            f: "" for f in b.formats if f not in CALIBRE_INPUT_FORMATS}
+        return -_format_rank(b, bad), _metadata_richness(b)
 
     if same_library or cleanup:
-        # Of two copies, the one decided first is kept.
-        unreadable = {id(b): unreadable_formats(b.formats) for b in source_books}
+        # Of two copies, the one decided first is kept. A fake file found only in its turn
+        # can make a copy come first that shouldn't: see the check after _plan_one.
         analysis_books = sorted(chosen, key=keep_rank, reverse=True)
+    # The source copy each book indexed in one library stands for: id(indexed book) -> record.
+    records: dict[int, tuple[_Candidate, Book]] = {}
     # One library, with a tag filter: the books it leaves out are copies that stay, matched
     # as they are (no AI reads them unless a chosen book needs it). candidate book -> record
     others: dict[int, tuple[_Candidate, Book]] = {}
     if same_library and tag:
         for ob in source_books:
-            bad = unreadable[id(ob)]
+            bad = {f: "" for f in ob.formats if f not in CALIBRE_INPUT_FORMATS}  # not opened: never analyzed
             if tag_selects(ob, tag, tag_exclude) or (bad and set(bad) >= set(ob.formats)):
                 continue  # an unreadable book is no copy to keep
             book = replace(ob, formats={f: p for f, p in ob.formats.items() if f not in bad}) if bad else ob
@@ -770,8 +787,8 @@ def build_plan(
         try:
             if unpack is not None:
                 seen, archives = unpack_archives(sb, resolver.extractor, unpack)
-            bad = (dict(unreadable[id(sb)]) if id(sb) in unreadable and seen is sb
-                   else unreadable_formats(seen.formats))
+            bad = file_checks.bad(sb) if seen is sb else unreadable_formats(seen.formats)
+            unreadable[id(sb)] = bad
             if bad and set(bad) >= set(seen.formats):
                 item = _unreadable_item(sb, bad, trash_unreadable, same_series)
             else:
@@ -816,7 +833,12 @@ def build_plan(
         if item.action is Action.TRASH and item.match is not None and id(item.match) in others:
             c, record = others[id(item.match)]
             if keep_rank(sb) > keep_rank(record):
-                item = _keep_chosen(item, c, tag_filter_text(tag, not tag_exclude))
+                item = _keep_chosen(item, c, f"the other is {tag_filter_text(tag, not tag_exclude)}")
+        elif item.action is Action.TRASH and item.match is not None and id(item.match) in records:
+            c, record = records[id(item.match)]
+            if keep_rank(sb) > keep_rank(record):  # its files, opened in its turn, made it worse
+                item = _keep_chosen(item, c, f"but the other's {', '.join(unreadable[id(record)])} "
+                                                "can't be opened (found when it was analyzed)")
         # File errors are also caught (as "unreadable") deeper down: a vanished
         # drive would quietly leave books undecided. Check, at most once a second.
         if time.monotonic() - checked >= 1:
@@ -832,7 +854,9 @@ def build_plan(
                     down[what] = n
         if same_library:
             if item.action is not Action.TRASH:
-                add_to_index(_Candidate(book, item.identity, planned=False, ai_done=item.ai_used))
+                c = _Candidate(book, item.identity, planned=False, ai_done=item.ai_used)
+                add_to_index(c)
+                records[id(book)] = (c, sb)
         elif item.action is Action.MOVE or kept:
             add_to_index(_Candidate(book, item.identity, planned=True, ai_done=item.ai_used))
         # Only now: the user may change the item from here on (planner decisions
@@ -842,6 +866,7 @@ def build_plan(
         if resolver and n % 10 == 0:
             resolver.cache.save()
     perf.run_end(len(plan.items), plan.stopped)
+    file_checks.save()  # those of the books analyzed one by one
     if resolver:
         resolver.cache.save()
         stats.update(resolver.stats)
@@ -896,15 +921,15 @@ UNREADABLE_REASON = "no file Calibre can open"
 CLEANUP = "cleanup only"
 
 
-def _keep_chosen(item: PlanItem, cand: _Candidate, other: str) -> PlanItem:
-    """In one library, a book the tag filter chose whose duplicate it left out (`other`:
-    "not tagged 'New'"), when the chosen one is the copy to keep (better format or
-    metadata). The other one is not handled, so neither is trashed: left, with the
-    match, so the user can still Trash it into it."""
+def _keep_chosen(item: PlanItem, cand: _Candidate, why: str) -> PlanItem:
+    """In one library, a duplicate that is the copy to keep (better format or metadata)
+    after all, `why` the other came first: the tag filter left it out ("the other is not
+    tagged 'New'"), or its best format turned out to be unreadable. Neither is trashed:
+    left, with the match, so the user can still Trash one into the other."""
     cand.formats.difference_update(item.add_formats)  # nothing is added to it after all
     base, bracket, notes = item.reason.partition(" [")
     reason = (f"{base.split('; adding ')[0]}; this copy is the one to keep (better format or "
-              f"metadata), and the other is {other}: neither is handled{bracket}{notes}")
+              f"metadata), {why}: neither is handled{bracket}{notes}")
     return _logged(replace(item, action=Action.LEAVE, add_formats=[], reason=reason))
 
 

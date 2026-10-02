@@ -98,6 +98,8 @@ def read_books(library: str | Path) -> list[Book]:
             optional.append("comments")
         if "series_index" in columns:
             optional.append("series_index")
+        if "last_modified" in columns:
+            optional.append("last_modified")
         rows = conn.execute(
             "SELECT id, title, pubdate, path, uuid" +
             (", " + ", ".join(optional) if optional else "") +
@@ -134,6 +136,7 @@ def read_books(library: str | Path) -> list[Book]:
             has_cover=bool(metadata.get("has_cover", 0)),
             comments=metadata.get("comments") or None,
             uuid=uuid or "",
+            last_modified=str(metadata.get("last_modified") or ""),
             path=path,
             library=str(library),
         ))

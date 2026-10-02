@@ -1,0 +1,133 @@
+# Copyright (c) 2026 Antonio Romeo <antonioromeo@ilve.it>
+# Author: Antonio Romeo (with Claude Code et al.)
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+"""What was found in the files of each book (its cover, its formats), kept between
+runs: a library on a network drive is not read again, file by file, at each analysis.
+An entry holds while the book's last_modified is the same: Calibre changes it when
+the book's cover or formats change (not when a file is replaced by hand)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from .extract import unreadable_formats
+from .library_use import library_hash
+from .models import Book
+
+log = logging.getLogger(__name__)
+
+
+class LibraryCache:
+    """One kind of fact ("covers", "files") about each book, one file per library in
+    `folder`; None: nothing is kept."""
+
+    VERSION = 1
+
+    def __init__(self, folder: Path | None, kind: str):
+        self.folder = folder
+        self.kind = kind
+        self._books: dict[str, dict[str, list]] = {}  # library -> book path -> [last_modified, value]
+        self._seen: dict[str, set[str]] = defaultdict(set)
+        self._changed: set[str] = set()
+
+    def _file(self, library: str) -> Path:
+        return self.folder / f"{library_hash(library)}.{self.kind}.json"
+
+    def _entries(self, library: str) -> dict[str, list]:
+        if library not in self._books:
+            entries: dict[str, list] = {}
+            try:
+                data = json.loads(self._file(library).read_text(encoding="utf-8"))
+                if data.get("version") == self.VERSION:
+                    entries = data["books"]
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+            self._books[library] = entries
+        return self._books[library]
+
+    def get(self, b: Book) -> Any:
+        """The value kept for this version of the book, or None."""
+        if self.folder is None or not b.last_modified:
+            return None
+        self._seen[b.library].add(b.path)
+        entry = self._entries(b.library).get(b.path)
+        return entry[1] if isinstance(entry, list) and len(entry) == 2 and entry[0] == b.last_modified else None
+
+    def put(self, b: Book, value: Any) -> None:
+        if self.folder is None or not b.last_modified:
+            return
+        self._seen[b.library].add(b.path)
+        self._entries(b.library)[b.path] = [b.last_modified, value]
+        self._changed.add(b.library)
+
+    def save(self, whole: bool = False) -> None:
+        """`whole`: every book of the libraries was looked at, so the others (deleted,
+        or without what is kept now) are forgotten."""
+        if self.folder is None:
+            return
+        for library, entries in self._books.items():
+            if whole:
+                gone = entries.keys() - self._seen[library]
+                for path in gone:
+                    del entries[path]
+                if gone:
+                    self._changed.add(library)
+            if library not in self._changed:
+                continue
+            target = self._file(library)
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+            try:
+                self.folder.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps({"version": self.VERSION, "library": library, "books": entries}),
+                               encoding="utf-8")
+                os.replace(tmp, target)  # two programs saving at once: one whole file wins
+            except OSError:
+                log.warning("Could not save the %s cache of %s", self.kind, library, exc_info=True)
+                tmp.unlink(missing_ok=True)
+        self._changed.clear()
+
+
+class FileChecks:
+    """extract.unreadable_formats of each book, kept: every file is opened to be told
+    apart, which takes long on a network drive. Checked again when the book's
+    formats are not those checked."""
+
+    def __init__(self, folder: Path | None):
+        self.cache = LibraryCache(folder, "files")
+
+    def bad(self, b: Book) -> dict[str, str]:
+        names = {fmt: Path(path).name for fmt, path in b.formats.items()}
+        known = self.cache.get(b)
+        if isinstance(known, dict) and known.get("formats") == names:
+            return dict(known["bad"])
+        bad = unreadable_formats(b.formats)
+        self.cache.put(b, {"formats": names, "bad": bad})
+        return bad
+
+    def save(self, whole: bool = False) -> None:
+        self.cache.save(whole)

@@ -46,6 +46,7 @@ class Book:
     series: str | None = None
     series_index: float | None = None  # only meaningful with a series
     tags: set[str] = field(default_factory=set)
+    last_modified: str = ""  # Calibre's, changed with the metadata or the cover
 
     def label(self) -> str:
         return f"{self.title} — {' & '.join(self.authors)}"

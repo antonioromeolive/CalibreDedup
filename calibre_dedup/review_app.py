@@ -42,7 +42,7 @@ def run_cli(argv: list[str]) -> int:
 def _run_cli(argv: list[str]) -> int:
     from . import perf, tempdirs
     from .ai import AICache
-    from .config import config_dir, load_review_settings
+    from .config import config_dir, library_cache_dir, load_review_settings
     from .library_use import LibraryInUse, LibraryUse
     from .review import (
         FIELDS, REVIEW_CACHE_FILE, ReviewAction, Reviewer, current_value, execute_review, format_value,
@@ -105,7 +105,8 @@ def _run_cli(argv: list[str]) -> int:
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
         result = scan_library(args.library, args.trash, reviewer, progress,
                               skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed,
-                              unpack=(lambda n: True) if args.unpack else None, tag=tag, tag_exclude=tag_exclude)
+                              unpack=(lambda n: True) if args.unpack else None, tag=tag, tag_exclude=tag_exclude,
+                              library_cache=library_cache_dir())
         print(file=sys.stderr)
     finally:
         reviewer.cache.save()

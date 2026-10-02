@@ -49,12 +49,30 @@ def test_a_trash_library_cannot_be_analyzed_by_another_program(tmp_path):
         LibraryUse("dedup").claim([str(tmp_path / "Trash"), str(tmp_path / "Target")], str(tmp_path / "Trash2"))
 
 
-def test_programs_may_share_the_trash_and_the_analyzed_libraries(tmp_path):
+def test_programs_may_share_the_trash_library(tmp_path):
     trash = str(tmp_path / "Trash")
     held = [LibraryUse("dedup"), LibraryUse("review"), LibraryUse("dedup")]
     held[0].claim([str(tmp_path / "A"), str(tmp_path / "T")], trash)
-    held[1].claim([str(tmp_path / "A")], trash)  # same library analyzed: not checked
-    held[2].claim([str(tmp_path / "B"), str(tmp_path / "T")], trash)
+    held[1].claim([str(tmp_path / "B")], trash)
+    held[2].claim([str(tmp_path / "C"), str(tmp_path / "D")], trash)
+
+
+@pytest.mark.parametrize("other", ["dedup", "review"])
+def test_a_library_cannot_be_analyzed_by_two_programs_at_once(tmp_path, other):
+    dedup = LibraryUse("dedup")
+    dedup.claim([str(tmp_path / "S"), str(tmp_path / "T")], "")
+    with pytest.raises(LibraryInUse, match="being analyzed by Calibre Merge and Dedup"):
+        LibraryUse(other).claim([str(tmp_path / "T")], "")
+
+
+def test_a_new_analysis_is_not_stopped_by_the_one_it_replaces(tmp_path):
+    previous = LibraryUse("dedup")
+    previous.claim([str(tmp_path / "S"), str(tmp_path / "T")], str(tmp_path / "Trash"))
+    new = LibraryUse("dedup")
+    new.claim([str(tmp_path / "T"), str(tmp_path / "S")], str(tmp_path / "Trash"), replacing=previous)
+    previous.release()
+    with pytest.raises(LibraryInUse):
+        LibraryUse("review").claim([str(tmp_path / "S")], "")
 
 
 def test_the_same_library_written_differently_is_the_same(tmp_path):

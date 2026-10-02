@@ -443,6 +443,14 @@ class SettingsDialog(QDialog):
             "book files must match too (Calibre's cover can be a downloaded picture). Needs an Image\n"
             "AI; costs more AI calls. List these books with the 'Decided by cover' filter.")
         self.a_always_cover.setChecked(s.always_cover)
+        self.a_skip_generic = QCheckBox("Skip looking for generic covers (for tests: faster start)")
+        self.a_skip_generic.setToolTip(
+            "Before the first book, every cover of both libraries is looked at to find generic ones\n"
+            "(the same placeholder image on books of 3 or more titles and authors), which are never\n"
+            "proof of a duplicate. What is found is remembered per library, so only new or changed\n"
+            "books are looked at again; the first time, a big library on a network drive takes minutes.\n"
+            "Skipped, a placeholder cover may make two different books duplicates: use it for tests only.")
+        self.a_skip_generic.setChecked(s.skip_generic_covers)
         self.a_years = QCheckBox("Re-check year differences by reading both books (AI)")
         self.a_years.setToolTip("Calibre's publication date is often the original publication, not this "
                                 "edition's.\nWhen only the years differ, the AI reads the year printed in "
@@ -522,6 +530,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.a_cover_note)
         form.addRow(self.a_always_cover)
         form.addRow(self.a_always_cover_note)
+        form.addRow(self.a_skip_generic)
         form.addRow(self.a_years)
         form.addRow(self.a_years_note)
         form.addRow(self.a_author_variants)
@@ -548,7 +557,7 @@ class SettingsDialog(QDialog):
         if not self.dedup_options:
             # Hidden, not left out: accept() still reads (and keeps) their values.
             for widget in (self.a_subtitle, self.a_similar, self.a_cover, self.a_cover_note, self.a_always_cover,
-                           self.a_always_cover_note, self.a_years, self.a_years_note, self.a_author_variants,
+                           self.a_always_cover_note, self.a_skip_generic, self.a_years, self.a_years_note, self.a_author_variants,
                            self.a_swapped,
                            self.a_similar_titles, self.a_series, self.a_unreadable, self.a_update, reset):
                 form.setRowVisible(widget, False)
@@ -641,6 +650,7 @@ class SettingsDialog(QDialog):
         s.similar_matching = self.a_similar.isChecked()
         s.cover_check = self.a_cover.isChecked()
         s.always_cover = self.a_always_cover.isChecked()
+        s.skip_generic_covers = self.a_skip_generic.isChecked()
         s.recheck_years = self.a_years.isChecked()
         s.same_series = self.a_series.isChecked()
         s.similar_titles = self.a_similar_titles.isChecked()

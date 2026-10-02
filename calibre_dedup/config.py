@@ -51,6 +51,11 @@ REVIEW_SETTINGS_FILE = "review_settings.json"  # calibre-review: its own copy, s
 PROFILES_FILE = "ai_profiles.json"  # the AI providers, shared by both programs
 
 
+def library_cache_dir() -> Path:
+    """Where what was found in the books' files is kept between runs (see library_cache)."""
+    return config_dir() / "library_cache"
+
+
 def config_dir() -> Path:
     """All settings (including AI profiles), caches, remembered choices and logs
     live in ~/.CalibreDedup — never in the program's own folder."""
@@ -119,6 +124,7 @@ class Settings:
     recheck_years: bool = True  # AI reads both books when only the metadata years differ
     same_series: bool = False  # same series + number (not 1) = same book, if the title or an author agrees
     always_cover: bool = False  # compare covers even when the metadata says different; same cover wins
+    skip_generic_covers: bool = False  # for tests: don't look for generic covers (minutes on a big library)
     author_variants: bool = True  # same title, author written differently ("Frederickk"/"Frederick"; AI if on)
     fix_swapped: bool = True  # title and author swapped ("Kingston — The Log House by the Lake"): analyzed put right
     similar_titles: bool = True  # same author, one title inside the other ("1 Dune" / "Dune"): needs proof

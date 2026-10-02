@@ -32,7 +32,7 @@ import sys
 from . import perf, tempdirs
 from .ai import AICache
 from .awake import keep_awake
-from .config import Settings, config_dir
+from .config import Settings, config_dir, library_cache_dir
 from .executor import execute_plan
 from .library_use import LibraryInUse, LibraryUse
 from .models import Action
@@ -111,7 +111,8 @@ def _run(argv: list[str]) -> int:
                           trash_unreadable=settings.trash_unreadable,
                           cleanup_only=settings.cleanup_only if args.cleanup_only is None else True,
                           tag=tag, tag_exclude=tag_exclude,
-                          unpack=(lambda n: True) if args.unpack else None)
+                          unpack=(lambda n: True) if args.unpack else None,
+                          generic_check=not settings.skip_generic_covers, library_cache=library_cache_dir())
         print(file=sys.stderr)
     finally:
         if resolver:

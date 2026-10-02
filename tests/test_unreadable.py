@@ -27,6 +27,8 @@ from pathlib import Path
 
 from calibre_dedup.ai import AICache
 from calibre_dedup.executor import plan_actions
+import pytest
+
 from calibre_dedup.extract import Excerpt, TextExtractor, unreadable_formats
 from calibre_dedup.models import Action
 from calibre_dedup.planner import build_plan
@@ -187,3 +189,19 @@ def test_review_proposes_a_book_with_no_readable_file_for_the_trash(tmp_path):
     item = scan_library(lib, "", Reviewer(text, ReadsEpubOnly(), AICache(tmp_path / "c.json"))).items[0]
     assert item.broken and item.action is ReviewAction.TRASH and item.selected and text.calls == []
     assert review_actions([item], {"year"}) == [{"src_id": 1, "title": "Ernani", "op": "trash", "no_target": True}]
+
+
+@pytest.mark.parametrize("tag", ["", "New"])
+def test_in_one_library_a_copy_whose_epub_is_fake_does_not_replace_a_real_one(tmp_path, monkeypatch, tag):
+    monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
+    library = make_library(tmp_path / "library", [  # the first looks better until its EPUB is opened
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["EPUB", "MOBI"], "tags": ["New"],
+         "comments": "A novel"},
+        {"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["EPUB"], "tags": ["New"]},
+    ])
+    put(library, 1, "EPUB", WORD)
+    plan = build_plan(library, library, str(tmp_path / "trash"), tag=tag)
+    first, second = plan.items
+    assert first.action is Action.LEAVE and "EPUB" in first.bad_formats
+    assert second.action is Action.LEAVE and second.match is not None
+    assert "can't be opened (found when it was analyzed): neither is handled" in second.reason

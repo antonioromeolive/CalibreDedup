@@ -382,14 +382,18 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  on_item: Callable[[ReviewItem], None] | None = None,
                  skip_reviewed: bool = True,
                  unpack: Callable[[int], bool] | None = None,
-                 tag: str = "", tag_exclude: bool = False) -> ReviewResult:
+                 tag: str = "", tag_exclude: bool = False,
+                 library_cache: Path | None = None) -> ReviewResult:
     """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
     `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
     of the n books that have one (see archives.ask_once); None: archives are read as they are.
-    `tag`: review only the books with this tag (with `tag_exclude`, without it); "" = all."""
+    `tag`: review only the books with this tag (with `tag_exclude`, without it); "" = all.
+    `library_cache`: where generic_covers keeps what it found (see library_cache)."""
     check_libraries(library, trash)
     books = read_books(library)
-    generic = generic_covers(books)  # over the whole library: reviewed books show the image too
+    if progress is not None:
+        progress(0, len(books), "Looking for generic covers…")
+    generic = generic_covers(books, cancel, library_cache)  # over the whole library: reviewed books show the image too
     tag = tag.strip()
     tag_exclude = tag_exclude and bool(tag)
     books = [b for b in books if tag_selects(b, tag, tag_exclude)]

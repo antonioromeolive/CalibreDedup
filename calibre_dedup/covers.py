@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections import defaultdict
 from pathlib import Path
 
+from .library_cache import LibraryCache
 from .models import Book
 from .normalize import authors_key, title_key
 
@@ -48,33 +50,66 @@ def cover_file(book: Book) -> Path:
     return Path(book.library, book.path, "cover.jpg")
 
 
-def generic_covers(books: list[Book]) -> dict[str, int]:
+def generic_covers(books: list[Book], cancel: threading.Event | None = None,
+                   cache_dir: Path | None = None) -> dict[str, int]:
     """The generic covers among these books' cover.jpg: path -> how many books show
     that image. Only files whose size another cover shares are read. A library read
-    twice (source and target the same) counts each book once."""
+    twice (source and target the same) counts each book once. Every cover is looked at,
+    which takes a while on a big library: once `cancel` is set, {} is returned.
+    `cache_dir`: where the sizes and hashes found are kept for the next time (see
+    library_cache); None: not kept."""
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
     keys: dict[str, tuple] = {}  # cover path -> (title key, authors key)
+    owner: dict[str, Book] = {}
     for b in books:
         if b.has_cover:
-            keys[str(cover_file(b))] = (title_key(b.title or ""), authors_key(b.authors))
+            path = str(cover_file(b))
+            keys[path] = (title_key(b.title or ""), authors_key(b.authors))
+            owner[path] = b
 
     def placeholder(paths: list[str]) -> bool:
         return all(len({keys[p][k] for p in paths}) >= GENERIC_COVER_BOOKS for k in (0, 1))
 
-    by_size: dict[int, list[str]] = defaultdict(list)
-    for path in keys:
-        try:
-            by_size[Path(path).stat().st_size].append(path)
-        except OSError:
-            pass
-    by_hash: dict[str, list[str]] = defaultdict(list)
-    for paths in by_size.values():
-        if not placeholder(paths):
-            continue
-        for path in paths:
-            try:
-                by_hash[hashlib.sha1(Path(path).read_bytes()).hexdigest()].append(path)
-            except OSError:
-                pass
+    cache = LibraryCache(cache_dir, "covers")
+    whole = False
+    try:
+        by_size: dict[int, list[str]] = defaultdict(list)
+        sizes: dict[str, int] = {}
+        digests: dict[str, str] = {}
+        for path, b in owner.items():
+            if cancelled():
+                return {}
+            known = cache.get(b)  # [size, hash or ""]
+            if known is not None:
+                size, digests[path] = known
+            else:
+                try:
+                    size = Path(path).stat().st_size
+                except OSError:
+                    continue
+                cache.put(b, [size, ""])
+            sizes[path] = size
+            by_size[size].append(path)
+        by_hash: dict[str, list[str]] = defaultdict(list)
+        for paths in by_size.values():
+            if not placeholder(paths):
+                continue
+            for path in paths:
+                if cancelled():
+                    return {}
+                digest = digests.get(path)
+                if not digest:
+                    try:
+                        digest = hashlib.sha1(Path(path).read_bytes()).hexdigest()
+                    except OSError:
+                        continue
+                    cache.put(owner[path], [sizes[path], digest])
+                by_hash[digest].append(path)
+        whole = True
+    finally:
+        cache.save(whole)  # stopped halfway: what was found is kept too
     generic = {p: len(paths) for paths in by_hash.values() if placeholder(paths) for p in paths}
     if generic:
         log.info("%d books have a generic cover (the same image on books of %d or more titles and authors)",
