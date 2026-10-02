@@ -67,6 +67,9 @@ def _run_cli(argv: list[str]) -> int:
     by_tag.add_argument("--except-tag", help="review all the books except those with this tag")
     ap.add_argument("--execute", action="store_true",
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
+    ap.add_argument("--all-changes", action="store_true",
+                    help="with --execute, also write the changes left out because the book doesn't support "
+                         "them (default: only those it supports, and the empty fields filled)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer of the review first (review_cache.json)")
     ap.add_argument("--no-cache", action="store_true",
@@ -120,11 +123,14 @@ def _run_cli(argv: list[str]) -> int:
         elif item.changes:
             print(f"CHANGE   #{item.book.id:<6} {item.book.label()}")
             for name, value in item.changes.items():
+                left_out = f"   (left out: {item.doubts[name]})" if name in item.doubts else ""
                 print(f"        {name:9} {format_value(name, current_value(item.book, name)) or '—'}"
-                      f"  ->  {format_value(name, value)}")
+                      f"  ->  {format_value(name, value)}{left_out}")
     print(summary(result))
     if args.execute:
         for item in result.items:
+            if args.all_changes:
+                item.excluded -= set(item.doubts)
             item.selected = item.action is ReviewAction.UPDATE
         ok, failed, tagged = execute_review(result, fields, require_calibre_dir(settings),
                                     on_result=lambda it, good, msg: print(f"#{it.book.id}: {msg}"))

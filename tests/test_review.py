@@ -32,8 +32,8 @@ from calibre_dedup.extract import Excerpt
 from calibre_dedup.models import Book
 from calibre_dedup.review import (
     FIELDS,
-    ReviewAction, ReviewItem, Reviewer, apply_to_book, ask_ai, find_changes, format_value, review_actions, scan_library,
-    summary,
+    ReviewAction, ReviewItem, Reviewer, apply_to_book, ask_ai, find_changes, format_value, mark_series_publishers,
+    read_evidence, review_actions, scan_library, summary,
 )
 from tests.test_planner import make_library
 
@@ -49,6 +49,12 @@ def meta(**kw) -> ReviewMetadata:
     base = dict(title="Il nome della rosa", authors=["Umberto Eco"], publisher="Bompiani", year=1980)
     base.update(kw)
     return ReviewMetadata(**base)
+
+
+def read(b: Book, found: ReviewMetadata, text: str) -> ReviewMetadata:
+    """`found`, as read in a book whose first pages are `text` (its evidence)."""
+    found.evidence = read_evidence(b, found, text)
+    return found
 
 
 # --- parsing ---------------------------------------------------------------------
@@ -113,7 +119,7 @@ def test_values_are_shown_as_in_calibre():
 
 # --- actions ---------------------------------------------------------------------------
 def test_books_with_differences_are_proposed_for_update_the_others_kept():
-    changed = ReviewItem(book(), meta(year=1981))
+    changed = ReviewItem(book(), read(book(), meta(year=1981), "Umberto Eco IL NOME DELLA ROSA Bompiani 1981"))
     same = ReviewItem(book(id=2), meta())
     unread = ReviewItem(book(id=3), None, "no readable file")
     assert (changed.action, changed.selected) == (ReviewAction.UPDATE, True)
@@ -392,7 +398,7 @@ def test_books_tagged_reviewed_are_skipped_unless_asked(tmp_path):
 
 
 def test_every_book_read_gets_the_tag_updated_or_not():
-    updated = ReviewItem(book(), meta(year=1981))
+    updated = ReviewItem(book(), read(book(), meta(year=1981), "Umberto Eco IL NOME DELLA ROSA Bompiani 1981"))
     same = ReviewItem(book(id=2), meta())  # nothing to change
     unchecked = ReviewItem(book(id=3), meta(year=1999))
     unchecked.selected = False
@@ -432,3 +438,137 @@ def test_a_run_without_cache_is_written_as_csv(tmp_path):
     assert rows[0]["calibre_authors"] == rows[0]["read_authors"] == "Umberto Eco"
     assert rows[0]["new_authors"] == "" and rows[0]["action"] == "update"
     assert rows[1]["read_title"] == "" and rows[1]["note"] == "nothing to read"
+
+
+# --- what the book supports: in doubt, the metadata stays ---------------------------------
+PAGES = "UMBERTO ECO\nIL NOME DELLA ROSA\nRomanzo\nBompiani\nPrima edizione 1980\nISBN 88-452-0726-9"
+
+
+def test_the_ai_reads_isbn_language_and_cover():
+    m = ReviewMetadata.from_json(json.dumps({"title": "x", "isbn": ["88-452-0726-9", "123"], "language": "it",
+                                             "cover": "Text"}))
+    assert (m.isbn, m.language, m.cover) == (["9788845207266"], "ita", "text")
+    m = ReviewMetadata.from_json(json.dumps({"title": "x", "language": "Italian", "cover": "photo"}))
+    assert (m.language, m.cover) == ("ita", None)
+    assert ReviewMetadata.from_dict({"title": "x", "unknown_key": 1}).title == "x"
+
+
+def test_a_change_the_book_supports_is_ticked():
+    b = book(title="nome rosa scan", pub_year=2013)  # a file name, Calibre's file date
+    it = ReviewItem(b, read(b, meta(isbn=["9788845207266"]), PAGES))
+    assert set(it.changes) == {"title", "year", "isbn"} and it.doubts == {}
+    assert it.action is ReviewAction.UPDATE and it.selected and it.changes["isbn"] == "9788845207266"
+
+
+@pytest.mark.parametrize("calibre,found,why", [
+    (dict(pub_year=1971), dict(year=1980), None),  # 1971 not printed, 1980 printed: supported
+    (dict(pub_year=1975), dict(year=1971), "the new value is not in the book's text"),
+    (dict(publisher="Bompiani"), dict(publisher="Mondadori"), "Calibre's value is printed in the book"),
+    (dict(title="Il nome della rosa"), dict(title="La rosa"), "Calibre's value is printed in the book"),
+])
+def test_a_value_is_replaced_only_when_the_book_supports_it(calibre, found, why):
+    b = book(**calibre)
+    it = ReviewItem(b, read(b, meta(**found), PAGES))
+    [name] = [n for n in it.changes if n not in ("isbn", "language")]
+    assert it.doubts.get(name) == why and (name in it.excluded) == bool(why)
+
+
+def test_without_text_to_check_nothing_is_replaced_but_empty_fields_are_filled():
+    b = book(pub_year=1971, publisher=None)
+    it = ReviewItem(b, meta(year=1980))  # e.g. a scanned book: no evidence
+    assert it.doubts == {"year": "not checked against the book"} and it.changes["publisher"] == "Bompiani"
+    assert it.to_write(FIELDS) == {"publisher": "Bompiani"} and it.selected
+    changed = book(pub_year=1972)  # Calibre's value changed since the AI read the book
+    assert ReviewItem(changed, read(b, meta(year=1980), PAGES)).doubts == {"year": "not checked against the book"}
+
+
+@pytest.mark.parametrize("authors", [["Heinlein, Bradbury, Amis"], ["F. Brown e altri"], ["Eco", "Rossi"]])
+def test_a_change_that_loses_an_author_is_left_out(authors):
+    b = book(authors=authors)
+    it = ReviewItem(b, read(b, meta(authors=["Robert A. Heinlein"]), PAGES + " Robert A. Heinlein"))
+    assert it.doubts["authors"] == "an author would be lost"
+
+
+def test_a_title_that_loses_its_issue_number_is_left_out_unless_it_is_the_series_number():
+    b = book(title="Galaxy Mensile Di Fantascienza N 04")
+    it = ReviewItem(b, read(b, meta(title="Galaxy"), "GALAXY mensile"))
+    assert it.doubts["title"] == "the issue or volume number would be lost"
+    it = ReviewItem(b, read(b, meta(title="Galaxy", series="Galaxy", series_index=4), "GALAXY mensile"))
+    assert "title" not in it.doubts
+
+
+def test_a_series_name_is_not_a_publisher():
+    b = book(publisher="La Tribuna")
+    it = ReviewItem(b, read(b, meta(publisher="Galassia", series="Galassia", series_index=134), "GALASSIA"))
+    assert it.doubts["publisher"] == "a series name, not a publisher"
+    other = book(id=2, publisher="La Tribuna")
+    it = ReviewItem(other, read(other, meta(publisher="Galassia"), "GALASSIA"))  # the series is another book's
+    assert "publisher" not in it.doubts and it.selected
+    mark_series_publishers([it], {"galassia"})
+    assert it.doubts["publisher"] == "a series name, not a publisher" and "publisher" in it.excluded
+
+
+def test_a_record_with_title_and_author_swapped_is_put_right():
+    b = book(title="1969", authors=["La Contessa Di Ascot"])  # the title in the author field, a year as title
+    it = ReviewItem(b, read(b, meta(title="La contessa di Ascot", authors=["Edgar Wallace"]),
+                            "EDGAR WALLACE\nLA CONTESSA DI ASCOT\n1969"))
+    assert "title" not in it.doubts and "authors" not in it.doubts
+    b = book(title="Bernard Cornwell", authors=["L'Eroe Di Trafalgar"])
+    it = ReviewItem(b, read(b, meta(title="L'eroe di Trafalgar", authors=["Bernard Cornwell"]),
+                            "BERNARD CORNWELL\nL'EROE DI TRAFALGAR"))
+    assert it.doubts == {}
+
+
+def test_isbn_only_for_a_book_without_one_and_only_one_printed():
+    b = book()
+    assert "isbn" not in ReviewItem(book(isbns={"9780000000002"}), read(b, meta(isbn=["9788845207266"]), PAGES)).changes
+    two = read(b, meta(isbn=["9788845207266", "9788804668237"]), PAGES + " ISBN 978-88-04-66823-7")
+    assert "isbn" not in ReviewItem(b, two).changes  # two printed: the print and the e-book's, or another book's
+    absent = read(b, meta(isbn=["9788804668237"]), PAGES)  # read, but not in the text
+    assert "isbn" not in ReviewItem(b, absent).changes
+    assert ReviewItem(b, meta(isbn=["9788845207266"])).changes["isbn"] == "9788845207266"  # no text: as read
+
+
+def test_the_language_is_the_texts_own():
+    italian = "Il vecchio pescatore guardava il mare che non si calmava e pensava alla barca che aveva " * 12
+    b = book(languages=["eng"])  # Calibre's default language, wrong
+    it = ReviewItem(b, read(b, meta(language="ita"), italian))
+    assert it.changes["language"] == "ita" and "language" not in it.doubts
+    it = ReviewItem(b, meta(language="ita"))  # no text to tell it: the AI's word alone
+    assert it.doubts["language"] == "not told by the book's text"
+    assert ReviewItem(book(), meta(language="ita")).to_write(FIELDS)["language"] == "ita"  # empty: filled
+
+
+def test_a_cover_the_ai_says_is_not_real_is_tagged_bad_cover():
+    text_page = ReviewItem(book(), meta(cover="text"))
+    real = ReviewItem(book(id=2), meta(cover="real"))
+    tagged = ReviewItem(book(id=3, tags={"BadCover"}), meta(cover="placeholder"))
+    assert text_page.bad_cover and not real.bad_cover and not tagged.bad_cover
+    assert [a for a in review_actions([text_page, real, tagged], set()) if a.get("tag") == "BadCover"] == [
+        {"op": "tag", "src_ids": [1], "tag": "BadCover"}]
+
+
+def test_a_generic_cover_is_not_sent_to_the_ai(tmp_path):
+    folder = tmp_path / "b"
+    folder.mkdir()
+    (folder / "cover.jpg").write_bytes(b"jpg")
+    b = book(library=str(tmp_path), path="b")
+    reviewer = Reviewer(FakeProvider(), FakeExtractor(), AICache(tmp_path / "c.json"))
+    reviewer.generic = {str(folder / "cover.jpg"): 5}
+    assert reviewer._cover(b) == (None, "generic cover not sent to the AI")
+
+
+def test_the_evidence_is_kept_with_the_answer(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "dune", "text": "x"}])
+    text = FakeProvider(REPLY)
+    reviewer = Reviewer(text, FakeExtractor("FRANK HERBERT\nDUNE\n1965"), AICache(tmp_path / "cache.json"))
+    first = scan_library(lib, "", reviewer).items[0]
+    again = scan_library(lib, "", reviewer).items[0]  # from the cache: no text read, the evidence is there
+    assert len(text.calls) == 1 and again.found.evidence == first.found.evidence
+    assert first.found.evidence["fields"]["year"] == {"current": "", "current_printed": False, "read_printed": True}
+
+
+def test_an_authors_name_is_not_a_publisher():
+    b = book(publisher=None, authors=["La Contessa Di Ascot"])
+    it = ReviewItem(b, read(b, meta(publisher="Edgar Fallace", authors=["Edgar Wallace"]), "EDGAR FALLACE"))
+    assert it.doubts["publisher"] == "an author's name, not a publisher"  # one letter from the author's name

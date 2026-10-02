@@ -166,7 +166,7 @@ class ReadsEpubOnly:
         return None
 
 
-def test_review_reads_the_next_format_when_one_fails_and_proposes_it_for_the_trash(tmp_path):
+def test_review_reads_the_next_format_when_one_fails_and_keeps_it(tmp_path):
     lib = make_library(tmp_path / "lib", [{"title": "Dune", "formats": ["EPUB", "MOBI"]}])
     put(lib, 1, "EPUB", b"PK\x03\x04" + bytes(50))
     put(lib, 1, "MOBI", bytes(60) + b"BOOKMOBI")
@@ -174,21 +174,38 @@ def test_review_reads_the_next_format_when_one_fails_and_proposes_it_for_the_tra
     assert item.found is not None and set(item.bad_formats) == {"MOBI"} and not item.broken
     assert item.action is ReviewAction.UPDATE and "unreadable" in item.note
     ops = review_actions([item], {"year"})
-    assert ops[0]["op"] == "set" and ops[0]["trash_formats"] == ["MOBI"]
+    assert ops[0]["op"] == "set" and "trash_formats" not in ops[0]  # only Calibre's converter failed on it
+    item.trash_bad = True  # the user moves it to the trash library anyway
+    assert review_actions([item], {"year"})[0]["trash_formats"] == ["MOBI"]
     item.selected = False  # nothing to write: the formats go on their own, then the tag
     assert [a["op"] for a in review_actions([item], {"year"})] == ["trash_formats", "tag"]
     item.trash_bad = False
     assert [a["op"] for a in review_actions([item], {"year"})] == ["tag"]
 
 
-def test_review_proposes_a_book_with_no_readable_file_for_the_trash(tmp_path):
-    lib = make_library(tmp_path / "lib", [{"title": "Ernani", "formats": ["PDF", "DOC"]}])
-    put(lib, 1, "PDF", WORD)
-    put(lib, 1, "DOC", WORD)
+def test_review_trashes_a_book_only_when_none_of_its_files_opens(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "Ernani", "formats": ["PDF", "EPUB"]},
+                                          {"title": "Otello", "formats": ["PDF", "DOC"]}])
+    put(lib, 1, "PDF", WORD)  # a Word document named .pdf and an empty EPUB: nothing opens them
+    put(lib, 1, "EPUB", b"")
+    put(lib, 2, "PDF", WORD)
+    put(lib, 2, "DOC", WORD)  # Word opens it
     text = FakeProvider(REPLY)
-    item = scan_library(lib, "", Reviewer(text, ReadsEpubOnly(), AICache(tmp_path / "c.json"))).items[0]
-    assert item.broken and item.action is ReviewAction.TRASH and item.selected and text.calls == []
-    assert review_actions([item], {"year"}) == [{"src_id": 1, "title": "Ernani", "op": "trash", "no_target": True}]
+    fake, doc = scan_library(lib, "", Reviewer(text, ReadsEpubOnly(), AICache(tmp_path / "c.json"))).items
+    assert fake.broken and fake.action is ReviewAction.TRASH and fake.selected and text.calls == []
+    assert doc.broken and doc.action is ReviewAction.KEEP and "another program may open it" in doc.note
+    assert review_actions([fake, doc], {"year"}) == [{"src_id": 1, "title": "Ernani", "op": "trash", "no_target": True}]
+
+
+def test_review_takes_out_only_the_files_that_open_nowhere(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "Dune", "formats": ["EPUB", "PDF", "DOC"]}])
+    put(lib, 1, "EPUB", b"PK\x03\x04" + bytes(50))
+    put(lib, 1, "PDF", WORD)  # not a PDF: opens nowhere
+    put(lib, 1, "DOC", WORD)  # Calibre doesn't read it, Word does
+    item = scan_library(lib, "", Reviewer(FakeProvider(REPLY), ReadsEpubOnly(), AICache(tmp_path / "c.json"))).items[0]
+    assert set(item.bad_formats) == {"PDF", "DOC"} and item.bad_formats_to_trash == ["PDF"]
+    item.trash_bad = True
+    assert item.bad_formats_to_trash == ["DOC", "PDF"]
 
 
 @pytest.mark.parametrize("tag", ["", "New"])

@@ -547,17 +547,23 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     the other models' answers are kept. Handy for books the AI failed on, or for a second
     opinion; e.g. filter *Not read*, select all, right-click.
   - *Check visible* / *Uncheck visible* act on the rows the filters show.
-- **Books with no file Calibre can open** (a record without files, or only unreadable ones)
-  are proposed for the trash, ticked. A book with some unreadable files is read from the
-  others, and those files are proposed for the trash library (the record is copied there
-  first). See [Files Calibre can't open](#files-calibre-cant-open).
+- **Books with no file Calibre can open**: a record without files, or whose files open
+  nowhere (empty, or not what their format says), is proposed for the trash, ticked. A file
+  that another program may open is **kept**: a format Calibre doesn't read (a DOC opens in
+  Word), or a file only Calibre's converter fails on (an RTF Word opens); such a book is kept,
+  *Not read*. A book with some unreadable files is read from the others, and only those that
+  open nowhere are proposed for the trash library (the record is copied there first);
+  right-click → *Move the unreadable formats to the trash library* takes out the others too.
+  See [Files Calibre can't open](#files-calibre-cant-open).
 - **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
   Merge and Dedup (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
   an unpacked book stays visible with *With differences*, since Execute changes it.
-- **Books with a generic cover** (the same image on books of 3 or more different titles and
-  authors, see above) say so in the *Read* column, and Execute tags them **`BadCover`**
-  (unless they go to the trash), so you can find them in Calibre later and give them a real
-  cover. Nothing else is changed: neither Calibre's cover nor the e-book files.
+- **Books with a bad cover**: a generic cover (the same image on books of 3 or more different
+  titles and authors, see above), which is not sent to the AI (it would mislead it), or a
+  cover the Image AI says is not a real one (only a page of text, or a placeholder). They are
+  listed by the *Bad cover* filter, and Execute tags them **`BadCover`** (unless they go to the
+  trash), so you can find them in Calibre later and give them a real cover. Nothing else is
+  changed: neither Calibre's cover nor the e-book files.
 
 ### Step 3: Execute
 
@@ -596,6 +602,7 @@ book's files.
 ```powershell
 python -m calibre_dedup.review_app --cli --library D:\Books\Main                  # dry run: prints the differences
 python -m calibre_dedup.review_app --cli ... --fields title,authors --execute    # write only these fields
+python -m calibre_dedup.review_app --cli ... --execute --all-changes             # also the changes left out
 python -m calibre_dedup.review_app --cli ... --include-reviewed                  # also books tagged AIReviewed
 python -m calibre_dedup.review_app --cli ... --tag New                           # only the books tagged New
 python -m calibre_dedup.review_app --cli ... --except-tag Checked                # all books except those tagged Checked
@@ -603,6 +610,9 @@ python -m calibre_dedup.review_app --cli ... --except-tag Checked               
 
 The **tag filter** (under the libraries) works as in Merge and Dedup: *Only books tagged* or
 *All books except tagged*; *Skip books tagged AIReviewed* still applies on top.
+
+The dry run marks each change left out, with the reason; `--execute` writes the others, as
+the window ticks them, and `--all-changes` the left-out ones too.
 
 Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
 clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ask the AI again
@@ -749,7 +759,7 @@ there automatically.
 | `review_settings.json` | Review | its own settings |
 | `ai_profiles.json` | both | the AI providers (no keys: those are in Windows Credential Manager) |
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
-| `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes |
+| `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes, those left out and why, the cover type |
 | `selections.json` | Merge and Dedup | remembered ticks and changes, per source/target pair |
 | `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
@@ -949,7 +959,8 @@ answer with Calibre's metadata.
 - **AI:** with an **Image AI**, every book goes to it, with the cover and, for scanned books,
   the page images. Without one, the **Text AI** reads the text only (the cover isn't read,
   scanned PDFs are skipped).
-- **What is read:** the **start** of the book, and the cover (Image AI only).
+- **What is read:** the **start** of the book, and the cover (Image AI only; a generic cover
+  is not sent).
 - **Sent when:** for every book analyzed, except books tagged `AIReviewed` while **Skip books
   tagged AIReviewed** is on (the default), and books with nothing readable. If the AI's
   content filter refuses a book (e.g. a violent novel), the same prompt is sent again with
@@ -965,23 +976,36 @@ The text may be in any language.
 
 Respond with a single JSON object with exactly these keys:
 {"title": string|null, "authors": [string], "publisher": string|null, "year": integer|null,
- "series": string|null, "series_index": number|null}
+ "series": string|null, "series_index": number|null, "isbn": [string], "language": string|null,
+ "cover": "real"|"text"|"placeholder"|null}
 
 Rules:
 - Use only information shown in the pages or on the cover. Never guess. Use null or [] when
   not found.
-- "title": the book's title as printed, with normal capitalisation (not ALL CAPS). Without
-  the series name or number, unless they are part of the title itself.
+- "title": the title of THIS edition as printed, with normal capitalisation (not ALL CAPS):
+  not the original title of a translation ("Titolo originale", "Original title"). Without the
+  series name or number, unless they are part of the title itself.
 - "authors": the authors' names as printed, in "First Last" order. Exclude translators,
   editors of forewords, illustrators and cover artists.
-- "publisher": the publishing house of THIS edition (not the printer or distributor).
+- "publisher": the publishing house of THIS edition: not the printer or distributor, nor the
+  name of a series, collection or magazine the book belongs to.
 - "year": the publication year of THIS edition (not the original first publication, if both
   are shown).
 - "series": the series or numbered collection the book belongs to, e.g. a saga
   ("Foundation") or a publisher's numbered collection ("Gutenberg"). null if none is shown.
 - "series_index": the book's number in that series (e.g. 3, or 1234 for "Gutenberg n. 1234").
-ok g  null if not shown.
+  null if not shown.
+- "isbn": the ISBNs printed for THIS book (digits and X only), not those of other books
+  listed in it.
+- "language": the language the book's text is written in, as a two-letter ISO 639-1 code
+  ("it", "en").
+- "cover": only when a cover is attached: "real" for a real book cover, "text" when it is
+  only a page of text or a plain cover with just the title and author, "placeholder" for an
+  image that is not about this book (a logo, a stock picture). null when no cover is attached.
 ```
+
+The answer is then checked against the pages it was read from, without AI (see [Which
+changes are ticked](#step-2-review-the-list)).
 
 User message, from these lines:
 

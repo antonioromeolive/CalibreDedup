@@ -954,35 +954,51 @@ its cover. The text may be in any language.
 
 Respond with a single JSON object with exactly these keys:
 {"title": string|null, "authors": [string], "publisher": string|null, "year": integer|null,
- "series": string|null, "series_index": number|null}
+ "series": string|null, "series_index": number|null, "isbn": [string], "language": string|null,
+ "cover": "real"|"text"|"placeholder"|null}
 
 Rules:
 - Use only information shown in the pages or on the cover. Never guess. Use null or [] when not found.
-- "title": the book's title as printed, with normal capitalisation (not ALL CAPS). Without the series \
-name or number, unless they are part of the title itself.
+- "title": the title of THIS edition as printed, with normal capitalisation (not ALL CAPS): not the \
+original title of a translation ("Titolo originale", "Original title"). Without the series name or \
+number, unless they are part of the title itself.
 - "authors": the authors' names as printed, in "First Last" order. Exclude translators, editors of \
 forewords, illustrators and cover artists.
-- "publisher": the publishing house of THIS edition (not the printer or distributor).
+- "publisher": the publishing house of THIS edition: not the printer or distributor, nor the name of a \
+series, collection or magazine the book belongs to.
 - "year": the publication year of THIS edition (not the original first publication, if both are shown).
 - "series": the series or numbered collection the book belongs to, e.g. a saga ("Foundation") or a \
 publisher's numbered collection ("Gutenberg"). null if none is shown.
 - "series_index": the book's number in that series (e.g. 3, or 1234 for "Gutenberg n. 1234"). null if \
 not shown.
+- "isbn": the ISBNs printed for THIS book (digits and X only), not those of other books listed in it.
+- "language": the language the book's text is written in, as a two-letter ISO 639-1 code ("it", "en").
+- "cover": only when a cover is attached: "real" for a real book cover, "text" when it is only a page \
+of text or a plain cover with just the title and author, "placeholder" for an image that is not about \
+this book (a logo, a stock picture). null when no cover is attached.
 """
+COVER_KINDS = ("real", "text", "placeholder")
 
 
 @dataclass
 class ReviewMetadata:
-    """What the AI read in a book's first pages and on its cover."""
+    """What the AI read in a book's first pages and on its cover. `evidence`: what the
+    pages show, checked without AI (review.read_evidence), kept with the answer."""
     title: str | None = None
     authors: list[str] = field(default_factory=list)
     publisher: str | None = None
     year: int | None = None
     series: str | None = None
     series_index: float | None = None
+    isbn: list[str] = field(default_factory=list)  # valid ISBN-13s
+    language: str | None = None  # Calibre's code ("ita")
+    cover: str | None = None  # COVER_KINDS, when a cover was attached
+    evidence: dict = field(default_factory=dict)
 
     @classmethod
     def from_json(cls, text: str) -> "ReviewMetadata":
+        from .language import language_code
+        from .normalize import normalize_isbn
         base = AIMetadata.from_json(text)  # same parsing and checks for the shared fields
         m = re.search(r"\{.*\}", text, re.S)
         data = json.loads(m.group()) if m else {}
@@ -993,8 +1009,17 @@ class ReviewMetadata:
             index = float(str(data.get("series_index")).replace(",", ".")) if series else None
         except (TypeError, ValueError):
             index = None
+        cover = str(data.get("cover") or "").strip().casefold()
         return cls(title=base.title, authors=base.authors, publisher=base.publisher, year=base.year,
-                   series=series, series_index=index if index is None or 0 <= index < 100_000 else None)
+                   series=series, series_index=index if index is None or 0 <= index < 100_000 else None,
+                   isbn=list(dict.fromkeys(i for i in (normalize_isbn(x) for x in base.isbn) if i)),
+                   language=language_code(data.get("language")),
+                   cover=cover if cover in COVER_KINDS else None)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReviewMetadata":
+        """A cached answer (to_dict), ignoring keys it doesn't know."""
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -1002,8 +1027,9 @@ class ReviewMetadata:
 
 def read_book_metadata(provider: Provider, text: str, images: list[str] | None = None,
                        has_cover: bool = False) -> ReviewMetadata:
-    """Ask for title, authors, publisher, year and series. With `has_cover`, the
-    first image is the cover; the other images are pages of a scanned book."""
+    """Ask for title, authors, publisher, year, series, ISBN, language and what the cover
+    is. With `has_cover`, the first image is the cover; the other images are pages of a
+    scanned book."""
     parts = []
     if has_cover:
         parts.append("The first attached image is the book's cover.")

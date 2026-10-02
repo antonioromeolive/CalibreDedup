@@ -86,3 +86,22 @@ def test_swapped_title_and_author_are_written_only_if_unchanged(bridge):
     assert "changed since the analysis" in bridge.swap_title_author(db, 1, swap)
     assert db.fields["title"][1] == "Kingston" and db.fields["tags"][1] == ()
     assert bridge.swap_title_author(db, 1, None) == ""
+
+
+class BookDB(FieldsDB):
+    def formats(self, book_id):
+        return ()
+
+    def format_abspath(self, book_id, fmt):
+        return None
+
+
+def test_review_writes_an_isbn_only_where_there_is_none_and_the_language(bridge):
+    db = BookDB(identifiers={"amazon": "B00X"}, languages=("eng",), path="a/b")
+    changed, path, formats = bridge.set_metadata(db, 1, {"isbn": "9788845207266", "language": "ita"})
+    assert changed == ["isbn", "language"] and path == "a/b" and formats == {}
+    assert db.fields["identifiers"][1] == {"amazon": "B00X", "isbn": "9788845207266"}
+    assert db.fields["languages"][1] == ["ita"]
+    db = BookDB(identifiers={"isbn": "9780000000002"}, path="a/b")  # has one: kept
+    assert bridge.set_metadata(db, 1, {"isbn": "9788845207266"})[0] == []
+    assert db.fields["identifiers"][1] == {"isbn": "9780000000002"}

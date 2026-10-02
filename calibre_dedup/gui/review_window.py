@@ -60,7 +60,7 @@ from ..normalize import strip_accents
 from ..review import (
     ACTION_LABELS, FIELD_LABELS, FIELDS, ReviewAction, ReviewItem, ReviewResult, Reviewer, book_cover_file,
     REVIEW_CACHE_FILE, REVIEWED_TAG, ask_ai, check_libraries, current_value, execute_review, format_value,
-    is_reviewed, review_actions, review_cache, scan_library, summary, write_run_csv,
+    is_reviewed, review_actions, review_cache, scan_library, series_names, summary, write_run_csv,
 )
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
 from ..version import app_version
@@ -87,10 +87,11 @@ CELL_ROLE = Qt.UserRole + 1  # (current text, proposed text or None, will be wri
 
 # --- table model ----------------------------------------------------------------
 class ReviewModel(QAbstractTableModel):
-    HEADERS = ["✓", "ID", "Action", "Title", "Authors", "Publisher", "Year", "Series", "Read", "Result"]
+    HEADERS = ["✓", "ID", "Action", "Title", "Authors", "Publisher", "Year", "Series", "ISBN", "Language", "Read",
+               "Result"]
     COL_CHECK, COL_ID, COL_ACTION = 0, 1, 2
-    FIELD_COLS = {3: "title", 4: "authors", 5: "publisher", 6: "year", 7: "series"}
-    COL_READ, COL_RESULT = 8, 9
+    FIELD_COLS = {3: "title", 4: "authors", 5: "publisher", 6: "year", 7: "series", 8: "isbn", 9: "language"}
+    COL_READ, COL_RESULT = 10, 11
     selection_changed = Signal()
 
     def __init__(self, fields_on: set[str]):
@@ -205,8 +206,10 @@ class ReviewModel(QAbstractTableModel):
                 label += " (nothing to write)"
             label += " (manual)" if it.manual else ""
             if it.bad_formats and not it.broken and not (it.selected and it.action is ReviewAction.TRASH):
-                bad = ", ".join(sorted(it.bad_formats))
-                label += f"\n+ {bad} to trash" if it.trash_bad else f"\n{bad} unreadable, kept"
+                going = it.bad_formats_to_trash
+                kept = sorted(set(it.bad_formats) - set(going))
+                label += (f"\n+ {', '.join(going)} to trash" if going else "") + (
+                    f"\n{', '.join(kept)} unreadable, kept" if kept else "")
             if it.archives and not (it.selected and it.action is ReviewAction.TRASH):
                 label += "\n" + "\n".join(archive_texts(it.archives))
             return label
@@ -220,6 +223,10 @@ class ReviewModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             return it.book.id if col == self.COL_ID else self.text(it, col)
         if role == Qt.ToolTipRole:
+            name = self.FIELD_COLS.get(col)
+            if name in it.doubts and name in it.excluded:
+                return (f"{self.text(it, col)}\n\nLeft out: {it.doubts[name]}.\nRight-click → Change "
+                        f"{FIELD_LABELS[name].lower()} again, to write it anyway.")
             return self.text(it, col) or None
         if role == CELL_ROLE and col in self.FIELD_COLS:
             return self.cell(it, self.FIELD_COLS[col])
@@ -273,12 +280,16 @@ ACTION_ENTRIES: list[Entry] = [
 BOOK_ENTRIES: list[Entry] = [
     ("changes", "With differences", "The AI read something different from Calibre's metadata, or Execute changes "
                                     "the book anyway (trash, unpacking)."),
+    ("doubt", "Changes left out", "Changes not ticked because the book doesn't support them: Calibre's value is "
+                                  "printed in the book, or the new one isn't, or an author, an issue number or the "
+                                  "publisher would be lost. Shown struck through; right-click → Change … again to "
+                                  "write one."),
     ("unread", "Not read", "The AI could not read the book: no file, no text, or an error."),
     ("unreadable", "Unreadable files", "Files Calibre can't open (a format it doesn't read, a fake PDF): proposed "
                                        "for the trash library; the book keeps the others."),
     ("archives", "Archives", "Books stored as RAR/ZIP/7Z: their archive can be unpacked on Execute."),
-    ("generic", "Generic cover", f"The same cover image as books of other titles and authors: tagged "
-                                 f"{BAD_COVER_TAG} on Execute."),
+    ("generic", "Bad cover", f"Not a real cover: the same image as books of other titles and authors, or, per the "
+                             f"Image AI, only a page of text or a placeholder. Tagged {BAD_COVER_TAG} on Execute."),
     ("other", "Other books", "Books that match none of the entries above."),
 ]
 DEFAULT_BOOKS = {"changes"}
@@ -288,13 +299,15 @@ def book_kinds(it: ReviewItem) -> set[str]:
     kinds = set()
     if it.changes or it.action is ReviewAction.TRASH or it.archives_to_unpack:
         kinds.add("changes")
+    if any(name in it.excluded for name in it.doubts):
+        kinds.add("doubt")
     if it.found is None:
         kinds.add("unread")
     if it.bad_formats:
         kinds.add("unreadable")
     if it.archives:
         kinds.add("archives")
-    if it.generic_cover:
+    if it.bad_cover:
         kinds.add("generic")
     return kinds or {"other"}
 
@@ -450,9 +463,11 @@ class AskWorker(ScanWorker):
     replaced = Signal(object, object)  # old item, new item
     asked = Signal(int)  # books done
 
-    def __init__(self, settings: Settings, items: list[ReviewItem], no_cache: bool = False):
+    def __init__(self, settings: Settings, items: list[ReviewItem], no_cache: bool = False,
+                 series: set[str] | None = None):
         super().__init__(settings, "", "", no_cache)
         self.items = items
+        self.series = series  # the review's series names, never taken as a publisher
 
     def _run(self):
         reviewer = None
@@ -461,7 +476,7 @@ class AskWorker(ScanWorker):
                                      cache=review_cache(self.no_cache))
             if reviewer is None:
                 raise RuntimeError("Asking the AI needs one: choose a Text AI (or an Image AI).")
-            done = ask_ai(reviewer, self.items, self.progress.emit, self.cancel, self.replaced.emit)
+            done = ask_ai(reviewer, self.items, self.progress.emit, self.cancel, self.replaced.emit, self.series)
             self.asked.emit(len(done))
         except Exception as e:
             log.exception("Asking the AI failed")
@@ -686,7 +701,7 @@ class ReviewWindow(QMainWindow):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.sectionClicked.connect(self._header_clicked)
-        for col, width in enumerate([34, 50, 70, 280, 200, 170, 60, 180, 260, 240]):
+        for col, width in enumerate([34, 50, 70, 280, 200, 170, 60, 180, 130, 70, 260, 240]):
             self.table.setColumnWidth(col, width)
         self.table.selectionModel().currentRowChanged.connect(self._show_cover)
 
@@ -1201,7 +1216,9 @@ class ReviewWindow(QMainWindow):
         if self.ask_worker is not None or self.model.locked:  # started meanwhile
             return
         ais = " + ".join(dict.fromkeys(n for n in (settings.text_profile, settings.image_profile) if n))
-        worker = AskWorker(settings, items, self.no_cache.isChecked())
+        shown = self.result.items if self.result is not None else self.model.items
+        worker = AskWorker(settings, items, self.no_cache.isChecked(),
+                           series_names([i.book for i in shown], shown))
         worker.progress.connect(lambda done, total, msg, a=ais: self._on_ask_progress(a, done, total, msg))
         worker.replaced.connect(self._on_replaced)
         worker.asked.connect(self._ask_done)
@@ -1300,6 +1317,7 @@ class ReviewWindow(QMainWindow):
         fields = ", ".join(FIELD_LABELS[f].lower() for f in FIELDS if f in self.fields_on) or "none"
         where = "permanently deleted" if self.settings.delete_permanently else "moved to Calibre's recycle bin"
         unread = sum(1 for i in self.model.items if i.found is None and not i.manual)
+        left_out = sum(1 for i in self.model.items for name in i.doubts if name in i.excluded)
         if QMessageBox.question(
                 self, "Execute and mark reviewed",
                 f"{updates} books will have their metadata updated (fields: {fields}).\n"
@@ -1314,7 +1332,9 @@ class ReviewWindow(QMainWindow):
                 f"{AI_UPDATED_TAG}.\n"
                 + (f"The {unread} books the AI could not read are not tagged: the next analysis tries them again.\n"
                    if unread else "")
-                + (f"{covers} books with a generic cover (the same image on books of different titles) are "
+                + (f"{left_out} changes are left out, not supported by the book (filter 'Changes left out'): "
+                   "they are not written.\n" if left_out else "")
+                + (f"{covers} books whose cover is not a real one (a generic image, a page of text) are "
                    f"tagged {BAD_COVER_TAG}, to find them a real cover in Calibre.\n" if covers else "")
                 + "\nContinue?") != QMessageBox.Yes:
             return

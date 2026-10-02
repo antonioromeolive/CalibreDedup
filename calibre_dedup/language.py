@@ -50,6 +50,30 @@ _LANGUAGE_OF = {word: lang for lang, words in _WORDS.items() for word in words.s
 NAMES = {"ita": "Italian", "eng": "English", "fra": "French", "deu": "German", "spa": "Spanish",
          "por": "Portuguese", "nld": "Dutch", "lat": "Latin"}
 
+# What an AI may answer for a language (ISO 639-1 codes, older ISO 639-2 codes, names) ->
+# Calibre's language codes (ISO 639-3, as its Languages field stores them).
+_CODES = {
+    "it": "ita", "en": "eng", "fr": "fra", "de": "deu", "es": "spa", "pt": "por", "nl": "nld", "la": "lat",
+    "ru": "rus", "pl": "pol", "sv": "swe", "da": "dan", "no": "nor", "nb": "nob", "fi": "fin", "el": "ell",
+    "tr": "tur", "ro": "ron", "hu": "hun", "cs": "ces", "sk": "slk", "hr": "hrv", "sr": "srp", "sl": "slv",
+    "ca": "cat", "eu": "eus", "gl": "glg", "ja": "jpn", "zh": "zho", "ko": "kor", "ar": "ara", "he": "heb",
+    "hi": "hin", "uk": "ukr", "bg": "bul", "et": "est", "lv": "lav", "lt": "lit", "ga": "gle", "cy": "cym",
+    "is": "isl", "eo": "epo",
+    "fre": "fra", "ger": "deu", "dut": "nld", "gre": "ell", "chi": "zho", "cze": "ces", "rum": "ron",
+    "slo": "slk", "ice": "isl", "wel": "cym",
+    "italian": "ita", "italiano": "ita", "english": "eng", "inglese": "eng", "french": "fra", "francese": "fra",
+    "german": "deu", "tedesco": "deu", "spanish": "spa", "spagnolo": "spa", "portuguese": "por",
+    "portoghese": "por", "dutch": "nld", "olandese": "nld", "latin": "lat", "latino": "lat",
+}
+
+
+def language_code(value) -> str | None:
+    """Calibre's code for a language as an AI may write it ("it", "ita", "Italian"); None if unknown."""
+    v = str(value or "").strip().casefold()
+    if v in _CODES:
+        return _CODES[v]
+    return v if v in set(_CODES.values()) else None
+
 MIN_HITS = 20  # fewer frequent words: too little text to tell
 MARGIN = 3  # the language found must have this many times the hits of the next one
 

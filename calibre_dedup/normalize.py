@@ -87,6 +87,11 @@ def _tokens(text: str) -> list[str]:
     return text.split()
 
 
+def word_tokens(text: str) -> list[str]:
+    """The words of a text as titles and names are compared: case, accents and punctuation ignored."""
+    return _tokens(text)
+
+
 def is_unknown(value: str | None) -> bool:
     return value is None or value.strip().casefold() in UNKNOWN_VALUES
 

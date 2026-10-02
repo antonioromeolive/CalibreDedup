@@ -253,3 +253,15 @@ def test_a_save_that_cannot_lock_keeps_its_answers_for_the_next(monkeypatch, tmp
     assert ai.AICache().get("k") is None
     cache.save()
     assert ai.AICache().get("k") == {"title": "x"}
+
+
+def test_review_fields_added_later_start_on_and_a_field_turned_off_stays_off(monkeypatch, tmp_path):
+    home = _fake_home(monkeypatch, tmp_path)
+    data = home / ".CalibreDedup"
+    data.mkdir()
+    _write(data / config.REVIEW_SETTINGS_FILE, {"review_fields": ["title", "year"]})  # saved before ISBN and language
+    review = config.load_review_settings()
+    assert review.review_fields == ["title", "year", "isbn", "language"]
+    review.review_fields = ["title", "year", "language"]  # the user turns ISBN off
+    review.save()
+    assert config.load_review_settings().review_fields == ["title", "year", "language"]

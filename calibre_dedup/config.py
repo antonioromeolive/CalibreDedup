@@ -46,6 +46,8 @@ ANTHROPIC = "anthropic"
 
 
 DATA_DIR_NAME = ".CalibreDedup"
+# The fields calibre-review can change (review.FIELDS), for its "Change:" boxes.
+REVIEW_FIELD_NAMES = ("title", "authors", "publisher", "year", "series", "isbn", "language")
 SETTINGS_FILE = "settings.json"  # Merge and Dedup
 REVIEW_SETTINGS_FILE = "review_settings.json"  # calibre-review: its own copy, see load_review_settings
 PROFILES_FILE = "ai_profiles.json"  # the AI providers, shared by both programs
@@ -146,7 +148,9 @@ class Settings:
     dismissed_warnings: list[str] = field(default_factory=list)  # pre-flight warnings not to show again
     # calibre-review (python -m calibre_dedup.review)
     review_library: str = ""
-    review_fields: list[str] = field(default_factory=lambda: ["title", "authors", "publisher", "year", "series"])
+    review_fields: list[str] = field(default_factory=lambda: list(REVIEW_FIELD_NAMES))
+    # The fields there were when review_fields was saved: one added since starts on.
+    review_fields_known: list[str] = field(default_factory=list)
     review_window_geometry: str = ""
     review_skip_reviewed: bool = True  # skip books tagged AIReviewed (review.REVIEWED_TAG)
     review_tag: str = ""  # review only the books with this tag; "" = all
@@ -297,7 +301,13 @@ def load_review_settings() -> Settings:
             log.info("Review settings created from %s", dedup)
         except OSError as e:
             log.warning("Could not copy %s to %s: %s", dedup, path, e)
-    return Settings.load(path)
+    settings = Settings.load(path)
+    # A field added since the settings were saved starts on; one the user turned off stays off.
+    # Saved before review_fields_known existed: the fields known then were the first five.
+    known = settings.review_fields_known or [f for f in REVIEW_FIELD_NAMES if f not in ("isbn", "language")]
+    settings.review_fields += [f for f in REVIEW_FIELD_NAMES if f not in known and f not in settings.review_fields]
+    settings.review_fields_known = list(REVIEW_FIELD_NAMES)
+    return settings
 
 
 # --- secrets ---------------------------------------------------------------

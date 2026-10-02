@@ -121,6 +121,14 @@ CALIBRE_INPUT_FORMATS = {
 }
 
 
+def openable_elsewhere(reason: str) -> bool:
+    """Whether a format Calibre can't open (by the reason unreadable_formats or a failed
+    reading gives) may still open in another program: Calibre doesn't read the format (a
+    DOC), or only its converter failed (an RTF Word opens). Not an empty file, nor one that
+    isn't what its format says: those can't be opened at all."""
+    return reason.startswith("Calibre can't read")
+
+
 def unreadable_formats(formats: dict[str, str]) -> dict[str, str]:
     """The book's formats Calibre can't open, with why: not an input format of
     Calibre, or a file that is not what its format says. Missing files and

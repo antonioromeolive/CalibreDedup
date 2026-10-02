@@ -211,13 +211,23 @@ def swap_title_author(db, book_id, swap):
 
 def set_metadata(db, book_id, values):
     """Overwrite fields with the reviewed values (calibre-review). The year keeps
-    the date's month and day. Returns the changed fields, the book's folder and
-    its formats' paths (a new title or author renames them)."""
+    the date's month and day; an ISBN is added only to a book that has none; the
+    language replaces the book's languages. Returns the changed fields, the book's
+    folder and its formats' paths (a new title or author renames them)."""
     changed = []
     for name in ("title", "authors", "publisher", "series", "series_index"):
         if name in values:
             db.set_field(name, {book_id: values[name]})
             changed.append(name)
+    if values.get("isbn"):
+        ids = dict(db.field_for("identifiers", book_id) or {})
+        if "isbn" not in ids:
+            ids["isbn"] = values["isbn"]
+            db.set_field("identifiers", {book_id: ids})
+            changed.append("isbn")
+    if values.get("language"):
+        db.set_field("languages", {book_id: [values["language"]]})
+        changed.append("language")
     if values.get("year"):
         year = int(values["year"])
         pubdate = db.field_for("pubdate", book_id)
