@@ -1009,7 +1009,7 @@ The books whose metadata was actually written also get the tag **`AIUpdated`**: 
 The review has its own settings (`review_settings.json`) and its own AI cache
 (`review_cache.json`), so it can run at the same time as Merge and Dedup. The first
 time, both start as a copy of Merge and Dedup's: the same trash library, Calibre folder and
-reading limits (Settings → *Reading*). After that a change in one program doesn't reach the
+reading limits (Settings → *Analysis*). After that a change in one program doesn't reach the
 other. The **AI providers are shared** (`ai_profiles.json`): a profile added or edited in
 one program shows up in the other, while each program keeps its own choice of Text and Image
 AI. API keys are shared too (they are stored per profile name). AI answers

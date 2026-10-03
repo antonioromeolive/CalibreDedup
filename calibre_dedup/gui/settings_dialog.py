@@ -90,7 +90,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_providers_tab(), "AI providers")
-        tabs.addTab(self._build_analysis_tab(), "Analysis" if dedup_options else "Reading")
+        tabs.addTab(self._build_analysis_tab(), "Analysis")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
