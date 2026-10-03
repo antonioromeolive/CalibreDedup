@@ -138,7 +138,6 @@ class Settings:
     cleanup_only: bool = False
     only_tag: str = ""  # analyze only the source books with this tag; "" = all
     only_tag_exclude: bool = False  # ... all the source books except those with it, instead
-    update_metadata: bool = True  # write AI-found title/authors/publisher to moved books
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""
     source_library: str = ""

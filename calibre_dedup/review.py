@@ -46,6 +46,7 @@ from . import perf
 from .archives import ask_once, prepare as unpack_archives
 from .ai import AICache, AIError, ReviewMetadata, ask_fitting, read_book_metadata
 from .executor import AI_UPDATED_TAG, ExecutionError, run_bridge
+from .journal import Journal
 from .calibre_env import calibre_is_running
 from .config import config_dir
 from .covers import BAD_COVER_TAG, cover_file, generic_covers, generic_note
@@ -109,10 +110,45 @@ class ReviewItem:
     archives: list = field(default_factory=list)
     # Its cover.jpg is a generic cover shown by this many books (covers.py), else 0.
     generic_cover: int = 0
+    # The user looked at the book (a tick, a field turned on or off, Mark reviewed): it no
+    # longer needs review (see needs_review).
+    reviewed: bool = False
 
     @property
     def archives_to_unpack(self) -> list:
         return [u for u in self.archives if u.unpack and not u.problem]
+
+    @property
+    def cleanup(self) -> bool:
+        """Formats Calibre can't open to take out, or an archive to unpack (when ticked)."""
+        return bool(self.bad_formats_to_trash or self.archives_to_unpack)
+
+    @property
+    def checkable(self) -> bool:
+        """Whether the row can be ticked: something to write or trash, or a cleanup."""
+        return self.action is not ReviewAction.KEEP or self.cleanup
+
+    def review_for(self, fields_on: set[str] | list[str] = FIELDS) -> str:
+        """What the user should check: changes left out (not supported by the book) of the
+        fields on, an archive left packed in doubt. "" when nothing."""
+        left = [FIELD_LABELS[n].lower() for n in self.doubts
+                if n in self.excluded and n in self.changes and n in fields_on]
+        parts = [f"changes left out: {', '.join(left)}"] if left else []
+        return "; ".join(parts + [u.note for u in self.archives if u.doubt and not u.unpack])
+
+    def needs_review_for(self, fields_on: set[str] | list[str] = FIELDS) -> bool:
+        """Something to check (review_for) that the user hasn't looked at yet. Its supported
+        changes are written when ticked, but it is not tagged REVIEWED_TAG: the next
+        analysis shows it again, until the user decides (or marks it reviewed)."""
+        return bool(self.review_for(fields_on)) and not self.manual and not self.reviewed
+
+    @property
+    def review(self) -> str:
+        return self.review_for()
+
+    @property
+    def needs_review(self) -> bool:
+        return self.needs_review_for()
 
     @property
     def broken(self) -> bool:
@@ -149,12 +185,20 @@ class ReviewItem:
         elif ((not self.book.formats or (self.broken and set(self.unopenable) >= set(self.bad_formats)))
               and self.action is ReviewAction.KEEP and not self.manual):
             self.action, self.selected = ReviewAction.TRASH, True  # no file that opens at all: nothing to keep
+        self.tick_cleanup()
+
+    def tick_cleanup(self) -> None:
+        """A book with a cleanup to do (files that open nowhere, an archive to unpack) is
+        ticked for it, unless the user decided otherwise."""
+        if not self.manual and self.cleanup and self.action is not ReviewAction.TRASH:
+            self.selected = True
 
     def to_write(self, fields_on: set[str] | list[str]) -> dict:
         """The changes that will be written: not excluded, and the field is on."""
         return {k: v for k, v in self.changes.items() if k in fields_on and k not in self.excluded}
 
     def set_action(self, action: ReviewAction) -> None:
+        """Keep: the book is left as it is (tick it for its cleanup)."""
         self.action, self.manual = action, True
         self.selected = action is not ReviewAction.KEEP
 
@@ -304,11 +348,12 @@ def _swapped(name: str, book: Book, found: ReviewMetadata) -> bool:
 
 
 def doubtful_changes(book: Book, found: ReviewMetadata, changes: dict) -> dict[str, str]:
-    """The changes left out, with why: in doubt, the metadata stays as it is. Filling an
-    empty field loses nothing; a value replaced must be supported by the book itself: the
-    AI's value is printed in the pages it read, and Calibre's is not. Never by default: a
-    change that drops an author, or an issue or volume number, or a series or an author's
-    name as the publisher. A record with title and author swapped is put right."""
+    """The changes left out, with why: in doubt, the metadata stays as it is. A value
+    written, in an empty field or over Calibre's, must be supported by the book itself:
+    printed in the pages the AI read (the ISBN too; the language told by the text), and,
+    replacing a value, Calibre's is not. Never by default: a change that drops an author,
+    or an issue or volume number, or a series or an author's name as the publisher. A
+    record with title and author swapped is put right."""
     evidence = found.evidence.get("fields", {})
     doubts: dict[str, str] = {}
     for name, new in changes.items():
@@ -320,26 +365,29 @@ def doubtful_changes(book: Book, found: ReviewMetadata, changes: dict) -> dict[s
                                        for a in [*book.authors, *found.authors]):
             doubts[name] = "an author's name, not a publisher"
             continue
-        if not current or name == "isbn":
-            continue  # an empty field filled: nothing is lost
-        if name == "authors" and (len(new) < _people(current) or any(_SEVERAL_RE.search(a) for a in current)):
-            doubts[name] = "an author would be lost"
-            continue
-        if name == "title" and (m := _NUMBER_RE.search(current)):
-            number = int(m.group(1))
-            if number not in {int(n) for n in re.findall(r"\d+", new)} and found.series_index != number:
-                doubts[name] = "the issue or volume number would be lost"
-                continue
-        if _swapped(name, book, found):
+        if name == "isbn":  # find_changes keeps only one printed in the text, when there is one
+            if found.evidence.get("isbns") is None:
+                doubts[name] = "not checked against the book"
             continue
         if name == "language":
             if found.evidence.get("language") != new:
                 doubts[name] = "not told by the book's text"
             continue
+        if current:
+            if name == "authors" and (len(new) < _people(current) or any(_SEVERAL_RE.search(a) for a in current)):
+                doubts[name] = "an author would be lost"
+                continue
+            if name == "title" and (m := _NUMBER_RE.search(current)):
+                number = int(m.group(1))
+                if number not in {int(n) for n in re.findall(r"\d+", new)} and found.series_index != number:
+                    doubts[name] = "the issue or volume number would be lost"
+                    continue
+            if _swapped(name, book, found):
+                continue
         e = evidence.get(name)
         if not e or e.get("current") != format_value(name, current):
             doubts[name] = "not checked against the book"  # no text, or Calibre's value changed since
-        elif e.get("current_printed"):
+        elif current and e.get("current_printed"):
             doubts[name] = "Calibre's value is printed in the book"
         elif not e.get("read_printed"):
             doubts[name] = "the new value is not in the book's text"
@@ -362,7 +410,7 @@ def mark_series_publishers(items: list[ReviewItem], names: set[str]) -> None:
             it.doubts["publisher"] = "a series name, not a publisher"
             it.excluded.add("publisher")
             if it.action is ReviewAction.UPDATE and not it.manual and not it.to_write(FIELDS):
-                it.selected = False
+                it.selected = it.cleanup
 
 
 def format_value(name: str, value) -> str:
@@ -667,6 +715,7 @@ def _scan_book(reviewer: Reviewer, book: Book,
     if archives:
         item.archives = archives
         item.note = _join(item.note, "; ".join(u.note for u in archives))
+        item.tick_cleanup()
     if item.changes:
         log.info("%s: %s", book.label(), ", ".join(
             f"{k} {format_value(k, current_value(book, k))!r} -> {format_value(k, v)!r}"
@@ -751,22 +800,43 @@ def write_run_csv(result: ReviewResult, folder: Path | None = None) -> Path:
 
 
 # --- executing ---------------------------------------------------------------------------
+def decided(it: ReviewItem, fields_on: set[str] | list[str]) -> bool:
+    """Whether the book is done with, to be tagged REVIEWED_TAG on Execute (the next
+    analysis skips it): the user chose its action or marked it reviewed, or the AI read
+    it and it is ticked, or proposes nothing. Not: a book that needs review, an unticked
+    book that proposes something (left for later), a book the AI couldn't read."""
+    if it.needs_review_for(fields_on):
+        return False
+    if it.manual or it.reviewed:
+        return True
+    if it.found is None:
+        return False
+    proposes = ((it.action is ReviewAction.UPDATE and bool(it.to_write(fields_on)))
+                or it.action is ReviewAction.TRASH or it.cleanup)
+    return it.selected or not proposes
+
+
 def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> list[dict]:
-    """Bridge actions: "set" for the checked updates, "trash" (no target) for the
-    checked trash, and one "tag" with every other reviewed book: updated or not,
-    each book of the scan is tagged REVIEWED_TAG ("set" tags its book too, and
-    AI_UPDATED_TAG when a field is written); last, one "tag" BAD_COVER_TAG with the
-    books whose cover is not a real one (ReviewItem.bad_cover), unless they go to the trash. Not the
-    books the AI couldn't read (unless the user chose Keep): the next scan tries
-    them again. "trash_formats": the formats Calibre can't open go first (the whole
-    record is copied to the trash library as it is), on their own for a book with
-    nothing to write."""
+    """Bridge actions, for the ticked books only (an unticked book is left as it is):
+    "set" for the updates, "trash" (no target) for the trash; "trash_formats": the formats
+    Calibre can't open go first (the whole record is copied to the trash library as it
+    is), on their own for a book with nothing to write; likewise "unpack". Then one "tag"
+    REVIEWED_TAG with the other books done with (see decided; "set" tags its book itself,
+    and AI_UPDATED_TAG when a field is written); last, one "tag" BAD_COVER_TAG with the
+    books whose cover is not a real one (ReviewItem.bad_cover), unless they go to the
+    trash. Each action carries the book's last_modified as the analysis read it ("stamp"):
+    a book changed since in Calibre is not touched."""
     actions = []
     tag_ids = []
     for it in items:
-        base = {"src_id": it.book.id, "title": it.book.title}
+        base = {"src_id": it.book.id, "title": it.book.title, "stamp": it.book.last_modified}
+        done = decided(it, fields_on)
         if it.selected and it.action is ReviewAction.TRASH:
             actions.append({**base, "op": "trash", "no_target": True})
+            continue
+        if not it.selected:
+            if done and not is_reviewed(it.book):
+                tag_ids.append(it.book.id)
             continue
         bad = it.bad_formats_to_trash
         if bad:
@@ -774,11 +844,11 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
         unpack = [u.spec(remove=True) for u in it.archives_to_unpack]
         if unpack:
             base["unpack"] = unpack
-        changes = it.to_write(fields_on) if it.selected and it.action is ReviewAction.UPDATE else {}
+        changes = it.to_write(fields_on) if it.action is ReviewAction.UPDATE else {}
         if not changes:
             if bad or unpack:
                 actions.append({**base, "op": "trash_formats" if bad else "unpack"})
-            if (it.found is not None or it.manual) and not is_reviewed(it.book):
+            if done and not is_reviewed(it.book):
                 tag_ids.append(it.book.id)
             continue
         values: dict = {}
@@ -789,7 +859,8 @@ def review_actions(items: list[ReviewItem], fields_on: set[str] | list[str]) -> 
                     values["series_index"] = value[1]
             else:
                 values[name] = value
-        actions.append({**base, "op": "set", "set": values, "tag": REVIEWED_TAG, "updated_tag": AI_UPDATED_TAG})
+        actions.append({**base, "op": "set", "set": values, "updated_tag": AI_UPDATED_TAG,
+                        **({"tag": REVIEWED_TAG} if done else {})})
     if tag_ids:
         actions.append({"op": "tag", "src_ids": tag_ids, "tag": REVIEWED_TAG})
     bad_covers = [it.book.id for it in items
@@ -825,13 +896,23 @@ def apply_to_book(book: Book, values: dict, path: str | None, formats: dict | No
     return out
 
 
+def _journal_values(book: Book, values: dict) -> tuple[str, str]:
+    """(before, after) of the fields a "set" action writes, for the journal."""
+    names = [n for n in FIELDS if n in values or (n == "series" and "series_index" in values)]
+    after = {n: (values.get("series", book.series), values.get("series_index", book.series_index))
+             if n == "series" else values[n] for n in names}
+    return ("; ".join(f"{FIELD_LABELS[n]}: {format_value(n, current_value(book, n))}" for n in names),
+            "; ".join(f"{FIELD_LABELS[n]}: {format_value(n, v)}" for n, v in after.items()))
+
+
 def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibre_dir: Path,
                    permanent: bool = False,
                    on_result: Callable[[ReviewItem, bool, str], None] | None = None,
-                   cancel: threading.Event | None = None) -> tuple[int, int, int]:
+                   cancel: threading.Event | None = None, journal: Path | None = None) -> tuple[int, int, int]:
     """Write the checked updates, move the checked books to the trash library, and
-    tag the reviewed books REVIEWED_TAG (see review_actions). Returns (succeeded,
-    failed, tagged with nothing written)."""
+    tag the reviewed books REVIEWED_TAG (see review_actions). Each book acted on (not
+    only tagged) gets a row in the journal (journal.Journal, in `journal`, default the
+    data folder). Returns (succeeded, failed, tagged with nothing written)."""
     if calibre_is_running():
         raise ExecutionError("Calibre is running. Close Calibre (and calibre-server) before executing.")
     actions = review_actions(result.items, fields_on)
@@ -843,14 +924,22 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
     items = {i.book.id: i for i in result.items}
     sent = {a["src_id"]: a for a in actions if "src_id" in a}
     ok = failed = tagged = 0
+    book_log = Journal("review", journal)
+
+    def restamp(item: ReviewItem, value: str | None) -> None:
+        """The book's last_modified after this run changed it: a next Execute of the same list checks against it."""
+        if value:
+            item.book.last_modified = value
 
     def on_message(msg: dict) -> None:
         nonlocal ok, failed, tagged
+        stamps = msg.get("stamps") or {}
         if msg["event"] == "tagged" and msg.get("tag") == BAD_COVER_TAG:  # a mark only: the rows keep their status
             if msg["ok"]:
                 for sid in msg["src_ids"]:
                     items[sid].book.tags = set(items[sid].book.tags) | {BAD_COVER_TAG}
                     items[sid].generic_cover = 0
+                    restamp(items[sid], stamps.get(str(sid)))
                 log.info("%d book(s) with a generic cover %s", len(msg["src_ids"]), msg["msg"])
             else:
                 failed += len(msg["src_ids"])
@@ -868,6 +957,7 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
                 item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
                 if msg["ok"]:
                     item.book.tags = set(item.book.tags) | {REVIEWED_TAG}
+                    restamp(item, stamps.get(str(sid)))
                 if on_result:
                     on_result(item, msg["ok"], msg["msg"])
             return
@@ -875,9 +965,19 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
             return
         item = items[msg["src_id"]]
         item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
+        action = sent[item.book.id]
+        before, after = _journal_values(item.book, action["set"]) if action["op"] == "set" else ("", "")
+        book_log.write(library=result.library, book_id=item.book.id, title=item.book.title,
+                       authors=" & ".join(item.book.authors),
+                       action={"set": "Update metadata", "trash": "Move to the trash library",
+                               "trash_formats": "Unreadable formats to the trash library",
+                               "unpack": "Archive unpacked"}.get(action["op"], action["op"]),
+                       ok="yes" if msg["ok"] else "no", result=msg["msg"],
+                       why="; ".join([item.note] + [f"{f}: {w}" for f, w in item.bad_formats.items()
+                                                    if f in (action.get("trash_formats") or [])]),
+                       before=before, after=after)
         if msg["ok"]:
             ok += 1
-            action = sent[item.book.id]
             if action.get("trash_formats"):  # the book no longer has them
                 gone = set(action["trash_formats"])
                 item.book = replace(item.book, formats={f: p for f, p in item.book.formats.items() if f not in gone})
@@ -890,6 +990,7 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
                 book = apply_to_book(item.book, action["set"], msg.get("path"), msg.get("formats"))
                 book.tags = set(book.tags) | ({action["tag"]} if action.get("tag") else set())
                 item.book_changed(book)
+            restamp(item, msg.get("stamp"))
             log.info("Book %s (%s): %s", item.book.id, item.book.title, msg["msg"])
         else:
             failed += 1
@@ -897,6 +998,8 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
         if on_result:
             on_result(item, msg["ok"], msg["msg"])
 
-    run_bridge(calibre_dir, {"source": result.library, "trash": result.trash_library,
-                             "permanent": permanent, "actions": actions}, on_message, cancel, program="review")
+    with book_log:
+        log.info("Journal of this execution: %s", book_log.path)
+        run_bridge(calibre_dir, {"source": result.library, "trash": result.trash_library,
+                                 "permanent": permanent, "actions": actions}, on_message, cancel, program="review")
     return ok, failed, tagged

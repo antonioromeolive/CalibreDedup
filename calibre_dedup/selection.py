@@ -89,7 +89,7 @@ def override(item: PlanItem, action: Action, same_library: bool = False, merge: 
     no_copy = ", no copy in the target" if action is Action.TRASH and item.match is None else ""
     item.reason = (f"manual: {action_label(item).lower()}{merged}{no_copy} "
                    f"(analysis: {item.planned_action.value} — {item.planned_reason})")
-    item.selected = action is not Action.LEAVE
+    item.selected = action is not Action.LEAVE  # kept: untouched (tick it for its cleanup)
 
 
 def revert(item: PlanItem) -> None:
@@ -97,16 +97,39 @@ def revert(item: PlanItem) -> None:
     item.reason = item.planned_reason
     item.add_formats = list(item.planned_add_formats)
     item.manual = False
+    item.reviewed = False
     item.selected = item.planned_selected
     for u in item.archives:
         u.unpack = u.planned
 
 
-def is_changed(item: PlanItem) -> bool:
+def _decided(item: PlanItem) -> bool:
     """Whether the user changed the analysis' choices for the book: its action, its
     tick, its unreadable formats or its archives."""
     return (item.manual or item.selected != item.planned_selected or item.trash_bad != item.planned_trash_bad
             or any(u.unpack != u.planned for u in item.archives))
+
+
+def is_changed(item: PlanItem) -> bool:
+    """The user changed the analysis' choices for the book, or marked it reviewed."""
+    return _decided(item) or item.reviewed
+
+
+def needs_review(item: PlanItem) -> bool:
+    """The analysis isn't sure about the book (PlanItem.review: an unproven duplicate,
+    files that open nowhere, a doubtful archive), and the user hasn't decided yet: ticked,
+    unticked or changed anything, or marked it reviewed. Such books start unticked
+    (unticked, nothing happens to them), except for a doubtful archive, which is only
+    left packed."""
+    return bool(item.review) and not is_changed(item)
+
+
+def mark_reviewed(items: list[PlanItem]) -> int:
+    """The user looked at these books and keeps the analysis' choices. Returns how many."""
+    todo = [i for i in items if needs_review(i)]
+    for i in todo:
+        i.reviewed = True
+    return len(todo)
 
 
 def revert_all(plan: Plan) -> int:
@@ -143,33 +166,27 @@ def blocked_reason(it: PlanItem, by_id: dict[int, PlanItem]) -> str:
 
 
 def actionable(plan: Plan) -> list[PlanItem]:
-    """Items that execution will process, in plan order.
-
-    A book left in source may still be updated with AI metadata when it was
-    enriched but not moved/trash-ed. Those updates must be allowed without
-    treating normal leave decisions as executable actions. A book whose
-    unreadable formats go to the trash library, or whose archive is unpacked, is
-    processed for that alone, ticked or not.
-    """
+    """Items that execution will process, in plan order: the ticked ones (an unticked
+    book is left as it is). A blocked book, or one left in place, is processed only for
+    its unreadable formats and its archives (has_cleanup)."""
     stuck = blocked(plan)
-    return [i for i in plan.items if runs_main_action(i, stuck) or i.bad_formats_to_trash or i.archives_to_unpack]
+    return [i for i in plan.items if i.selected and (runs_main_action(i, stuck) or has_cleanup(i))]
 
 
 def runs_main_action(i: PlanItem, stuck: dict[int, str]) -> bool:
-    """Whether the item's own action (move, trash, metadata update) runs on Execute."""
-    return i.selected and i.source.id not in stuck and (i.action is not Action.LEAVE or has_metadata_update(i))
+    """Whether the item's own action (move, trash) runs on Execute."""
+    return i.selected and i.source.id not in stuck and i.action is not Action.LEAVE
 
 
 def checkable(i: PlanItem) -> bool:
     """Whether the item can be ticked: it moves or trashes the book, or (left in place)
-    has metadata to write."""
-    return i.action is not Action.LEAVE or has_metadata_update(i)
+    takes out its unreadable formats or unpacks its archive."""
+    return i.action is not Action.LEAVE or has_cleanup(i)
 
 
-def has_metadata_update(i: PlanItem) -> bool:
-    """Whether a book left in place still has metadata to write: what the AI found,
-    or title and author put right after being swapped."""
-    return (i.ai_used and bool(i.identity.ai_fields)) or i.swapped
+def has_cleanup(i: PlanItem) -> bool:
+    """Formats Calibre can't open to take out, or an archive to unpack (see PlanItem)."""
+    return bool(i.bad_formats_to_trash or i.archives_to_unpack)
 
 
 # --- remembering choices --------------------------------------------------------
@@ -207,10 +224,12 @@ class SelectionStore:
                     override(item, Action(e["action"]), plan.same_library, e.get("merge", True))
                 except ValueError:
                     continue
-            if "selected" in e and item.action is not Action.LEAVE:
-                item.selected = bool(e["selected"])
             if "trash_bad" in e and item.bad_formats and not item.unreadable:
                 item.trash_bad = bool(e["trash_bad"])
+            if "selected" in e and checkable(item):
+                item.selected = bool(e["selected"])
+            if e.get("reviewed"):
+                item.reviewed = True
             restored += 1
         return restored
 
@@ -233,13 +252,15 @@ class SelectionStore:
                 e["action"] = item.action.value
                 if item.action is Action.TRASH and not item.add_formats:
                     e["merge"] = False
-            # Only a tick that differs from the analysis' own: unreadable books start
-            # unticked unless the setting is on, and follow the setting until changed.
+            # Only a tick that differs from the analysis' own: books to review start
+            # unticked, and follow the analysis until changed.
             default = item.planned_selected if item.action is item.planned_action else item.action is not Action.LEAVE
-            if item.action is not Action.LEAVE and item.selected != default:
+            if checkable(item) and item.selected != default:
                 e["selected"] = item.selected
             if item.bad_formats and not item.unreadable and item.trash_bad != item.planned_trash_bad:
                 e["trash_bad"] = item.trash_bad
+            if item.reviewed:
+                e["reviewed"] = True
             if e and item.source.uuid:
                 entries[item.source.uuid] = e
         data = self._read()

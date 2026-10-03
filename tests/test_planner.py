@@ -190,7 +190,7 @@ def test_edition_on_one_side_and_year_on_other_is_unknown(libs):
     assert build_plan(src, tgt, trash).items[0].action is Action.LEAVE
 
 
-def test_ai_fills_title_and_edition(libs):
+def test_a_book_without_title_or_authors_stays_and_the_ai_only_tells_copies_apart(libs):
     src, tgt, trash = libs(
         source=[{"title": "Unknown", "authors": ["Unknown"]}, {"title": "Children of Dune"}],
         target=[{"title": "Dune", "publisher": "Ace", "year": 1990},
@@ -201,8 +201,12 @@ def test_ai_fills_title_and_edition(libs):
         "Children of Dune": AIMetadata(publisher="Gollancz", year=2003),
     })
     plan = build_plan(src, tgt, trash, resolver)
-    assert actions(plan) == [("Unknown", Action.TRASH), ("Children of Dune", Action.MOVE)]
-    assert plan.items[0].ai_used and "title" in plan.items[0].identity.ai_fields
+    assert actions(plan) == [("Unknown", Action.LEAVE), ("Children of Dune", Action.MOVE)]
+    unknown = plan.items[0]
+    assert "title or authors missing; fix it with the Metadata Review first" in unknown.reason
+    assert not unknown.ai_used and "Unknown" not in resolver.calls  # the AI never identifies a book
+    assert plan.items[1].ai_used and "Children of Dune" in resolver.calls  # it reads the edition, to compare
+    assert "1 not moved: record to fix with the Metadata Review first" in planner.run_summary(plan)[0]
 
 
 def test_non_library_folder_rejected(libs, tmp_path):
@@ -683,8 +687,9 @@ def test_a_move_judged_a_different_edition_can_be_forced_to_trash(libs):
     assert new.action is Action.MOVE and new.match is None  # nothing in the target: nothing to trash into
     assert can_override(different, Action.TRASH) and can_override(new, Action.TRASH)  # Trash: always possible
     override(different, Action.TRASH)
-    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == different.source.id)
+    action = next(a for a in plan_actions(plan) if a["src_id"] == different.source.id)
     assert action["op"] == "trash" and action["target_id"] == different.match.id
+    assert action["target_stamp"] == different.match.last_modified and action["stamp"] == different.source.last_modified
 
 
 # --- checks that could not run -------------------------------------------------------
@@ -1016,7 +1021,7 @@ def test_cleanup_only_trashes_the_duplicates_and_copies_nothing(libs):
     assert "another copy (#3) stays in the source" in copy.reason
     children = plan.items[3]
     assert "its copy lacks MOBI" in children.reason and children.match is not None and not children.selected
-    assert [(a["op"], a["src_id"], a["add_formats"], a.get("keep_src_id")) for a in plan_actions(plan, True)] == [
+    assert [(a["op"], a["src_id"], a["add_formats"], a.get("keep_src_id")) for a in plan_actions(plan)] == [
         ("trash", 1, [], None), ("trash", 2, [], 3)]
     kept.selected, kept.action = True, Action.TRASH  # trashing the kept copy too blocks its copy
     assert "the copy kept in the source" in blocked(plan)[2]
@@ -1093,30 +1098,24 @@ def test_a_single_word_author_needs_a_well_known_person(libs, others, swapped):
     assert build_plan(src, tgt, trash, fix_swapped=True).items[0].swapped is swapped
 
 
-def test_swap_is_written_on_execute(libs):
+def test_a_swapped_book_is_never_moved(libs):
     from calibre_dedup.executor import plan_actions
     from calibre_dedup.selection import checkable
     src, tgt, trash = libs(
-        source=[{"title": "Kingston", "authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]},  # not in target: moved, put right
+        source=[{"title": "Kingston", "authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]},  # not in target
                 {"title": "The Boy who sailed with Blake", "authors": ["William Henry Giles Kingston"]}],
         target=[{"title": "The Log House by the Lake", "authors": ["William Henry Giles Kingston"]}],
     )
     plan = build_plan(src, tgt, trash, fix_swapped=True, author_variants=True)
-    moved = plan.items[0]
-    assert moved.action is Action.MOVE and moved.swapped
-    [a] = [a for a in plan_actions(plan, True) if a["src_id"] == moved.source.id]
-    assert a["swap"] == {"title": "Ben Hadden; or, Do Right Whatever Comes Of It", "authors": ["Kingston"], "tag": "TitleAuthorSwapped",
-                         "was_title": "Kingston", "was_authors": ["Ben Hadden; or, Do Right Whatever Comes Of It"]}
-    assert all("swap" not in a for a in plan_actions(plan, False))  # "Write found metadata" off
+    held = plan.items[0]
+    assert held.action is Action.LEAVE and held.swapped and not checkable(held)
+    assert held.reason.startswith("not moved: title and author were swapped (was 'Kingston' by 'Ben Hadden")
+    assert "fix it with the Metadata Review first" in held.reason
+    assert all(a["src_id"] != held.source.id for a in plan_actions(plan))  # nothing is written to any record
 
-    # One library: a book left in place is put right only when ticked
-    plan = build_plan(src, src, trash, fix_swapped=True)
+    plan = build_plan(src, src, trash, fix_swapped=True)  # one library: left as it is
     left = plan.items[0]
-    assert left.action is Action.LEAVE and left.swapped and checkable(left) and not left.selected
-    assert plan_actions(plan, True) == []
-    left.selected = True
-    [a] = plan_actions(plan, True)
-    assert a["op"] == "update" and a["swap"]["title"] == "Ben Hadden; or, Do Right Whatever Comes Of It" and "updated_tag" not in a
+    assert left.action is Action.LEAVE and left.swapped and not checkable(left) and plan_actions(plan) == []
 
 
 def test_generic_covers_can_be_skipped(libs, monkeypatch, tmp_path):

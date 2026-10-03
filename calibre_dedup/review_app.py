@@ -69,7 +69,7 @@ def _run_cli(argv: list[str]) -> int:
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
     ap.add_argument("--all-changes", action="store_true",
                     help="with --execute, also write the changes left out because the book doesn't support "
-                         "them (default: only those it supports, and the empty fields filled)")
+                         "them (default: only those it supports)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer of the review first (review_cache.json)")
     ap.add_argument("--no-cache", action="store_true",
@@ -127,11 +127,13 @@ def _run_cli(argv: list[str]) -> int:
                 print(f"        {name:9} {format_value(name, current_value(item.book, name)) or '—'}"
                       f"  ->  {format_value(name, value)}{left_out}")
     print(summary(result))
-    if args.execute:
+    if args.execute:  # as the window ticks them; --all-changes: the changes left out too, as if reviewed
         for item in result.items:
-            if args.all_changes:
+            if args.all_changes and item.doubts:
                 item.excluded -= set(item.doubts)
-            item.selected = item.action is ReviewAction.UPDATE
+                item.reviewed = True
+                if item.action is ReviewAction.UPDATE and not item.manual:
+                    item.selected = bool(item.to_write(FIELDS)) or item.cleanup
         ok, failed, tagged = execute_review(result, fields, require_calibre_dir(settings),
                                     on_result=lambda it, good, msg: print(f"#{it.book.id}: {msg}"))
         print(f"Done: {ok} succeeded, {failed} failed, {tagged} more books tagged AIReviewed")

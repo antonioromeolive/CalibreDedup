@@ -25,17 +25,20 @@ target library, send it to the trash library, or leave it where it is. When
 source and target are the same library, duplicate records are merged into the
 record with richer metadata and the weaker record is sent to trash.
 
-AI is only consulted when metadata is not enough:
-* the source book has no usable title/authors, or a title made from a file name, or
-* a same-title/same-author book exists in the target but edition or publisher
-  can't be compared from metadata (both books are then enriched).
-It reads the first pages, then the last pages if fields are still missing.
+A book is identified by its own record: one without title or authors, with a title
+made from a file name, or with title and author swapped, is never moved (the Metadata
+Review fixes the record first); it is still trashed when proven a duplicate. AI is only
+consulted to tell two copies apart, when a same-title/same-author book exists but
+edition or publisher can't be compared from metadata (both books are then read): the
+first pages, then the last pages if fields are still missing.
 If that still can't decide, the covers do (see _by_covers): with no edition data
 to compare, two books are the same unless their covers differ; the same cover is
 proof, unless it is a generic cover (the same image on books of different titles,
 see covers.py). Without the AI, identical files prove the same book whatever the
 metadata, and identical EPUB text proves it before any AI call (copies that differ
 only in metadata or cover). A copy whose text is in another language is another book.
+A duplicate that isn't proven (no edition data, decided by the covers, authors matched
+only by the AI or the surname) starts unticked, for the user to check (PlanItem.review).
 """
 
 from __future__ import annotations
@@ -58,7 +61,8 @@ from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
 from .covers import GENERIC_COVER_BOOKS, generic_covers, generic_note
-from .extract import CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, epub_text_digest, unreadable_formats
+from .extract import (CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, epub_text_digest, openable_elsewhere,
+                      unreadable_formats)
 from .language import language_name
 from .library_cache import FileChecks, FileHashes, TextFacts
 from .library import read_books, tag_filter_text, tag_selects
@@ -69,7 +73,7 @@ from .normalize import (
     looks_like_file_name, looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number,
     related_titles, series_key, similar_authors_keys, surname_match, title_key, title_variants,
 )
-from .selection import action_label
+from .selection import action_label, has_cleanup
 
 log = logging.getLogger(__name__)
 
@@ -146,10 +150,6 @@ def merge_ai(ident: Identity, meta: AIMetadata) -> Identity:
         out.isbns |= isbns
         out.ai_fields.add("isbn")
     return out
-
-
-def _needs_title_authors(i: Identity) -> bool:
-    return not i.has_title_authors
 
 
 def _needs_edition_publisher(i: Identity) -> bool:
@@ -421,7 +421,6 @@ class _Candidate:
     planned: bool  # a source book that the plan moves into the target
     ai_done: bool = False
     year_rechecked: bool = False  # the AI read it to re-check a year difference
-    title_read: bool = False  # its title is a file name: the AI was asked for the real one
     formats: set[str] = field(default_factory=set)  # formats the target copy will have
     _variants: list[str] | None = None
 
@@ -630,7 +629,6 @@ class _Context:
     """What deciding a book needs besides the book: the indexes of the books it may be
     a copy of, the AI, the options, and what was found in the books' files."""
     index: dict[tuple, list[_Candidate]]
-    main_index: dict[tuple, list[_Candidate]]  # subtitles ignored
     resolver: AIResolver | None
     stats: Counter[str]
     ignore_subtitle: bool = False
@@ -647,9 +645,8 @@ class _Context:
     files: _FileIndex | None = None
     texts: TextFacts | None = None  # language and length of the books' text; None: not read
     # Books that stay as they are (the target's) whose title is a file name, by author key:
-    # the AI reads their real title when a book by that author finds no copy.
-    named: dict[tuple, list[_Candidate]] | None = None
-    add_titles: Callable[[_Candidate], None] = lambda c: None  # index a book under its (new) title
+    # one may be any book by that author, which is then not moved (see _plan_one).
+    named: dict[tuple, list[_Candidate]] = field(default_factory=dict)
 
 
 @dataclass
@@ -861,10 +858,9 @@ def build_plan(
         resolver.generic = generic
 
     index: dict[tuple, list[_Candidate]] = defaultdict(list)
-    main_index: dict[tuple, list[_Candidate]] = defaultdict(list)  # subtitle ignored
     files = _FileIndex(hashes)
-    # Books that stay as they are, with a file name for title: the AI reads the real one when needed.
-    named: dict[tuple, list[_Candidate]] | None = defaultdict(list) if resolver is not None else None
+    # Books that stay as they are, with a file name for title (see _Context.named).
+    named: dict[tuple, list[_Candidate]] = defaultdict(list)
     # For similar titles: books by author key, and the collections' words.
     similar = _SimilarIndex(defaultdict(list), _collection_words(source_books + target_books)) \
         if similar_titles else None
@@ -880,8 +876,6 @@ def build_plan(
     def add_titles(c: _Candidate) -> None:
         for k in _keys(c.identity, ignore_subtitle, similar_matching):
             index[k].append(c)
-        for k in _keys(c.identity, True, similar_matching):
-            main_index[k].append(c)
 
     def add_to_index(c: _Candidate) -> None:
         add_titles(c)
@@ -897,12 +891,14 @@ def build_plan(
     def add_staying(c: _Candidate) -> None:
         """A book that is never analyzed itself (the target's, or left out by the tag filter)."""
         add_to_index(c)
-        if named is not None and c.identity.title and looks_like_file_name(c.identity.title):
+        if c.identity.title and looks_like_file_name(c.identity.title):
             for k in _author_keys(c.identity, similar_matching):
                 named[k].append(c)
 
     if not same_library:
         for tb in target_books:
+            if not tb.formats:
+                continue  # an empty record (no file) is no copy of a book
             tb = put_right(tb) or tb
             add_staying(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
 
@@ -928,8 +924,8 @@ def build_plan(
     if same_library and tag:
         for ob in source_books:
             bad = {f: "" for f in ob.formats if f not in CALIBRE_INPUT_FORMATS}  # not opened: never analyzed
-            if tag_selects(ob, tag, tag_exclude) or (bad and set(bad) >= set(ob.formats)):
-                continue  # an unreadable book is no copy to keep
+            if tag_selects(ob, tag, tag_exclude) or not ob.formats or (bad and set(bad) >= set(ob.formats)):
+                continue  # an unreadable or empty book is no copy to keep
             book = replace(ob, formats={f: p for f, p in ob.formats.items() if f not in bad}) if bad else ob
             book = put_right(book) or book
             c = _Candidate(book, metadata_identity(book, same_series), planned=False)
@@ -944,10 +940,10 @@ def build_plan(
 
     stats: Counter[str] = Counter()
     down = {"text AI": 0, "image AI": 0}  # the book at which that AI was turned off
-    ctx = _Context(index, main_index, resolver, stats, ignore_subtitle=ignore_subtitle, same_library=same_library,
+    ctx = _Context(index, resolver, stats, ignore_subtitle=ignore_subtitle, same_library=same_library,
                    similar_matching=similar_matching, cover_check=cover_check, recheck_years=recheck_years,
                    same_series=same_series, always_cover=always_cover, similar=similar, by_title=by_title,
-                   persons=swaps, generic=generic, files=files, texts=texts, named=named, add_titles=add_titles)
+                   persons=swaps, generic=generic, files=files, texts=texts, named=named)
 
     perf.run_start("dedup", total, getattr(resolver, "provider", None), getattr(resolver, "vision", None))
     for n, sb in enumerate(analysis_books, 1):
@@ -960,12 +956,18 @@ def build_plan(
         seen = sb  # with the files of an archive the user unpacks, instead of the archive
         archives: list = []
         kept = False  # cleanup: a book not in the target, kept in the source (its copies are trashed)
+        no_file = False  # no file of the book Calibre can open
         try:
             if unpack is not None:
                 seen, archives = unpack_archives(sb, resolver.extractor, unpack)
             bad = file_checks.bad(sb) if seen is sb else unreadable_formats(seen.formats)
             unreadable[id(sb)] = bad
-            if bad and set(bad) >= set(seen.formats):
+            if not sb.formats:  # an empty record: nothing to read, nothing to keep
+                no_file = True
+                item = _empty_item(sb, same_series)
+                stats["empty"] += 1
+            elif bad and set(bad) >= set(seen.formats):
+                no_file = True
                 item = _unreadable_item(sb, bad, trash_unreadable, same_series)
             else:
                 # Decided on the formats Calibre can open: a fake PDF is never merged into a match.
@@ -975,23 +977,27 @@ def build_plan(
                 item = _plan_one(book, ctx)
                 item.source = sb  # the record itself (the executor acts on it)
                 if fixed is not None:
-                    item.swapped = True
                     stats["swapped"] += 1
-                    item.reason = item.planned_reason = _join(
-                        item.reason, [f"{SWAPPED_NOTE} (was {sb.title!r} by {' & '.join(sb.authors)!r})"])
+                    swap_note = f"{SWAPPED_NOTE} (was {sb.title!r} by {' & '.join(sb.authors)!r})"
+                    if item.action is Action.MOVE:  # trashed if proven a copy, never moved with a wrong record
+                        item = _hold(item, swap_note, stats)
+                    else:
+                        item.reason = item.planned_reason = _join(item.reason, [swap_note])
+                    item.swapped = True
                 if hasattr(extractor, "failed_formats"):  # files that failed to open while deciding
                     bad.update(extractor.failed_formats(book.formats))
                 if bad and set(bad) >= set(seen.formats):
+                    no_file = True
                     item = _unreadable_item(sb, bad, trash_unreadable, same_series)
                 elif bad:
                     item.bad_formats = bad
-                    item.trash_bad = item.planned_trash_bad = trash_unreadable
                     item.reason = item.planned_reason = _join(item.reason, [_bad_note(bad)])
             if archives:
                 item.archives = archives
                 item.reason = item.planned_reason = _join(item.reason, [u.note for u in archives])
             if cleanup:
                 kept = _cleanup_only(item)
+            _review_files(item, trash_unreadable)
         except OSError as e:
             # A missing or locked file is this book's problem; anything else (the
             # drive went away, I/O errors) would fail every book: stop, keep the rest.
@@ -1026,7 +1032,7 @@ def build_plan(
                 if reason and not down[what]:
                     down[what] = n
         if same_library:
-            if item.action is not Action.TRASH:
+            if item.action is not Action.TRASH and not no_file:  # a book left with no file to open is no copy to keep
                 c = _Candidate(book, item.identity, planned=False, ai_done=item.ai_used)
                 add_to_index(c)
                 records[id(book)] = (c, sb)
@@ -1090,8 +1096,13 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
         parts.append(f"{s['identical_files']} duplicates by identical files")
     if s.get("no_edition"):
         parts.append(f"{s['no_edition']} duplicates without edition data (covers not different)")
-    if s.get("file_name_titles"):
-        parts.append(f"{s['file_name_titles']} file-name titles read by AI")
+    if s.get("held"):
+        parts.append(f"{s['held']} not moved: record to fix with the Metadata Review first")
+    if s.get("empty"):
+        parts.append(f"{s['empty']} empty records (no file)")
+    reviews = sum(1 for it in plan.items if it.review)
+    if reviews:
+        parts.append(f"{reviews} to review before ticking")
     if s.get("other_language"):
         parts.append(f"{s['other_language']} copies in another language")
     counts = Counter(k for it in plan.items for k in it.skipped)
@@ -1101,7 +1112,55 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
 
 
 UNREADABLE_REASON = "no file Calibre can open"
+EMPTY_REASON = "no file: an empty record, nothing to keep"
 CLEANUP = "cleanup only"
+FIX_FIRST = "fix it with the Metadata Review first"
+# What to check before ticking (PlanItem.review)
+REVIEW_NO_EDITION = "no edition data: nothing tells the copies apart, compare them"
+REVIEW_COVER = "a duplicate because of the covers: compare them"
+REVIEW_PERSON = "authors matched {how}: check they are the same person"
+REVIEW_UNREADABLE = "no file Calibre can open: check before it goes to the trash library"
+REVIEW_UNOPENABLE = "{formats} open nowhere: taken out of the book on Execute"
+
+
+def _to_review(item: PlanItem, why: str, untick: bool = True) -> None:
+    """The analysis isn't sure: the user decides (see selection.needs_review). Unticked,
+    nothing happens to the book."""
+    item.review = f"{item.review}; {why}" if item.review else why
+    if untick:
+        item.selected = item.planned_selected = False
+
+
+def _hold(item: PlanItem, why: str, stats: Counter) -> PlanItem:
+    """A book the analysis would move, whose record isn't good enough for the target: it
+    stays in the source until the Metadata Review fixes it."""
+    stats["held"] += 1
+    return _logged(replace(item, action=Action.LEAVE, review="", reason=f"not moved: {why}; {FIX_FIRST} "
+                                                                          f"({item.reason})"))
+
+
+def _review_files(item: PlanItem, trash_unreadable: bool) -> None:
+    """Ticks for what Execute does to the book's files. Left in place, a book is ticked for
+    its cleanup (an archive the user said to unpack, files that open nowhere). Files that
+    open nowhere are taken out (never moved to the target) when the book is ticked; with
+    "move files Calibre can't open without asking" off, it starts unticked, to review. A
+    doubtful archive (archives.Unpack.doubt) is left packed, the book to review."""
+    if item.unreadable:
+        return
+    if item.action is Action.LEAVE and has_cleanup(item):
+        item.selected = item.planned_selected = True
+    if item.unopenable and item.action is not Action.TRASH and not trash_unreadable:
+        _to_review(item, REVIEW_UNOPENABLE.format(formats=", ".join(item.unopenable)))
+    for u in item.archives:
+        if u.doubt:
+            _to_review(item, u.note, untick=False)
+
+
+def _empty_item(sb: Book, same_series: bool) -> PlanItem:
+    """A record with no file at all: nothing to keep, to the trash library (ticked)."""
+    item = PlanItem(sb, Action.TRASH, EMPTY_REASON, metadata_identity(sb, same_series))
+    log.info("%s: %s", sb.label(), item.reason)
+    return item
 
 
 def _keep_chosen(item: PlanItem, cand: _Candidate, why: str) -> PlanItem:
@@ -1113,7 +1172,7 @@ def _keep_chosen(item: PlanItem, cand: _Candidate, why: str) -> PlanItem:
     base, bracket, notes = item.reason.partition(" [")
     reason = (f"{base.split('; adding ')[0]}; this copy is the one to keep (better format or "
               f"metadata), {why}: neither is handled{bracket}{notes}")
-    return _logged(replace(item, action=Action.LEAVE, add_formats=[], reason=reason))
+    return _logged(replace(item, action=Action.LEAVE, add_formats=[], reason=reason, review=""))
 
 
 def _cleanup_only(item: PlanItem) -> bool:
@@ -1141,6 +1200,7 @@ def _cleanup_only(item: PlanItem) -> bool:
     item.add_formats, item.planned_add_formats = [], []
     item.reason = item.planned_reason = f"{CLEANUP}: {why}, left in source ({item.reason})"
     item.selected = item.planned_selected = False
+    item.review = ""
     return kept
 
 
@@ -1149,11 +1209,18 @@ def _bad_note(bad: dict[str, str]) -> str:
 
 
 def _unreadable_item(sb: Book, bad: dict[str, str], selected: bool, same_series: bool) -> PlanItem:
-    """Every format of the book is one Calibre can't open: nothing to keep, to the
-    trash library (ticked only with the setting on; the user decides otherwise)."""
-    item = PlanItem(sb, Action.TRASH, f"{UNREADABLE_REASON} ({'; '.join(bad.values())})",
-                    metadata_identity(sb, same_series), bad_formats=bad)
-    item.selected = item.planned_selected = selected
+    """Every format of the book is one Calibre can't open. None opens anywhere (empty, or
+    not what its format says): nothing to keep, to the trash library (ticked only with the
+    setting on; the user decides otherwise). One another program may open (a DOC, a file
+    only Calibre's converter fails on): it stays in the source."""
+    reason = f"{UNREADABLE_REASON} ({'; '.join(bad.values())})"
+    if any(openable_elsewhere(why) for why in bad.values()):
+        item = PlanItem(sb, Action.LEAVE, f"{reason}: kept, another program may open it",
+                        metadata_identity(sb, same_series), bad_formats=bad)
+    else:
+        item = PlanItem(sb, Action.TRASH, reason, metadata_identity(sb, same_series), bad_formats=bad)
+        if not selected:
+            _to_review(item, REVIEW_UNREADABLE)
     log.info("%s: %s", sb.label(), item.reason)
     return item
 
@@ -1180,13 +1247,24 @@ def _metadata_richness(book: Book) -> int:
 
 
 def _plan_one(sb: Book, ctx: _Context) -> PlanItem:
+    """A book whose title is a file name is matched as it is (an identical file, the same
+    file name), but never moved. Nor is one that may be a target book by the same author
+    whose title is a file name: the Metadata Review fixes such titles first."""
     skipped: list[str] = []
     item = _decide_one(sb, ctx, skipped)
-    if not is_unknown(sb.title) and looks_like_file_name(sb.title):
-        if item.action is Action.MOVE and item.identity.title == sb.title:  # the AI didn't read the real one
-            why = "AI is off" if ctx.resolver is None else "the AI could not read the real one"
-            item = _logged(replace(item, action=Action.LEAVE, reason=(
-                f"the title looks like a file name, and {why}: not moved without a real title; {item.reason}")))
+    file_name = not is_unknown(sb.title) and looks_like_file_name(sb.title)
+    if item.action is Action.MOVE and file_name:
+        item = _hold(item, "the title looks like a file name", ctx.stats)
+    elif item.action is Action.MOVE:
+        named = next((c for k in _author_keys(item.identity, ctx.similar_matching) for c in ctx.named.get(k, [])
+                      if c.book is not sb), None)
+        if named is not None:
+            item = _hold(item, f"the target's {named.book.label()!r}, by the same author, has a file name for "
+                               "title: it may be this book", ctx.stats)
+            item.match, item.different = named.book, True
+            item.reason = item.planned_reason = item.reason.replace(FIX_FIRST, "fix that title with the Metadata "
+                                                                              "Review first")
+    if file_name:
         item.file_name_title = sb.title
     item.skipped = list(dict.fromkeys(skipped))
     return item
@@ -1236,54 +1314,24 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
             decision = decide(ident, [c.identity for c in candidates])
             return _duplicate_item(sb, ident, candidates[decision.match_index], decision.reason, notes, ai_used)
 
-    # 2. A title made from a file name ("ITABOOK 0052 - Hemingway") finds no copy, and is
-    # no title for the target: the AI reads the real one, and the book is matched with it.
-    # If it can't, the book is matched as it is, but never moved (see _plan_one).
-    if resolver and ident.title and looks_like_file_name(ident.title):
-        file_name = ident.title
-        ident.title = None
-        ident, n = enrich(sb, ident, _needs_title_authors)
-        notes += n
-        ai_used = True
-        if ident.title and not looks_like_file_name(ident.title):
-            notes.append(f"the title {file_name!r} looks like a file name: the AI read {ident.title!r}")
-            ctx.stats["file_name_titles"] += 1
-        else:
-            ident.title = file_name
-            ident.ai_fields.discard("title")
-
-    # 3. Title and authors
+    # 2. Title and authors: the record's own (a title made from a file name is matched as
+    # it is: see _plan_one). Without them the book can't be identified: it stays.
     if not ident.has_title_authors:
-        if not resolver:
-            return PlanItem(sb, Action.LEAVE, "title/authors missing and AI is off", ident)
-        ident, n = enrich(sb, ident, _needs_title_authors)
-        notes += n
-        ai_used = True
-        if not ident.has_title_authors:
-            return PlanItem(sb, Action.LEAVE, _join("title/authors could not be determined", notes), ident, ai_used=True)
+        ctx.stats["held"] += 1
+        return PlanItem(sb, Action.LEAVE, f"not moved: title or authors missing; {FIX_FIRST}", ident)
 
     keys = _keys(ident, ctx.ignore_subtitle, ctx.similar_matching)
     if not keys:
         return PlanItem(sb, Action.LEAVE, "title/authors unusable after normalization", ident, ai_used=ai_used)
     candidates = _lookup(ctx.index, keys)
+    weak: dict[int, str] = {}  # id(candidate) -> how its authors matched, when that's no proof
     if not candidates and ctx.by_title is not None:
-        candidates, n, called = _author_variant_candidates(sb, ident, ctx.by_title, resolver, ctx.ignore_subtitle,
-                                                           ctx.persons)
-        notes += n
-        ai_used = ai_used or called
-    if not candidates and ctx.named:
-        candidates, n, called = _file_name_candidates(sb, ident, ctx, enrich)
+        candidates, n, called, weak = _author_variant_candidates(sb, ident, ctx.by_title, resolver,
+                                                                 ctx.ignore_subtitle, ctx.persons)
         notes += n
         ai_used = ai_used or called
 
     if not candidates:
-        if ident.ai_fields & {"title", "authors"} and not ctx.ignore_subtitle:
-            near = _lookup(ctx.main_index, _keys(ident, True, ctx.similar_matching))
-            if near:
-                return _logged(PlanItem(
-                    sb, Action.LEAVE,
-                    _join(f"AI-found title matches {near[0].book.label()!r} only when ignoring the subtitle; check manually", notes),
-                    ident, match=near[0].book, match_planned=near[0].planned, ai_used=ai_used))
         if ctx.similar is not None:
             alike = [(c, how) for c in _lookup(ctx.similar.by_author, _author_keys(ident, ctx.similar_matching))
                      if c.book is not sb and (how := _similar_title(sb, ident, c, ctx.similar.collections))]
@@ -1356,7 +1404,7 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
         other = "" if outcome.content else _other_language(ctx, sb, c.book)
         if not other:
             return _duplicate_item(sb, ident, c, outcome.decision.reason, notes, ai_used, outcome.by_cover,
-                                   outcome.override, outcome.no_edition)
+                                   outcome.override, outcome.no_edition, weak.get(id(c), ""))
         notes.append(f"{c.book.label()!r} is {other}: another book")
         ctx.stats["other_language"] += 1
         other_language.append(c)
@@ -1442,50 +1490,34 @@ def _by_covers(ctx: _Context, sb: Book, ident: Identity, cands: list[_Candidate]
     return _Outcome(decision, called=called)
 
 
-def _file_name_candidates(sb: Book, ident: Identity, ctx: _Context, enrich) -> tuple[list[_Candidate], list[str], bool]:
-    """Books that stay as they are (the target's), by the same author, whose title is a file
-    name ("ITABOOK 0052 - Hemingway"): the AI reads their real title, once each, they are
-    indexed with it, and those with this book's title are its candidates. Returns
-    (candidates, notes, model called)."""
-    called = False
-    for key in _author_keys(ident, ctx.similar_matching):
-        for c in ctx.named.get(key, []):
-            if c.title_read or c.book is sb:
-                continue
-            c.title_read = True
-            read = c.identity.copy()
-            read.title = None
-            read, _ = enrich(c.book, read, _needs_title_authors)
-            called = True
-            if read.title and not looks_like_file_name(read.title):
-                c.identity, c._variants = read, None
-                ctx.add_titles(c)
-    found = [c for c in _lookup(ctx.index, _keys(ident, ctx.ignore_subtitle, ctx.similar_matching))
-             if c.book is not sb]
-    notes = [f"the title {c.book.title!r} looks like a file name: the AI read {c.identity.title!r}"
-             for c in found if c.title_read]
-    return found, notes, called
-
-
 def _duplicate_item(sb: Book, ident: Identity, cand: _Candidate, why: str, notes: list[str], ai_used: bool,
-                    by_cover: bool = False, override: bool = False, no_edition: bool = False) -> PlanItem:
+                    by_cover: bool = False, override: bool = False, no_edition: bool = False,
+                    person: str = "") -> PlanItem:
     """`sb` is a duplicate of `cand`: to trash, adding the formats the kept copy lacks.
     `override`: a cover overruling the metadata; the same book, but its files may be
     another edition's, so nothing is added to the other copy (Trash only).
-    `no_edition`: see PlanItem.no_edition."""
+    `no_edition`: see PlanItem.no_edition. `person`: how the authors matched, when that is
+    no proof (the surname only, the AI). An unproven duplicate (no edition data, the
+    covers, such authors) starts unticked: nothing happens to it, nor is anything added to
+    the target copy, until the user checks and ticks it."""
     missing = [] if override else [f for f in sb.formats if f not in cand.formats and f != "PDF"]
     cand.formats.update(missing)  # later duplicates must not add the same format again
     reason = f"duplicate of {cand.book.label()!r} ({why})"
     if missing:
         reason += f"; adding {', '.join(missing)} to target copy"
-    return _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=cand.book,
+    item = _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=cand.book,
                             match_planned=cand.planned, add_formats=missing, ai_used=ai_used,
                             by_cover=by_cover, no_edition=no_edition))
+    for flag, why_review in ((no_edition, REVIEW_NO_EDITION), (by_cover, REVIEW_COVER),
+                             (person, REVIEW_PERSON.format(how=person))):
+        if flag:
+            _to_review(item, why_review)
+    return item
 
 
 def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolver: AIResolver | None,
                                ignore_subtitle: bool, persons: SwapDetector | None = None,
-                               ) -> tuple[list[_Candidate], list[str], bool]:
+                               ) -> tuple[list[_Candidate], list[str], bool, dict[int, str]]:
     """Books with the same title whose authors are the same person written
     differently: one letter apart in a name ("Frederickk Marryat" / "Frederick Marryat"),
     first names as initials ("E. Marshall" / "Marshall, Emma"), the surname alone
@@ -1493,8 +1525,9 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
     told the shared title (typos, transliterations, pen names). They are then compared
     like any book with the same title and authors. The AI is not asked when the title is
     itself a person's name (`persons`): title and author are then swapped, and the
-    "authors" it would compare are book titles. Returns (candidates, notes, model called)."""
-    found, notes, called = [], [], False
+    "authors" it would compare are book titles. Returns (candidates, notes, model called,
+    {id(candidate): how} for those matched only by the surname or the AI: no proof)."""
+    found, notes, called, weak = [], [], False, {}
     mine = " & ".join(ident.authors)
     ask_ai = resolver is not None and (persons is None or persons.person(ident.title) is None)
     for c in by_title.get(title_key(ident.title, ignore_subtitle), []):
@@ -1507,9 +1540,11 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
             same, how = True, "initials"
         elif any(surname_match(a, b) for a in ident.authors for b in c.identity.authors):
             same, how = True, "surname only"
+            weak[id(c)] = "by the surname only"
         elif ask_ai:
             same, how, asked = resolver.same_person(sb, mine, theirs, ident.title)
             called = called or asked
+            weak[id(c)] = "by the AI"
             if not same and how == resolver.disabled_reason:
                 notes.append(how)
         else:
@@ -1519,7 +1554,7 @@ def _author_variant_candidates(sb: Book, ident: Identity, by_title: dict, resolv
         if same:
             found.append(c)
             notes.append(f"same person: {mine!r} / {theirs!r} ({how})")
-    return found, notes, called
+    return found, notes, called, weak
 
 
 def _inside(ctx: _Context, a: Book, b: Book, notes: list[str], skipped: list[str]) -> tuple[str, bool]:
@@ -1591,9 +1626,12 @@ def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, s
             reason = f"duplicate of {c.book.label()!r} (similar title: {how}; {proof})"
             if missing:
                 reason += f"; adding {', '.join(missing)} to target copy"
-            return _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=c.book,
+            item = _logged(PlanItem(sb, Action.TRASH, _join(reason, notes), ident, match=c.book,
                                     match_planned=c.planned, add_formats=missing, ai_used=ai_used,
                                     by_cover=by_cover))
+            if by_cover:
+                _to_review(item, REVIEW_COVER)
+            return item
         unproven.append((c, how))
     if unproven:
         c, how = unproven[0]

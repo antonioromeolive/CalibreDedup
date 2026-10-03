@@ -24,11 +24,22 @@ Both programs work the same way, in three steps:
 2. **Review** the list: filter it, tick or untick books, change any proposal.
 3. **Execute** (button *2. Execute checked*): only the ticked books, with Calibre closed.
 
-**Your books are never lost.** A "deleted" book is copied, whole (files, cover, metadata,
-custom columns), into a **trash library**, a normal Calibre library you choose, and only then
-removed from its library, into Calibre's own recycle bin by default. Every write goes
-through Calibre's own library code, and a copy is verified before the original is removed.
-Nothing is converted or repaired: the files stay as they are.
+**Your books are never lost.** A "deleted" book is copied, whole (files, cover, metadata),
+into a **trash library**, a normal Calibre library you choose, and only then removed from its
+library, into Calibre's own recycle bin by default. Every write goes through Calibre's own
+library code, and a copy is verified before the original is removed. Nothing is converted or
+repaired: the files stay as they are (Calibre's import plugins are not run). Custom columns
+are copied only into a library that has the same column: none is created.
+
+**Unticked means untouched.** Execute acts only on the ticked books. When the analysis isn't
+sure, the book starts unticked and is marked *To review* (filter Status → *Needs review*):
+check it, then tick it, change it, or right-click → *Mark reviewed*.
+
+**The way back.** Before each Execute, the `metadata.db` of every library it writes is copied
+to the data folder (the last 3 per library), and each Execute writes a journal of what it did
+to each book and why (see [Data files and logs](#data-files-and-logs)). A book changed in
+Calibre after the analysis (any change: Calibre's *last modified* date) is not touched:
+analyze again.
 
 **Contents**
 
@@ -117,7 +128,18 @@ book:
 | **Move to target** | The target has no book with the same title and authors, or only different editions of it (or copies in another language). |
 | **Merge & Trash** | A duplicate that has formats the target copy lacks: they are added to the target copy (except PDF), then the book goes to the trash library. |
 | **Trash only** | A duplicate with nothing to add: the book goes to the trash library. |
-| **Leave in source** | The program can't be sure: title or authors unknown, a title made from a file name that the AI can't read, edition data that can't be compared, or no edition data but different covers. The reason says why, and the likely match is shown. |
+| **Leave in source** | The program can't be sure: edition data that can't be compared, or no edition data but different covers; or the record isn't good enough for the target: title or authors missing, a title made from a file name, title and author swapped (*not moved: … fix it with the Metadata Review first*). The reason says why, and the likely match is shown. |
+
+A record with **no file at all** goes to the trash library (*Trash only*, ticked): there is
+nothing to keep. In the target, such a record is no copy of a book.
+
+**Merge and Dedup identifies a book by its own record, never by the AI.** Fix the records first
+with the [Metadata Review](#metadata-review), of both libraries if needed: a book without title
+or authors, with a file name for title, or with title and author swapped stays in the source,
+and so does a book whose target copy may hide behind a file-name title (see
+[Which books are compared](#which-books-are-compared)). Such a book is still trashed when it is
+proven a duplicate (the same file). The AI only tells two copies apart (edition, year, covers,
+an author written differently), and nothing it reads is written to any book.
 
 How a duplicate is recognised is explained in [How duplicates are found](#how-duplicates-are-found).
 
@@ -131,8 +153,28 @@ How a duplicate is recognised is explained in [How duplicates are found](#how-du
 
 ### Step 2: Review the list
 
-Only **ticked** books are acted on. *Move* and *Trash* rows start ticked; *Leave* rows can't
-be ticked unless you change their action.
+Only **ticked** books are acted on: an unticked book is left exactly as it is (its unreadable
+formats and its archive too). *Move* and *Trash* rows start ticked, except those **to review**;
+*Leave* rows can be ticked only for their cleanup (unreadable formats to take out, an archive
+to unpack), unless you change their action.
+
+**To review** (`?` in the first column, *To review: …* in orange in the reason): the analysis
+found an action but isn't sure, so the row starts unticked and nothing happens to the book
+until you decide:
+
+- a duplicate that isn't proven: *no edition data* (nothing tells the copies apart), a duplicate
+  **because of the covers**, or authors matched only **by the surname or by the AI** (a pen
+  name, a transliteration). Its *Merge & Trash* adds formats to the target copy only once you
+  tick it;
+- files that **open nowhere** (with *Move files Calibre can't open … without asking* off): a
+  book without any file Calibre can open, or a book whose fake or empty files are taken out
+  before it moves;
+- an archive with files of **different names** inside, left packed (see
+  [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z)); the row stays ticked.
+
+Open both books, then tick the row (or untick it again), change its action, or right-click →
+**Mark reviewed** to keep what the list shows. A row you decided leaves *Needs review*, and your
+decision is remembered at the next analysis.
 
 - **Filter** with the search box (all words must match, across title, authors, reason and
   match) and three drop-down lists. **Within a list, a book is shown if it matches any ticked
@@ -146,11 +188,12 @@ be ticked unless you change their action.
   - **Books:** *AI used*, *Adds formats*, *Reduced checks* (decided with fewer checks than the
     settings ask for, see [When a setting can't take effect](#when-a-setting-cant-take-effect)),
     *Decided by cover* (see *Always compare covers*), *No edition data* (duplicates only
-    because nothing tells the copies apart, see [the covers](#how-two-books-are-compared):
-    check them before executing), *File-name title*, *Unreadable files* (see
-    [Files Calibre can't open](#files-calibre-cant-open)), *Archives*, *Title/author swapped*,
-    and *Other books* (none of these). A book can be of several kinds.
-  - **Status:** *Checked*, *Not checked*, *Done*, *Failed* (on Execute).
+    because nothing tells the copies apart, see [the covers](#how-two-books-are-compared)),
+    *File-name title*, *Unreadable files* (see [Files Calibre can't open](#files-calibre-cant-open);
+    also the records with no file), *Archives*, *Title/author swapped*, and *Other books* (none
+    of these). A book can be of several kinds.
+  - **Status:** *Checked*, *Needs review* (to review, see above), *Not checked*, *Done*,
+    *Failed* (on Execute).
 - **Tick in bulk:** *Check visible*, *Uncheck visible* and *Invert visible* act on the rows
   the filters show. **Space** toggles the selected rows.
 - **Right-click** a row (or several) to change the action:
@@ -160,11 +203,12 @@ be ticked unless you change their action.
     in the trash library; the Execute confirmation counts such books;
   - *Keep in source* (*Keep in library* within one library);
   - *Move the unreadable formats to the trash library* / *Keep the unreadable formats*;
+  - *Mark reviewed*, for the books to review;
   - *Revert to analysis decision*.
 
   A book judged a *different edition* keeps that book as its match, shown as "(different
   edition)" in *Match in target*: forcing it to the trash uses it. Changed rows are shown in
-  italics.
+  italics. *Keep in source* leaves the book untouched (tick it for its cleanup).
 - **Right-click → Open this book / Open the match / Open both** opens the files with the
   apps Windows associates with them (EPUB preferred), to compare before deciding. Works
   during an analysis or execution too.
@@ -183,15 +227,17 @@ an AI that stopped responding, settings changed since the analysis.
 ### Step 3: Execute
 
 **2. Execute checked** requires Calibre to be closed. The writes go through Calibre's own library code
-(`calibre-debug`), the same as Calibre's *Copy to library*: covers, custom columns and all
-other metadata are kept. A source book is removed only after its copy has been verified, by
-default into the source library's Calibre recycle bin (Settings → Analysis → *Delete
-permanently from source* to skip it).
+(`calibre-debug`), the same as Calibre's *Copy to library*: covers and metadata are kept (custom
+columns only where the other library has the same column). A source book is removed only after
+its copy has been verified, by default into the source library's Calibre recycle bin (Settings
+→ Analysis → *Delete permanently from source* to skip it). A format added to a book (*Merge &
+Trash*, an unpacked archive) is added exactly as it is, and checked once added.
 
-With *Write AI-found title/authors/publisher/ISBN to moved books* (on by default), the
-values the AI read are written to the moved copy (and to books left in place that the AI
-read), **only into empty fields**. Each book changed this way gets the tag **`AIUpdated`**,
-so `tags:AIUpdated` in Calibre lists everything the AI changed, in both programs.
+Merge and Dedup writes **no metadata**: a moved book arrives as its record is. Before it starts,
+the source's and the target's `metadata.db` are copied, and each book acted on gets a line in
+the journal (see [Data files and logs](#data-files-and-logs)). A book changed in Calibre since
+the analysis, or a target copy changed since, fails with *changed since the analysis* and stays
+in the source: analyze again.
 
 Books moved or trashed successfully leave the list (the log keeps a line for each); failed,
 unticked and *Leave* rows stay. At the end, book and author folders that Windows left behind
@@ -209,11 +255,12 @@ read to tell, and a file shared by books of 3 or more titles *and* authors is a 
 
 **A title made from a file name** ("ITABOOK 0052 - Hemingway", "il_vecchio_e_il_mare",
 "Moby Dick.epub", "scan0012": a number padded with zeros, words joined by underscores, a
-file extension, a code of letters and digits) finds no copy, and is no title for the target:
-the AI reads the real title in the book, and the book is matched with that. If the AI can't
-(or is off), the book is matched as it is but **never moved**: it stays in the source. A
-target book with such a title is read by the AI when a source book by the same author finds
-no copy. The record keeps its title: the Metadata Review corrects it.
+file extension, a code of letters and digits) is no title for the target: the book is matched
+as it is (the same file, the same file name), but **never moved**: it stays in the source until
+the Metadata Review reads its real title. And a **target** book by the same author with such a
+title may be any of that author's books: a source book by that author that would be moved
+stays in the source too ("the target's 'ITABOOK 0052 - Hemingway' … may be this book: fix that
+title with the Metadata Review first"), and the target book is shown as its match.
 
 Otherwise only books with the **same title and authors** are compared, after normalization:
 
@@ -272,8 +319,9 @@ In this order; the first rule that decides wins:
    | Only Calibre's years differ, not confirmed in the books | duplicate (Trash only) | moved | stays |
 
    With no edition data, nothing tells the two copies apart: they are the same book unless
-   their covers differ. The *No edition data* filter lists these duplicates, to check before
-   executing. Without an Image AI (or with *Compare covers* off) the covers say nothing and
+   their covers differ. Neither this nor a cover is proof: these duplicates (filters *No edition
+   data*, *Decided by cover*) start unticked, **to review**, and nothing is trashed or added to
+   the other copy until you tick them. Without an Image AI (or with *Compare covers* off) the covers say nothing and
    these books stay in the source; **identical cover files** need no AI.
    Covers are only compared between books whose title and authors already match
    (or similar titles by the same author), and a **generic cover** is never a real cover: the same
@@ -316,8 +364,8 @@ proof, and Calibre's `cover.jpg` may be a picture downloaded by *Download metada
 the covers **stored inside the files** must match too (EPUB directly; MOBI, AZW3 and FB2 with
 Calibre's `ebook-meta`). Such a duplicate is **Trash only**: its formats are not added to the
 other copy, whose files may be another edition. The reason says what the metadata differed
-on; the *Decided by cover* filter lists these books to check before executing. It costs more
-AI calls (cached).
+on; these books start unticked, to review (filter *Decided by cover*). It costs more AI calls
+(cached).
 
 **Same title, author written differently** (on by default). A book with no match is checked
 against books with **the same title** whose author may be the same person written
@@ -325,7 +373,9 @@ differently: one letter apart in a name part of 5 letters or more ("Frederickk M
 "Frederick Marryat", no AI), initials, or else the Text AI is asked (a transliteration such as
 "Dostoevskij" / "Fyodor Dostoyevsky", or a pen name; a small model may not know pen names).
 The books are then compared as usual, and the reason says why, e.g. "same person: 'Frederickk
-Marryat' / 'Frederick Marryat' (one letter apart)".
+Marryat' / 'Frederick Marryat' (one letter apart)". Authors matched only by the surname
+("Kingston" / "William Henry Giles Kingston") or by the AI are no proof: such a duplicate starts
+unticked, to review.
 
 **Match similar titles by the same author** (on by default). With no book of the same
 title, books by the same author are compared when both titles are the same title with only
@@ -389,15 +439,23 @@ A format Calibre doesn't read (DOC, JPG…), a file that isn't what its format s
 that is really a LIT book or a picture), or a file that fails to open, is **unreadable**.
 Unreadable files are never read, converted or repaired, and never count in a comparison.
 
+Only files that **open nowhere** (empty, or not what their format says) are proposed for the
+trash. A file another program may open is **kept**: a format Calibre doesn't read (a DOC
+opens in Word), or a file only Calibre's converter fails on (an RTF Word opens).
+
 - A book with **only** unreadable files is proposed for the trash library ("no file Calibre
-  can open").
-- A book with **some**: it is decided on its other files. When its unreadable formats go to
-  the trash, the whole record is first copied to the trash library as it is, then those
-  formats are removed from the book. Right-click to keep them instead.
+  can open"), unless one of them may open elsewhere: then it stays in the source.
+- A book with **some**: it is decided on its other files. When the book is ticked, the files
+  that open nowhere go to the trash: the whole record is first copied to the trash library as
+  it is, then those formats are removed from the book, so that a moved book never brings them
+  into the target. Left in place, the book is ticked for that alone. Right-click → *Move the
+  unreadable formats to the trash library* takes out the ones another program may open too;
+  *Keep the unreadable formats* keeps them all.
+- A record with **no file** at all goes to the trash library, ticked.
 
 With *Move files Calibre can't open to the trash library without asking* (off by default)
-these rows start ticked; otherwise they are listed (filter *Unreadable files*) for you to
-decide.
+these rows start ticked; otherwise they start unticked, **to review** (filter *Unreadable
+files*, Status *Needs review*), for you to decide.
 
 ### Books stored as an archive (RAR, ZIP, 7Z)
 
@@ -421,8 +479,14 @@ summary…). Both programs handle them the same way.
   exactly as they are. Not added: formats Calibre can't read (DOC), pictures, notes (a TXT
   under 20 KB, such as "trama.txt"), other leftovers (Thumbs.db, .nfo, .url).
 - **Unclear archives are left as they are**, with the reason: two files of the same format
-  (maybe different books), nothing Calibre can read inside, an archive inside the archive, a
+  (maybe different books), nothing Calibre can read inside (an HTML book: its pages and
+  pictures belong together, the archive is its right form), an archive inside the archive, a
   password or a damaged file.
+- Files of **different formats** are taken as one book only when their names agree
+  ("Foundation.epub", "Asimov - Foundation.pdf"). Otherwise ("Foundation.epub", "I,
+  Robot.pdf") the archive is left packed, whatever the answer, and the book is **to review**;
+  right-click → *Unpack the archive on Execute* adds them anyway.
+- The archive of an unticked book is never unpacked.
 - The filter **Archives** lists these books; right-click → *Unpack the archive on Execute* /
   *Keep the archive* changes your answer. On the command line, `--unpack` unpacks every clear
   archive without asking (default: archives are left as they are).
@@ -442,8 +506,7 @@ RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
 | Same title, author written differently | on | "Frederickk Marryat" / "Frederick Marryat"; AI for other spellings. |
 | Match similar titles by the same author | on | Needs proof: ISBN, same text or same cover. |
 | Same series + same number = same book | off | For reliably numbered collections only. |
-| Move files Calibre can't open to the trash library without asking | off | Ticks those rows. |
-| Write AI-found title/authors/publisher/ISBN to moved books | on | Only empty fields; changed books are tagged `AIUpdated`. |
+| Move files Calibre can't open to the trash library without asking | off | Ticks those rows (off: to review). |
 | Delete permanently from source | off | Else Calibre's recycle bin. |
 | Calibre program folder | found automatically | Where `calibre-debug` and the converters are. |
 
@@ -477,7 +540,8 @@ It reads **every** book of one library with the AI (the first pages and, with an
 the cover) and compares what it read with Calibre's metadata. Where they differ, it proposes
 an update of **title, authors, publisher, year, series (with its number), ISBN and
 language**, as printed in the book itself. **In doubt, the metadata stays as it is**: a
-value is replaced only when the book supports the change (see *Which changes are ticked*).
+value is written (in an empty field too) only when the book supports it (see *Which
+changes are ticked*).
 
 Choose the **library to review** and the **trash library**, then **1. Analyze (dry run)**.
 
@@ -505,12 +569,14 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     anyway: sent to the trash, archive unpacked), *Changes left out* (see below), *Not read*
     (no file, no text, errors), *Unreadable files*, *Archives*, *Bad cover*, *Other books*
     (none of these).
-  - **Status:** *Checked*, *Not checked*, *Done*, *Failed*.
-- **Which changes are ticked.** An empty field filled loses nothing: ticked. A value
-  replaced must be **supported by the book**: the value the AI read is printed in the pages
-  it read, and Calibre's is not (the evidence is taken when the AI reads the book, and kept
-  with its answer). The others are **left out**: shown struck through, with the reason on
-  mouse-over, and never written unless you turn them on (right-click → *Change … again*):
+  - **Status:** *Checked*, *Needs review* (below), *Not checked*, *Done*, *Failed*.
+- **Which changes are ticked.** Every value written must be **supported by the book**: the
+  value the AI read is printed in the pages it read, whether it fills an empty field or
+  replaces Calibre's; replacing, Calibre's must also not be printed there (the evidence is
+  taken when the AI reads the book, and kept with its answer). A wrong value in an empty
+  field is no better than none: it would be taken for real metadata, also by Merge and Dedup.
+  The others are **left out**: shown struck through, with the reason on mouse-over, and never
+  written unless you turn them on (right-click → *Change … again*):
   - *Calibre's value is printed in the book* ("Polluce Quinto" is in the book: not replaced by
     the title of the magazine issue that holds it);
   - *the new value is not in the book's text* (e.g. read from the cover only);
@@ -519,24 +585,32 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     the series number;
   - *a series name, not a publisher* ("Galassia", "Urania": any series of the library or read
     by the AI), *an author's name, not a publisher*;
-  - *not checked against the book*: no text to check (a scanned book), or Calibre's value
-    changed since the AI read it.
+  - *not checked against the book*: no text to check (a scanned book: nothing is ticked), or
+    Calibre's value changed since the AI read it.
 
   A record with **title and author swapped** (the title in the author field, or the author's
   name as title) is put right. The **ISBN** is proposed only for a book that has none, and only
   one printed in its pages (several: the print and the e-book's, or other books listed). The
   **language** is the one of the book's own text, told by its common words without AI (Calibre's
-  field is often the library's default): a different language is ticked only when the text tells
-  it; for a scanned book the AI's answer fills an empty field only. The *Changes left out* filter
-  lists the books with changes left out; the Execute confirmation counts them.
+  field is often the library's default): it is ticked only when the text tells it, not on the
+  AI's word alone. The *Changes left out* filter lists the books with changes left out; the
+  Execute confirmation counts them.
+- **To review** (*To review* in orange in the Action column, Status → *Needs review*): a book
+  with a change left out (of a field that is on), or with an archive left packed because its
+  files have different names. Its supported changes are written when ticked, but it is **not
+  tagged `AIReviewed`** until you decide: the next analysis shows it again. Decide by ticking or
+  unticking it, turning a change on or off, choosing its action, or right-click → **Mark
+  reviewed** (the changes left out stay unwritten).
 - **Choosing:** books with differences are proposed for **Update**, ticked when they have
-  something to write.
+  something to write. **An unticked book is left as it is**: nothing written, no unreadable
+  format taken out, no archive unpacked, and no `AIReviewed` tag if it proposes something
+  (the next analysis shows it again).
   - The **Change:** boxes turn a field on or off for all books (e.g. never change the
     publisher).
   - Right-click turns one field off for the selected books ("Don't change publisher", shown
-    struck through), or sets the action: *Update metadata*, *Keep as it is*, *Move to the
-    trash library*; and, for unreadable formats, *Move the unreadable formats to the trash
-    library* / *Keep the unreadable formats*.
+    struck through), or sets the action: *Update metadata*, *Keep as it is* (untouched: tick it
+    for its cleanup), *Move to the trash library*; and, for unreadable formats, *Move the
+    unreadable formats to the trash library* / *Keep the unreadable formats*.
   - Right-click → **Ask the AI** reads the selected books again, never from the cache: with the
     Text AI / Image AI selected above, or with any configured AI picked in its submenu (just for
     this question: the choice above stays as it is). An AI that reads images reads the text and
@@ -552,9 +626,9 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   that another program may open is **kept**: a format Calibre doesn't read (a DOC opens in
   Word), or a file only Calibre's converter fails on (an RTF Word opens); such a book is kept,
   *Not read*. A book with some unreadable files is read from the others, and only those that
-  open nowhere are proposed for the trash library (the record is copied there first);
-  right-click → *Move the unreadable formats to the trash library* takes out the others too.
-  See [Files Calibre can't open](#files-calibre-cant-open).
+  open nowhere are proposed for the trash library (the record is copied there first), the book
+  ticked for it; right-click → *Move the unreadable formats to the trash library* takes out the
+  others too. See [Files Calibre can't open](#files-calibre-cant-open).
 - **Books stored as an archive** (RAR, ZIP, 7Z): you are asked whether to unpack them, as in
   Merge and Dedup (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
   an unpacked book stays visible with *With differences*, since Execute changes it.
@@ -570,20 +644,25 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
 With Calibre closed, **2. Execute checked** writes the ticked updates inside Calibre (a new year keeps the
 date's month and day), and the ticked trash books are copied to the trash library and removed
 from the reviewed library (recycle bin, or permanently with *Delete permanently from the
-reviewed library when trashing*). Updated and trashed books leave the list.
+reviewed library when trashing*). Updated and trashed books leave the list. As in Merge and
+Dedup, the library's `metadata.db` is copied first, each book acted on gets a line in the
+journal with its values before and after, and a book changed in Calibre since the analysis is
+not touched. The list can be executed again (e.g. after changing more rows): the books updated
+by the first Execute are checked against their new state.
 
 ### Continue another day, on any computer
 
-On Execute, **every book the AI read** gets the tag **`AIReviewed`**: updated, unchecked,
-kept, or with nothing to change. The next analysis skips books with that tag (*Skip books
-tagged AIReviewed*, on by default). So you can stop an analysis anywhere, execute what you
-have, and continue later, even from another computer: the mark is in the library itself,
-not in the cache. Books the AI could not read are not tagged (unless you chose *Keep as it
-is*): the next analysis tries them again. To review a book again, remove the tag in
-Calibre.
+On Execute, **every book done with** gets the tag **`AIReviewed`**: updated, with nothing to
+change, kept (*Keep as it is*) or marked reviewed. The next analysis skips books with that tag
+(*Skip books tagged AIReviewed*, on by default). So you can stop an analysis anywhere, execute
+what you have, and continue later, even from another computer: the mark is in the library
+itself, not in the cache. Not tagged, so that the next analysis shows them again (from the
+cache: quick): the books to review, the unticked books that propose something, and the books
+the AI could not read (unless you chose *Keep as it is*). To review a book again, remove the
+tag in Calibre.
 
-The books whose metadata was actually written also get the tag **`AIUpdated`** (as with the
-Merge and Dedup): search `tags:AIUpdated` in Calibre to check what the AI changed.
+The books whose metadata was actually written also get the tag **`AIUpdated`**: search
+`tags:AIUpdated` in Calibre to check what the AI changed (Merge and Dedup writes no metadata).
 
 ### Settings
 
@@ -611,8 +690,9 @@ python -m calibre_dedup.review_app --cli ... --except-tag Checked               
 The **tag filter** (under the libraries) works as in Merge and Dedup: *Only books tagged* or
 *All books except tagged*; *Skip books tagged AIReviewed* still applies on top.
 
-The dry run marks each change left out, with the reason; `--execute` writes the others, as
-the window ticks them, and `--all-changes` the left-out ones too.
+The dry run marks each change left out, with the reason; `--execute` does what the window
+ticks at the start (the supported changes, the trash of records with no file that opens), and
+`--all-changes` writes the left-out ones too (those books are then taken as reviewed).
 
 Also `--trash`, `--text-profile`, `--image-profile` (`""` for none), `--unpack` (unpack every
 clear RAR/ZIP/7Z archive without asking), `--clear-cache` and `--no-cache` (ask the AI again
@@ -760,7 +840,9 @@ there automatically.
 | `ai_profiles.json` | both | the AI providers (no keys: those are in Windows Credential Manager) |
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
 | `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes, those left out and why, the cover type |
-| `selections.json` | Merge and Dedup | remembered ticks and changes, per source/target pair |
+| `selections.json` | Merge and Dedup | remembered ticks and changes (and *Mark reviewed*), per source/target pair |
+| `snapshots\<library>_<id>\metadata_<date>.db` | both | a copy of each library's `metadata.db` taken before each Execute that writes it (not the trash library), the last 3 per library; `library.txt` says which library. To undo an Execute's metadata changes: close Calibre and copy it back over the library's `metadata.db` (the files moved or trashed since are in the target, the trash library or Calibre's recycle bin) |
+| `journal\dedup_<date>.csv`, `journal\review_<date>.csv` | each | one per Execute: each book acted on, what was done, why (the analysis' reason), the copy it duplicated, and for the review the values before and after; e.g. why a book is in the trash library |
 | `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
@@ -826,11 +908,8 @@ authors and no other book of the same title sends nothing.
   there is one; without one the book is skipped and marked *Reduced checks*.
 - **What is read:** the **start** of the book (title page, copyright page); the **end**
   (colophon) only if what was needed is still missing.
-- **Sent when**, for each book:
-  - it has **no title or no authors** in Calibre;
-  - its **title looks like a file name** ("ITABOOK 0052 - Hemingway"): for the real title. A
-    target book with such a title is read too (once), when a source book by the same author
-    finds no copy;
+- **Sent when**, for each book (never to identify a book: one without title or authors, or with
+  a file name for title, waits for the Metadata Review):
   - another book has the **same title and authors**, the metadata can't decide and the EPUB
     text isn't identical: this book is read if its edition or publisher is missing, and so is
     each other copy missing them;
@@ -916,7 +995,8 @@ User message: `Cover 1 and cover 2 are attached.`, with the two covers.
 - **Sent when** **Same title, author written differently** is on (the default), no book has
   the same title **and** authors, and another book has the same title with authors that are
   not one letter apart and not initials of each other (those two cases are decided without
-  AI). A "same" answer makes that book a candidate, compared as usual (prompts 1 and 2).
+  AI). A "same" answer makes that book a candidate, compared as usual (prompts 1 and 2); a
+  duplicate found this way starts unticked, to review.
 - **Always on:** no. With the option off it is never sent.
 
 `AUTHOR_PROMPT`:

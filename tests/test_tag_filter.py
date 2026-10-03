@@ -65,8 +65,9 @@ def test_one_library_tagged_copy_is_trashed_into_a_better_untagged_one(one_libra
     assert actions(plan) == [("Dune", Action.TRASH)]
     item = plan.items[0]
     assert item.source.id == 2 and item.match.id == 1 and item.add_formats == ["MOBI"]
-    assert plan_actions(plan, False) == [{"op": "trash", "src_id": 2, "title": "Dune",
-                                          "add_formats": ["MOBI"], "target_id": 1}]
+    stamp = "2026-01-01 00:00:00+00:00"  # both copies' last_modified, checked on Execute
+    assert plan_actions(plan) == [{"op": "trash", "src_id": 2, "title": "Dune", "add_formats": ["MOBI"],
+                                   "target_id": 1, "target_stamp": stamp, "stamp": stamp}]
 
 
 def test_one_library_better_tagged_copy_is_left_and_the_untagged_one_untouched(one_library):
@@ -79,7 +80,7 @@ def test_one_library_better_tagged_copy_is_left_and_the_untagged_one_untouched(o
     item = plan.items[0]
     assert item.match.id == 1 and not item.add_formats and not item.selected
     assert "one to keep" in item.reason and "adding" not in item.reason
-    assert plan_actions(plan, False) == []  # nothing happens to either copy
+    assert plan_actions(plan) == []  # nothing happens to either copy
     override(item, Action.TRASH, same_library=True)  # the user can still trash it into the other
     assert item.action is Action.TRASH and item.add_formats == ["EPUB"]
 

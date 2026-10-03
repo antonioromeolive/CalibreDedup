@@ -31,12 +31,15 @@ book doesn't have are added (exactly as they are), the whole record is copied to
 trash library as it is, and the archive is removed from the book.
 
 Unclear archives are left untouched and flagged: two files of the same format (maybe
-different books), nothing Calibre can read, an archive inside, password, damage."""
+different books), nothing Calibre can read, an archive inside, password, damage. Files of
+different formats are taken as one book, unless their names differ ("Foundation.epub",
+"I, Robot.pdf"): then the archive is left packed, for the user to check (Unpack.doubt)."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Callable
@@ -67,6 +70,7 @@ class Unpack:
     present: list[str] = field(default_factory=list)  # formats inside that the book already has
     ignored: list[str] = field(default_factory=list)  # files not added (DOC, pictures, notes…)
     problem: str = ""  # why it is left untouched ("" when clear)
+    doubt: str = ""  # why it is left packed though clear (different names: different books?); right-click unpacks
     unpack: bool = False  # Execute unpacks it (the answer to the question; right-click changes it)
     planned: bool = False  # the answer given during the analysis
     asked: bool = False
@@ -77,6 +81,8 @@ class Unpack:
         if self.problem:
             return f"{self.format} not unpacked: {self.problem}"
         holds = ", ".join(sorted(self.add)) or "nothing new"
+        if self.doubt and not self.unpack:
+            return f"{self.format} not unpacked: {self.doubt}; holds {holds}"
         if not self.asked:
             return f"{self.format} holds {holds}"
         if not self.planned:
@@ -126,12 +132,27 @@ def plan_unpack(fmt: str, path: str, members: list[dict], book_formats) -> Unpac
         u.problem = f"{len(found[twice[0]])} {twice[0]} files (different books?)"
     elif not found:
         u.problem = "nothing Calibre can read inside"
+    elif not same_names([ms[0]["name"] for ms in found.values()]):
+        names = sorted(PurePosixPath(ms[0]["name"].replace("\\", "/")).name for ms in found.values())
+        u.doubt = f"files with different names ({', '.join(names)}): different books?"
     for f, (m, *_) in sorted(found.items()):
         if f in book_formats:
             u.present.append(f)
         else:
             u.add[f], u.sizes[f] = m["name"], m["size"]
     return u
+
+
+def _name_words(name: str) -> set[str]:
+    stem = os.path.splitext(PurePosixPath(name.replace("\\", "/")).name)[0]
+    return set(re.findall(r"[^\W_]+", stem.casefold()))
+
+
+def same_names(names: list[str]) -> bool:
+    """Whether files of different formats are named as one book: each name's words (the
+    extension aside) are within the longest's ("Foundation.epub", "Asimov - Foundation.pdf")."""
+    words = sorted((_name_words(n) for n in names), key=len)
+    return all(w <= words[-1] for w in words)
 
 
 def ask_once(books: list[Book], ask: Callable[[int], bool] | None) -> Callable[[Book, Unpack], bool] | None:
@@ -164,8 +185,10 @@ def prepare(book: Book, extractor, ask: Callable[[Book, Unpack], bool]) -> tuple
             log.info("%s: %s", book.label(), u.note)
             continue
         u.asked = True
-        u.unpack = u.planned = bool(ask(book, u))
+        u.unpack = u.planned = bool(ask(book, u)) and not u.doubt
         if not u.unpack:
+            if u.doubt:
+                log.info("%s: %s", book.label(), u.note)
             continue
         try:
             extracted = extractor.extract_archive(fmt, path, u)

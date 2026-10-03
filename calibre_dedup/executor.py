@@ -32,18 +32,17 @@ from pathlib import Path
 from typing import Callable
 
 from .calibre_env import CREATE_NO_WINDOW, calibre_is_running, tool
+from .journal import Journal, snapshot
 from .library_use import ExecutionLock
 from .models import Action, Plan, PlanItem
-from .selection import actionable, blocked, has_metadata_update, runs_main_action
+from .selection import action_label, actionable, blocked, runs_main_action
 from .tempdirs import RunDir
 
 log = logging.getLogger(__name__)
 BRIDGE = Path(__file__).with_name("bridge_script.py")
-# Added to every book whose metadata is written from what the AI read in it (both programs),
-# only when a field actually changes: search it in Calibre to check the AI's work.
+# Added by the Metadata Review to every book whose metadata it writes from what the AI read
+# in it, only when a field actually changes: search it in Calibre to check the AI's work.
 AI_UPDATED_TAG = "AIUpdated"
-# Added to every book whose swapped title and author were put right.
-SWAPPED_TAG = "TitleAuthorSwapped"
 
 
 class ExecutionError(Exception):
@@ -57,11 +56,13 @@ def _keep_failed_in_source(item: PlanItem) -> None:
     item.reason = f"kept in source after execution failure: {item.reason}"
 
 
-def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
-    """Bridge actions for the checked, unblocked items. "trash_formats": the formats
-    Calibre can't open, taken out of the source first (the whole record is copied to
-    the trash library as it is); on its own for a book whose action doesn't run.
-    "unpack": the archives to unpack (see archives.Unpack.spec), likewise."""
+def plan_actions(plan: Plan) -> list[dict]:
+    """Bridge actions for the ticked, unblocked items (an unticked book is left as it is).
+    "trash_formats": the formats Calibre can't open, taken out of the source first (the
+    whole record is copied to the trash library as it is); on its own for a book whose
+    action doesn't run. "unpack": the archives to unpack (see archives.Unpack.spec),
+    likewise. "stamp" (and "target_stamp", "keep_stamp" for the copy kept): the books'
+    last_modified as the analysis read them, so that a book changed since is not touched."""
     actions = []
     stuck = blocked(plan)
     for item in actionable(plan):
@@ -69,27 +70,17 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
         a = None
         if main and item.action is Action.MOVE:
             a = {"op": "move", "src_id": item.source.id, "title": item.source.title}
-            if update_metadata and item.identity.ai_fields:
-                a["set"], a["updated_tag"] = _ai_values(item), AI_UPDATED_TAG
-            if update_metadata and item.swapped:
-                a["swap"] = _swap_values(item)
         elif main and item.action is Action.TRASH:
             a = {"op": "trash", "src_id": item.source.id, "title": item.source.title,
                  "add_formats": item.add_formats}
-            if item.match is None:  # forced by the user, or unreadable: no target copy to check or merge into
+            if item.match is None:  # forced by the user, unreadable or empty: no copy to check or merge into
                 a["no_target"] = True
             elif item.match_planned:
                 a["target_src_id"] = item.match.id
             elif item.match_in_source:
-                a["keep_src_id"] = item.match.id
+                a["keep_src_id"], a["keep_stamp"] = item.match.id, item.match.last_modified
             else:
-                a["target_id"] = item.match.id
-        elif main and item.action is Action.LEAVE and update_metadata and has_metadata_update(item):
-            a = {"op": "update", "src_id": item.source.id, "title": item.source.title, "set": {}}
-            if item.ai_used and item.identity.ai_fields:
-                a["set"], a["updated_tag"] = _ai_values(item), AI_UPDATED_TAG
-            if item.swapped:
-                a["swap"] = _swap_values(item)
+                a["target_id"], a["target_stamp"] = item.match.id, item.match.last_modified
         trashed = bool(a and a["op"] == "trash")
         bad = item.bad_formats_to_trash if not trashed else []  # trashed whole anyway
         # Archives: their files are added first (a merge may need them); a book trashed
@@ -103,44 +94,34 @@ def plan_actions(plan: Plan, update_metadata: bool) -> list[dict]:
         if unpack:
             a["unpack"] = unpack
         if a:
+            a["stamp"] = item.source.last_modified
             actions.append(a)
     return actions
 
 
-def _swap_values(item: PlanItem) -> dict:
-    """Title and authors put right, for a book whose record had them swapped
-    (overwritten, unlike what the AI found; tagged SWAPPED_TAG)."""
-    return {"title": item.identity.title, "authors": item.identity.authors, "tag": SWAPPED_TAG,
-            "was_title": item.source.title, "was_authors": item.source.authors}
-
-
-def _ai_values(item: PlanItem) -> dict:
-    ident, fields = item.identity, item.identity.ai_fields
-    values: dict = {}
-    if "title" in fields:
-        values["title"] = ident.title
-    if "authors" in fields:
-        values["authors"] = ident.authors
-    if "publisher" in fields:
-        values["publisher"] = ident.publisher
-    if "year" in fields and ident.year is not None:
-        values["year"] = ident.year
-    if "isbn" in fields and ident.isbns:
-        values["isbn"] = sorted(ident.isbns)[0]
-    return values
-
-
 def run_bridge(calibre_dir: Path, payload: dict, on_message: Callable[[dict], None],
-               cancel: threading.Event | None = None, program: str = "dedup") -> None:
+               cancel: threading.Event | None = None, program: str = "dedup",
+               snapshots: Path | None = None) -> None:
     """Run bridge_script.py in calibre-debug with `payload` as its plan, calling
     `on_message` for each "result" / "stopped" event it prints. Locks the libraries
     it writes (see library_use.ExecutionLock): if another execution writes one of
-    them, raises ExecutionError naming it."""
+    them, raises ExecutionError naming it. Before starting, the metadata.db of the
+    source and the target (not the trash library: it only receives books) is copied
+    (journal.snapshot, into `snapshots`, default the data folder); if it can't be,
+    nothing is done."""
     execution_lock = ExecutionLock(program)
     conflicts = execution_lock.acquire({r: payload.get(r) or "" for r in ("source", "target", "trash")})
     if conflicts:
         raise ExecutionError("\n".join(c.describe(program) for c in conflicts))
     try:
+        written = {str(Path(p).resolve()).casefold(): p for p in (payload.get("source"), payload.get("target"))
+                   if p and Path(p, "metadata.db").is_file()}
+        for library in written.values():
+            try:
+                snapshot(library, snapshots)
+            except Exception as e:
+                raise ExecutionError(f"Nothing was done: the copy of {library}'s metadata.db, kept to undo the "
+                                     f"changes, could not be saved ({e}).") from e
         with RunDir("execute_") as tmp:
             payload = {**payload, "tmp": str(tmp)}  # where the bridge extracts archives
             plan_file = tmp / "plan.json"
@@ -188,40 +169,64 @@ def run_bridge(calibre_dir: Path, payload: dict, on_message: Callable[[dict], No
         execution_lock.release()
 
 
+OP_LABELS = {"move": "Move to target", "trash_formats": "Unreadable formats to the trash library",
+             "unpack": "Archive unpacked"}
+
+
+def journal_match(item: PlanItem) -> str:
+    """The book a trashed one is a copy of, for the journal."""
+    m = item.match
+    if m is None:
+        return ""
+    where = (" (moved to the target by this run)" if item.match_planned
+             else " (kept in the source)" if item.match_in_source else "")
+    return f"#{m.id} {m.label()}{where}"
+
+
 def execute_plan(
-    plan: Plan, calibre_dir: Path, update_metadata: bool = True, permanent: bool = False,
+    plan: Plan, calibre_dir: Path, permanent: bool = False,
     on_result: Callable[[PlanItem, bool, str], None] | None = None,
-    cancel: threading.Event | None = None,
+    cancel: threading.Event | None = None, journal: Path | None = None,
 ) -> tuple[int, int]:
-    """Execute MOVE and TRASH items. Returns (succeeded, failed)."""
+    """Execute the ticked items. Returns (succeeded, failed). Each book acted on gets a
+    row in the journal (journal.Journal, in `journal`, default the data folder)."""
     if calibre_is_running():
         raise ExecutionError("Calibre is running. Close Calibre (and calibre-server) before executing the plan.")
-    actions = plan_actions(plan, update_metadata)
+    actions = plan_actions(plan)
     if not actions:
         return 0, 0
     items = {i.source.id: i for i in plan.items}
+    sent = {a["src_id"]: a for a in actions}
     ok = failed = 0
 
-    def on_message(msg: dict) -> None:
-        nonlocal ok, failed
-        if msg["event"] != "result":
-            return
-        item = items[msg["src_id"]]
-        item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
-        if msg["ok"]:
-            ok += 1
-            if item.archives_to_unpack:  # done: the book no longer has them
-                item.archives = [u for u in item.archives if not u.unpack]
-            log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
-        else:
-            failed += 1
-            _keep_failed_in_source(item)
-            log.error("Book %s (%s): %s", item.source.id, item.source.title, msg.get("trace") or msg["msg"])
-        if on_result:
-            on_result(item, msg["ok"], msg["msg"])
+    with Journal("dedup", journal) as book_log:
+        def on_message(msg: dict) -> None:
+            nonlocal ok, failed
+            if msg["event"] != "result":
+                return
+            item = items[msg["src_id"]]
+            op = sent[item.source.id]["op"]
+            book_log.write(library=plan.source_library, book_id=item.source.id, title=item.source.title,
+                           authors=" & ".join(item.source.authors),
+                           action=action_label(item) if op == "trash" else OP_LABELS.get(op, op),
+                           ok="yes" if msg["ok"] else "no", result=msg["msg"], why=item.reason,
+                           match=journal_match(item) if op == "trash" else "")
+            item.status = ("OK: " if msg["ok"] else "FAILED: ") + msg["msg"]
+            if msg["ok"]:
+                ok += 1
+                if item.archives_to_unpack:  # done: the book no longer has them
+                    item.archives = [u for u in item.archives if not u.unpack]
+                log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
+            else:
+                failed += 1
+                _keep_failed_in_source(item)
+                log.error("Book %s (%s): %s", item.source.id, item.source.title, msg.get("trace") or msg["msg"])
+            if on_result:
+                on_result(item, msg["ok"], msg["msg"])
 
-    run_bridge(calibre_dir, {
-        "source": plan.source_library, "target": plan.target_library, "trash": plan.trash_library,
-        "permanent": permanent, "actions": actions,
-    }, on_message, cancel)
+        log.info("Journal of this execution: %s", book_log.path)
+        run_bridge(calibre_dir, {
+            "source": plan.source_library, "target": plan.target_library, "trash": plan.trash_library,
+            "permanent": permanent, "actions": actions,
+        }, on_message, cancel)
     return ok, failed

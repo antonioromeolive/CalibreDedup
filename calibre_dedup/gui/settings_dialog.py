@@ -482,14 +482,13 @@ class SettingsDialog(QDialog):
             "then compared as usual (ISBN, edition and publisher, EPUB text, cover).")
         self.a_author_variants.setChecked(s.author_variants)
         self.a_swapped = QCheckBox("Title and author swapped (e.g. \"Kingston\" by \"The Log House by the Lake\"): "
-                                   "put them right")
+                                   "match them put right")
         self.a_swapped.setToolTip(
             "Books whose title is the name of an author of other books, and whose author reads as a title,\n"
             "usually from file names like \"Kingston - The Log House by the Lake.epub\". They are analyzed and\n"
-            "matched with title and author put right (filter: Title/author swapped). On Execute, with\n"
-            "\"Write AI-found … to moved books\" on, a moved book (or one you tick) gets them written,\n"
-            "tagged TitleAuthorSwapped. A book named after a person (\"Rousseau\" by \"John Morley\")\n"
-            "is left as it is: its author reads as a name.")
+            "matched with title and author put right (filter: Title/author swapped): trashed when proven a\n"
+            "duplicate, but never moved: the Metadata Review fixes the record first. A book named after a\n"
+            "person (\"Rousseau\" by \"John Morley\") is left as it is: its author reads as a name.")
         self.a_swapped.setChecked(s.fix_swapped)
         self.a_similar_titles = QCheckBox("Match similar titles by the same author (needs proof: ISBN, same text "
                                           "or same cover)")
@@ -514,13 +513,16 @@ class SettingsDialog(QDialog):
         self.a_unreadable.setToolTip(
             "Files Calibre can't open: a format it doesn't read (DOC, JPG...), a file that isn't what its\n"
             "format says (a \"PDF\" that is really a LIT book or a picture), or one that fails to open.\n"
-            "A book with only such files goes to the trash library. A book with some: its whole record is\n"
-            "copied to the trash library as it is, then those formats are removed from the source.\n"
-            "On: these are ticked like the other decisions. Off: they are listed (filter: Unreadable files)\n"
-            "and you tick them yourself.")
+            "Only files that open nowhere (empty, or not what their format says) are proposed for the trash:\n"
+            "one another program may open (a DOC opens in Word, an RTF only Calibre's converter fails on)\n"
+            "is kept, and a book with only such files stays in the source. A book with no file that opens\n"
+            "goes to the trash library. A book with some: its whole record is copied to the trash library\n"
+            "as it is, then those formats are removed from the source.\n"
+            "Files that open nowhere never go to the target with a moved book: they are taken out first.\n"
+            "On: these books are ticked like the other decisions. Off: they start unticked, to review\n"
+            "(Status: Needs review), and you tick them yourself; right-click a book to move its other\n"
+            "unreadable files too.")
         self.a_unreadable.setChecked(s.trash_unreadable)
-        self.a_update = QCheckBox("Write AI-found title/authors/publisher/ISBN to moved books (only empty fields)")
-        self.a_update.setChecked(s.update_metadata)
         self.a_permanent = QCheckBox("Delete permanently from source (else: Calibre's recycle bin)")
         self.a_permanent.setChecked(s.delete_permanently)
         self.a_calibre = QLineEdit(s.calibre_dir or str(find_calibre_dir() or ""))
@@ -546,7 +548,6 @@ class SettingsDialog(QDialog):
         form.addRow(self.a_similar_titles)
         form.addRow(self.a_series)
         form.addRow(self.a_unreadable)
-        form.addRow(self.a_update)
         form.addRow(self.a_permanent)
         form.addRow("Calibre program folder", crow)
         self._reset_warnings = False
@@ -567,7 +568,7 @@ class SettingsDialog(QDialog):
             for widget in (self.a_subtitle, self.a_similar, self.a_cover, self.a_cover_note, self.a_always_cover,
                            self.a_always_cover_note, self.a_skip_generic, self.a_years, self.a_years_note, self.a_author_variants,
                            self.a_swapped,
-                           self.a_similar_titles, self.a_series, self.a_unreadable, self.a_update, reset):
+                           self.a_similar_titles, self.a_series, self.a_unreadable, reset):
                 form.setRowVisible(widget, False)
             form.labelForField(self.a_pdf_pages).setText("PDF pages to read (from the start)")
             form.labelForField(self.a_chars).setText("Characters to read (other formats, from the start)")
@@ -665,7 +666,6 @@ class SettingsDialog(QDialog):
         s.author_variants = self.a_author_variants.isChecked()
         s.fix_swapped = self.a_swapped.isChecked()
         s.trash_unreadable = self.a_unreadable.isChecked()
-        s.update_metadata = self.a_update.isChecked()
         s.delete_permanently = self.a_permanent.isChecked()
         s.calibre_dir = self.a_calibre.text().strip()
         if self._reset_warnings:

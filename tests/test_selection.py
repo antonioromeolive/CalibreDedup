@@ -26,7 +26,8 @@ from calibre_dedup.ai import AICache
 from calibre_dedup.executor import _keep_failed_in_source, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
 from calibre_dedup.selection import (
-    SelectionStore, action_label, actionable, blocked, can_override, override, revert, revert_all,
+    SelectionStore, action_label, actionable, blocked, can_override, checkable, is_changed, mark_reviewed,
+    needs_review, override, revert, revert_all,
 )
 
 
@@ -51,19 +52,11 @@ def test_defaults_check_move_and_trash_only():
     assert [i.source.id for i in actionable(plan)] == [1, 2]
 
 
-def test_ai_year_is_included_in_move_metadata():
+def test_a_move_writes_no_metadata():
     plan = make_plan()
-    item = plan.items[0]
-    item.identity = Identity(year=1990, ai_fields={"year"})
-
-    action = plan_actions(plan, update_metadata=True)[0]
-    assert action["set"] == {"year": 1990} and action["updated_tag"] == "AIUpdated"
-
-
-def test_moves_without_ai_metadata_ask_for_no_tag():
-    plan = make_plan()
-    plan.items[0].identity = Identity(year=1990, ai_fields={"year"})
-    assert "updated_tag" not in plan_actions(plan, update_metadata=False)[0]
+    plan.items[0].identity = Identity(year=1990, ai_fields={"year"})  # what the AI read, to compare copies
+    action = plan_actions(plan)[0]
+    assert action == {"op": "move", "src_id": 1, "title": "T1", "stamp": ""}
 
 
 def test_failed_execution_keeps_book_in_source():
@@ -82,23 +75,43 @@ def test_ai_cache_is_model_independent():
     assert AICache.key("C:/books/book.epub", "start", "llama3") == AICache.key("C:/books/book.epub", "start", "gpt-4o")
 
 
-def test_leave_items_with_ai_metadata_are_updated_in_source():
+def test_a_book_left_in_place_is_never_updated():
     plan = make_plan()
     item = plan.items[3]
-    item.action = Action.LEAVE
     item.ai_used = True
     item.identity = Identity(title="New title", authors=["Alice Example"], ai_fields={"title", "authors"})
     item.selected = True
+    assert not checkable(item) and item not in actionable(plan)
+    assert all(a["src_id"] != item.source.id for a in plan_actions(plan))
 
-    actions = plan_actions(plan, update_metadata=True)
-    assert item in actionable(plan)
-    assert actions[-1] == {
-        "op": "update",
-        "src_id": item.source.id,
-        "title": item.source.title,
-        "set": {"title": "New title", "authors": ["Alice Example"]},
-        "updated_tag": "AIUpdated",
-    }
+
+def test_an_unticked_book_is_left_as_it_is():
+    plan = make_plan()
+    item = plan.items[0]
+    item.bad_formats = {"PDF": "empty file"}
+    item.source.formats["PDF"] = "x.PDF"
+    assert [a.get("trash_formats") for a in plan_actions(plan) if a["src_id"] == 1] == [["PDF"]]  # with the move
+    item.selected = False
+    assert all(a["src_id"] != 1 for a in plan_actions(plan))  # nor its unreadable formats
+
+
+def test_a_book_to_review_leaves_the_list_once_decided_and_it_is_remembered(tmp_path):
+    plan = make_plan()
+    item = plan.items[1]
+    item.review, item.selected, item.planned_selected = "no edition data", False, False
+    assert needs_review(item) and not is_changed(item)
+    item.selected = True
+    assert not needs_review(item)
+    item.selected = False
+    assert needs_review(item) and mark_reviewed(plan.items) == 1 and not needs_review(item)
+    store = SelectionStore(tmp_path / "sel.json")
+    store.save(plan)
+    fresh = make_plan()
+    fresh.items[1].review, fresh.items[1].selected, fresh.items[1].planned_selected = "no edition data", False, False
+    store.apply(fresh)
+    assert not needs_review(fresh.items[1]) and not fresh.items[1].selected
+    revert_all(fresh)
+    assert needs_review(fresh.items[1])
 
 
 def test_unchecking_a_move_blocks_its_duplicates():
@@ -106,7 +119,7 @@ def test_unchecking_a_move_blocks_its_duplicates():
     plan.items[0].selected = False
     assert 2 in blocked(plan)
     assert actionable(plan) == []
-    assert plan_actions(plan, update_metadata=False) == []
+    assert plan_actions(plan) == []
 
 
 def test_force_trash_computes_formats_and_works_without_a_match():
@@ -120,7 +133,7 @@ def test_force_trash_computes_formats_and_works_without_a_match():
     assert lone.match is None
     override(lone, Action.TRASH)
     assert lone.action is Action.TRASH and lone.add_formats == [] and "no copy in the target" in lone.reason
-    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == lone.source.id)
+    action = next(a for a in plan_actions(plan) if a["src_id"] == lone.source.id)
     assert action["op"] == "trash" and action["no_target"] and "target_id" not in action
 
 
@@ -281,7 +294,7 @@ def test_trash_only_is_possible_even_with_formats_to_merge():
     item = plan.items[2]  # has EPUB and MOBI that its match lacks
     override(item, Action.TRASH, merge=False)
     assert item.action is Action.TRASH and item.add_formats == [] and action_label(item) == "Trash only"
-    action = next(a for a in plan_actions(plan, update_metadata=False) if a["src_id"] == item.source.id)
+    action = next(a for a in plan_actions(plan) if a["src_id"] == item.source.id)
     assert action["add_formats"] == [] and action["target_id"] == 100
     override(item, Action.TRASH)  # and back to Merge & Trash
     assert item.add_formats == ["EPUB", "MOBI"]

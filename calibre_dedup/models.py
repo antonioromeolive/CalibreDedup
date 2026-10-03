@@ -120,20 +120,29 @@ class PlanItem:
     # The record's title looked like a file name ("ITABOOK 0052 - Hemingway"): the book is
     # matched with the title the AI read in it (identity.title), if it could.
     file_name_title: str = ""
-    # Title and author were swapped in the record: `identity` has them put right, and
-    # Execute writes them (with "Write found metadata" on) to a moved or ticked book.
+    # Title and author were swapped in the record: `identity` has them put right for the
+    # matching; the book is never moved (the Metadata Review fixes the record).
     swapped: bool = False
-    # Formats Calibre can't open (format -> why). All of them: the item trashes the book.
-    # Some: the book was decided on the others, and with `trash_bad` its whole record is
-    # copied to the trash library as it is, then those formats are removed from the source.
+    # Formats Calibre can't open (format -> why). All of them: the item trashes the book, or
+    # leaves it when another program may open one (planner._unreadable_item). Some: the book
+    # was decided on the others; for those taken out (`trash_bad`) the whole record is copied
+    # to the trash library as it is, then those formats are removed from the source.
     bad_formats: dict[str, str] = field(default_factory=dict)
-    trash_bad: bool = False
-    planned_trash_bad: bool = False  # the analysis' own choice (the setting)
+    # Which bad formats are taken out (when the book is ticked): None only those that open
+    # nowhere (empty, or not what their format says), not those another program may open
+    # (a DOC, a file only Calibre's converter fails on); True every one; False none.
+    trash_bad: bool | None = None
+    planned_trash_bad: bool | None = None  # the analysis' own choice
     # The book's archives (RAR, ZIP, 7Z) as archives.Unpack: unpacked on Execute when
     # their `unpack` is on, ticked or not (like the unreadable formats).
     archives: list = field(default_factory=list)
     status: str = ""  # filled during execution
-    selected: bool = True  # user wants this item executed (meaningless for LEAVE)
+    # What to check before ticking, when the analysis isn't sure (an unproven duplicate,
+    # files that open nowhere, a doubtful archive): see selection.needs_review. Such a
+    # book starts unticked, and unticked nothing happens to it.
+    review: str = ""
+    reviewed: bool = False  # the user marked it reviewed, keeping the analysis' choices
+    selected: bool = True  # user wants this item executed (a LEAVE item only for its cleanup)
     manual: bool = False  # action overridden by the user
     # The analysis' own decision, kept so a manual override can be reverted.
     planned_action: Action | None = None
@@ -153,9 +162,17 @@ class PlanItem:
         return bool(self.bad_formats) and set(self.bad_formats) >= set(self.source.formats)
 
     @property
+    def unopenable(self) -> list[str]:
+        """The bad formats that can't be opened at all: empty, or not what their format says."""
+        from .extract import openable_elsewhere
+        return sorted(f for f, why in self.bad_formats.items() if not openable_elsewhere(why))
+
+    @property
     def bad_formats_to_trash(self) -> list[str]:
-        """The formats to take out of the source on Execute (some formats bad, box ticked)."""
-        return sorted(self.bad_formats) if self.trash_bad and not self.unreadable else []
+        """The formats to take out of the source on Execute (some formats bad), by `trash_bad`."""
+        if self.trash_bad is False or self.unreadable:
+            return []
+        return sorted(self.bad_formats) if self.trash_bad else self.unopenable
 
     @property
     def archives_to_unpack(self) -> list:

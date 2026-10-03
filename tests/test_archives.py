@@ -31,7 +31,8 @@ from calibre_dedup.executor import plan_actions
 from calibre_dedup.extract import TextExtractor
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
 from calibre_dedup.review import ReviewAction, ReviewItem, review_actions
-from calibre_dedup.selection import actionable, revert
+from calibre_dedup import planner
+from calibre_dedup.selection import actionable, checkable, needs_review, revert
 from tests.test_bridge import bridge  # noqa: F401  (a fixture)
 from tests.test_review import book as make_book
 
@@ -133,15 +134,19 @@ def unpack(fmt="RAR", on=True) -> Unpack:
     return Unpack(fmt, "b.rar", 10, 20, add={"EPUB": "b.epub"}, sizes={"EPUB": 5}, unpack=on, planned=on)
 
 
-def test_an_unpack_runs_even_on_a_book_left_in_the_source():
-    item = PlanItem(make_book(id=7, title="T"), Action.LEAVE, "not proven", Identity())
+def test_an_unpack_runs_on_a_ticked_book_left_in_the_source():
+    item = PlanItem(make_book(id=7, title="T", last_modified="2026-10-03 09:00:00+00:00"), Action.LEAVE,
+                    "not proven", Identity())
     item.archives = [unpack()]
     plan = Plan("s", "t", "x", items=[item])
+    assert checkable(item) and actionable(plan) == []  # unticked: left as it is
+    item.selected = True  # as the analysis ticks it (planner._review_files)
     assert actionable(plan) == [item]
-    assert plan_actions(plan, False) == [{"op": "unpack", "src_id": 7, "title": "T", "unpack": [
-        {"format": "RAR", "size": 10, "mtime": 20, "add": {"EPUB": "b.epub"}, "sizes": {"EPUB": 5}, "remove": True}]}]
+    assert plan_actions(plan) == [{"op": "unpack", "src_id": 7, "title": "T", "unpack": [
+        {"format": "RAR", "size": 10, "mtime": 20, "add": {"EPUB": "b.epub"}, "sizes": {"EPUB": 5}, "remove": True}],
+        "stamp": "2026-10-03 09:00:00+00:00"}]
     item.archives[0].unpack = False  # right-click: keep the archive
-    assert actionable(plan) == []
+    assert actionable(plan) == [] and not checkable(item)
     revert(item)
     assert item.archives[0].unpack
 
@@ -150,18 +155,41 @@ def test_a_book_trashed_whole_keeps_its_archive():
     item = PlanItem(make_book(id=7, title="T"), Action.TRASH, "dup", Identity(),
                     match=make_book(id=9, title="T"), add_formats=["EPUB"])
     item.archives = [unpack()]
-    (action,) = plan_actions(Plan("s", "t", "x", items=[item]), False)
+    (action,) = plan_actions(Plan("s", "t", "x", items=[item]))
     assert action["op"] == "trash" and action["unpack"][0]["remove"] is False
 
 
-def test_review_unpacks_whatever_the_action_unless_the_book_is_trashed():
+def test_review_unpacks_a_ticked_book_unless_it_is_trashed():
     kept = ReviewItem(make_book(id=1, title="T", formats={"RAR": "b.rar"}), None, "")
     kept.archives = [unpack()]
+    kept.tick_cleanup()  # as the scan does
     trashed = ReviewItem(make_book(id=2, title="T", formats={"RAR": "b.rar"}), None, "")
     trashed.archives = [unpack()]
     trashed.set_action(ReviewAction.TRASH)
     ops = review_actions([kept, trashed], {"title"})
+    assert kept.selected and kept.checkable
     assert [(a["op"], "unpack" in a) for a in ops] == [("unpack", True), ("trash", False)]
+    kept.selected = False  # unticked: left as it is
+    assert [a["op"] for a in review_actions([kept], {"title"})] == []
+
+
+def test_files_of_different_formats_with_different_names_are_left_packed(archive, tmp_path):
+    u = plan_unpack("ZIP", archive, files(("Foundation.epub", 3), ("I, Robot.pdf", 6)), {"ZIP": archive})
+    assert not u.problem and u.doubt == "files with different names (Foundation.epub, I, Robot.pdf): different books?"
+    assert not plan_unpack("ZIP", archive, files(("Foundation.epub", 3), ("Asimov - Foundation.pdf", 6)),
+                           {"ZIP": archive}).doubt
+    book = zip_book(tmp_path, **{"Foundation.epub": b"E", "Robot.pdf": b"P"})
+    extractor = TextExtractor(tmp_path)
+    try:
+        seen, (u,) = prepare(book, extractor, lambda b, a: True)  # "unpack" was answered: not this one
+    finally:
+        extractor.close()
+    assert seen is book and u.asked and not u.unpack and u.note.startswith("ZIP not unpacked: files with different")
+    item = PlanItem(book, Action.MOVE, "not in target", Identity(), archives=[u])
+    planner._review_files(item, False)
+    assert needs_review(item) and item.selected  # the move is no doubt: only the archive stays packed
+    u.unpack = True  # right-click: unpack it after all
+    assert not needs_review(item)
 
 
 # --- the Calibre side (bridge_script), with a fake library ----------------------------------
@@ -176,7 +204,8 @@ class FakeLibrary:
     def formats(self, book_id):
         return tuple(self.files)
 
-    def add_format(self, book_id, fmt, path, replace=False):
+    def add_format(self, book_id, fmt, path, replace=False, run_hooks=True):
+        assert not replace and not run_hooks  # never replaced, never converted
         self.log.append(("add", fmt, Path(path).read_bytes()))
         self.files[fmt] = path
 

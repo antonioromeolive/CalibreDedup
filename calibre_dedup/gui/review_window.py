@@ -68,7 +68,7 @@ from .filters import STATUS_ENTRIES, STATUS_TIP, Entry, FilterButton, showing_te
 from .filters import filter_row as make_filter_row
 from .icons import REVIEW, app_icon, set_taskbar_identity
 from .main_window import (
-    AI_LOG_COLOR, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
+    AI_LOG_COLOR, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked, add_mark_reviewed,
     add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, fill_tags,
     no_cache_box, open_file, tag_box, tag_mode_box, with_eta,
 )
@@ -156,8 +156,9 @@ class ReviewModel(QAbstractTableModel):
         if self.locked:
             return
         for it in items:
-            if it.action is not ReviewAction.KEEP:
+            if it.checkable:
                 it.selected = (not it.selected) if value is None else value
+                it.reviewed = True
         self.refresh()
 
     # --- Qt ---------------------------------------------------------------------
@@ -174,8 +175,7 @@ class ReviewModel(QAbstractTableModel):
 
     def flags(self, index):
         f = super().flags(index)
-        if (index.column() == self.COL_CHECK and not self.locked
-                and self.items[index.row()].action is not ReviewAction.KEEP):
+        if index.column() == self.COL_CHECK and not self.locked and self.items[index.row()].checkable:
             f |= Qt.ItemIsUserCheckable
         return f
 
@@ -212,6 +212,8 @@ class ReviewModel(QAbstractTableModel):
                     f"\n{', '.join(kept)} unreadable, kept" if kept else "")
             if it.archives and not (it.selected and it.action is ReviewAction.TRASH):
                 label += "\n" + "\n".join(archive_texts(it.archives))
+            if it.needs_review_for(self.fields_on):
+                label += "\nTo review"
             return label
         if col == self.COL_READ:
             return it.note
@@ -224,13 +226,17 @@ class ReviewModel(QAbstractTableModel):
             return it.book.id if col == self.COL_ID else self.text(it, col)
         if role == Qt.ToolTipRole:
             name = self.FIELD_COLS.get(col)
+            if col == self.COL_ACTION and it.needs_review_for(self.fields_on):
+                return (f"{self.text(it, col)}\n\nTo review: {it.review_for(self.fields_on)}.\nUntil you decide (tick or untick, "
+                        f"change a field or the action, or right-click → Mark reviewed) the book is not tagged "
+                        f"{REVIEWED_TAG}: the next analysis shows it again.")
             if name in it.doubts and name in it.excluded:
                 return (f"{self.text(it, col)}\n\nLeft out: {it.doubts[name]}.\nRight-click → Change "
                         f"{FIELD_LABELS[name].lower()} again, to write it anyway.")
             return self.text(it, col) or None
         if role == CELL_ROLE and col in self.FIELD_COLS:
             return self.cell(it, self.FIELD_COLS[col])
-        if role == Qt.CheckStateRole and col == self.COL_CHECK and it.action is not ReviewAction.KEEP:
+        if role == Qt.CheckStateRole and col == self.COL_CHECK and it.checkable:
             return Qt.Checked if it.selected else Qt.Unchecked
         if role == Qt.FontRole and it.manual and col == self.COL_ACTION:
             return self.italic_font
@@ -238,7 +244,7 @@ class ReviewModel(QAbstractTableModel):
             return int(Qt.AlignLeft | Qt.AlignTop)
         if role == Qt.ForegroundRole:
             if col == self.COL_ACTION:
-                return QColor(ACTION_COLORS[it.action])
+                return QColor("#e65100" if it.needs_review_for(self.fields_on) else ACTION_COLORS[it.action])
             if col == self.COL_RESULT and it.status.startswith("FAILED"):
                 return QColor("#c62828")
             if col == self.COL_READ and it.found is None:
@@ -248,7 +254,7 @@ class ReviewModel(QAbstractTableModel):
     # --- sorting (in Python, see main_window.PlanModel) ----------------------------
     def sort_key(self, it: ReviewItem, col: int):
         if col == self.COL_CHECK:
-            return (2 if it.selected else 1) if it.action is not ReviewAction.KEEP else 0
+            return (2 if it.selected else 1) if it.checkable else 0
         if col == self.COL_ID:
             return it.book.id
         return strip_accents(self.text(it, col)).casefold()
@@ -313,7 +319,7 @@ def book_kinds(it: ReviewItem) -> set[str]:
 
 
 def is_checked(it: ReviewItem) -> bool:
-    return it.selected and it.action is not ReviewAction.KEEP
+    return it.selected and it.checkable
 
 
 class ReviewFilter(QSortFilterProxyModel):
@@ -341,7 +347,8 @@ class ReviewFilter(QSortFilterProxyModel):
             return False
         if self.kinds and not (self.kinds & book_kinds(it)):
             return False
-        if self.states and not (self.states & status_keys(is_checked(it), it.status)):
+        if self.states and not (self.states & status_keys(is_checked(it), it.status,
+                                                          it.needs_review_for(model.fields_on))):
             return False
         if self.terms:
             hay = strip_accents(" ".join(model.text(it, c) for c in range(1, len(model.HEADERS)))).casefold()
@@ -650,7 +657,8 @@ class ReviewWindow(QMainWindow):
             BOOK_ENTRIES, lambda: Counter(k for it in items() for k in book_kinds(it)), default=DEFAULT_BOOKS)
         self.status_filter = FilterButton(
             "Status", STATUS_TIP, STATUS_ENTRIES,
-            lambda: Counter(k for it in items() for k in status_keys(is_checked(it), it.status)))
+            lambda: Counter(k for it in items() for k in status_keys(is_checked(it), it.status,
+                                                                     it.needs_review_for(self.fields_on))))
         self.action_filter.changed.connect(lambda: self.proxy.update(actions=self.action_filter.selected()))
         self.book_filter.changed.connect(lambda: self.proxy.update(kinds=self.book_filter.selected()))
         self.status_filter.changed.connect(lambda: self.proxy.update(states=self.status_filter.selected()))
@@ -877,6 +885,7 @@ class ReviewWindow(QMainWindow):
         formats, books whose archive is unpacked, books tagged BAD_COVER_TAG) that
         Execute would do."""
         actions = review_actions(self.model.items, self.fields_on)
+        self._tagged_updates = sum(1 for a in actions if a["op"] == "set" and a.get("tag") == REVIEWED_TAG)
         updates = sum(1 for a in actions if a["op"] == "set")
         trashes = sum(1 for a in actions if a["op"] == "trash")
         tags = sum(len(a["src_ids"]) for a in actions if a["op"] == "tag" and a["tag"] == REVIEWED_TAG)
@@ -904,7 +913,7 @@ class ReviewWindow(QMainWindow):
         self.checked_label.setText(f"{updates} to update · {trashes} to trash · "
                                    + (f"{formats} losing unreadable formats · " if formats else "")
                                    + (f"{unpacks} archives to unpack · " if unpacks else "")
-                                   + f"{updates + tags} to tag {REVIEWED_TAG}"
+                                   + f"{self._tagged_updates + tags} to tag {REVIEWED_TAG}"
                                    + (f" · {covers} {BAD_COVER_TAG}" if covers else ""))
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
@@ -926,14 +935,14 @@ class ReviewWindow(QMainWindow):
     def _header_clicked(self, section: int):
         if section != ReviewModel.COL_CHECK or not self._can_edit():
             return
-        items = [it for it in self.model.items if it.action is not ReviewAction.KEEP]
+        items = [it for it in self.model.items if it.checkable]
         if items:
             self.model.set_checked(items, not all(it.selected for it in items))
 
     def _toggle_selected_rows(self):
         if not self._can_edit():
             return
-        items = [i for i in self._selected_items() if i.action is not ReviewAction.KEEP]
+        items = [i for i in self._selected_items() if i.checkable]
         if items:
             self.model.set_checked(items, not all(i.selected for i in items))
 
@@ -1003,6 +1012,8 @@ class ReviewWindow(QMainWindow):
                     act.triggered.connect(lambda _=False, v=value, f=fits: self._set_trash_bad(f, v))
             add_unpack_actions(menu, items, self._set_unpack)
             menu.addSeparator()
+            add_mark_reviewed(menu, items, lambda i: i.needs_review_for(self.fields_on), self._mark_reviewed)
+            menu.addSeparator()
             for name in FIELDS:
                 having = [i for i in items if name in i.changes]
                 if not having:
@@ -1022,6 +1033,8 @@ class ReviewWindow(QMainWindow):
     def _set_trash_bad(self, items: list[ReviewItem], value: bool):
         for it in items:
             it.trash_bad = value
+            it.reviewed = True
+            it.tick_cleanup()
         self.model.refresh()
 
     def _set_unpack(self, items: list[ReviewItem], value: bool):
@@ -1029,6 +1042,8 @@ class ReviewWindow(QMainWindow):
             for u in it.archives:
                 if not u.problem:
                     u.unpack = value
+            it.reviewed = True
+            it.tick_cleanup()
         self.model.refresh()
 
     def _exclude(self, items: list[ReviewItem], name: str, exclude: bool):
@@ -1037,6 +1052,14 @@ class ReviewWindow(QMainWindow):
                 it.excluded.add(name)
             else:
                 it.excluded.discard(name)
+            it.reviewed = True
+            if it.action is ReviewAction.UPDATE and not it.manual:
+                it.selected = bool(it.to_write(FIELDS)) or it.cleanup
+        self.model.refresh()
+
+    def _mark_reviewed(self, items: list[ReviewItem]):
+        for it in items:
+            it.reviewed = True
         self.model.refresh()
 
     def _clear_filters(self):
@@ -1318,6 +1341,7 @@ class ReviewWindow(QMainWindow):
         where = "permanently deleted" if self.settings.delete_permanently else "moved to Calibre's recycle bin"
         unread = sum(1 for i in self.model.items if i.found is None and not i.manual)
         left_out = sum(1 for i in self.model.items for name in i.doubts if name in i.excluded)
+        to_review = sum(1 for i in self.model.items if i.needs_review_for(self.fields_on))
         if QMessageBox.question(
                 self, "Execute and mark reviewed",
                 f"{updates} books will have their metadata updated (fields: {fields}).\n"
@@ -1327,22 +1351,26 @@ class ReviewWindow(QMainWindow):
                    "library, then those formats are removed from the book.\n" if formats else "")
                 + (f"{unpacks} books have their archive unpacked: the formats they lack are added, and the "
                    "archive goes to the trash library inside a copy of the whole record.\n" if unpacks else "") +
-                f"The {updates} updated books and {tags} more (unchecked or nothing to change) will be tagged "
+                f"The updated books and {tags} more (nothing to change, or your choice) will be tagged "
                 f"{REVIEWED_TAG}: the next analysis skips them. The updated books are also tagged "
-                f"{AI_UPDATED_TAG}.\n"
+                f"{AI_UPDATED_TAG}. Unchecked books with something to change are left as they are, untagged: "
+                "the next analysis shows them again.\n"
                 + (f"The {unread} books the AI could not read are not tagged: the next analysis tries them again.\n"
                    if unread else "")
                 + (f"{left_out} changes are left out, not supported by the book (filter 'Changes left out'): "
                    "they are not written.\n" if left_out else "")
+                + (f"{to_review} books need review (Status → Needs review): their supported changes are written "
+                   f"if ticked, but they are not tagged {REVIEWED_TAG} until you decide.\n" if to_review else "")
                 + (f"{covers} books whose cover is not a real one (a generic image, a page of text) are "
                    f"tagged {BAD_COVER_TAG}, to find them a real cover in Calibre.\n" if covers else "")
-                + "\nContinue?") != QMessageBox.Yes:
+                + "\nA copy of the library's metadata.db is saved first, and a journal of what is done (data "
+                  "folder: snapshots, journal).\n\nContinue?") != QMessageBox.Yes:
             return
         self.model.locked = True
         # (a book losing its unreadable formats with nothing written reports twice: formats, then tag)
         self._done_count = 0
         self._exec_total = updates + trashes + tags + sum(
-            1 for i in self.model.items if i.bad_formats_to_trash and not i.to_write(self.fields_on))
+            1 for i in self.model.items if i.selected and i.bad_formats_to_trash and not i.to_write(self.fields_on))
         self.progress.setMaximum(max(self._exec_total, 1))
         self.progress.setValue(0)
         worker = ExecuteWorker(self.settings, self.result, self.fields_on)

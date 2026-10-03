@@ -133,8 +133,7 @@ def _run(argv: list[str]) -> int:
             return 1
 
     if args.execute:
-        ok, failed = execute_plan(plan, require_calibre_dir(settings), settings.update_metadata,
-                                  settings.delete_permanently,
+        ok, failed = execute_plan(plan, require_calibre_dir(settings), settings.delete_permanently,
                                   on_result=lambda it, good, msg: print(f"#{it.source.id}: {msg}"))
         print(f"Done: {ok} succeeded, {failed} failed")
     if args.report:

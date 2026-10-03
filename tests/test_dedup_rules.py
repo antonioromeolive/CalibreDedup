@@ -209,37 +209,83 @@ def test_the_length_does_not_overrule_a_proof(libs):
 
 
 # --- titles made from file names ------------------------------------------------------
-def test_a_file_name_title_is_matched_with_the_title_the_ai_reads(libs):
+def test_a_file_name_title_is_never_moved_nor_read_by_the_ai(libs):
     src, tgt, trash = libs(
-        source=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"], "isbn": ISBN}],
+        source=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"], "isbn": ISBN},
+                {"title": "scan_0012", "authors": ["Ernest Hemingway"]}],
         target=[{"title": "Il vecchio e il mare", "authors": ["Ernest Hemingway"], "isbn": ISBN}])
-    resolver = FakeResolver({"ITABOOK 0052 - Hemingway": AIMetadata(title="Il vecchio e il mare")})
-    item = build_plan(src, tgt, trash, resolver).items[0]
-    assert item.action is Action.TRASH and item.file_name_title == "ITABOOK 0052 - Hemingway"
-    assert "the AI read 'Il vecchio e il mare'" in item.reason and item.identity.title == "Il vecchio e il mare"
+    for resolver in (None, FakeResolver({"ITABOOK 0052 - Hemingway": AIMetadata(title="Il vecchio e il mare")})):
+        plan = build_plan(src, tgt, trash, resolver)
+        assert actions(plan) == [("ITABOOK 0052 - Hemingway", Action.LEAVE), ("scan_0012", Action.LEAVE)]
+        for item in plan.items:
+            assert item.reason.startswith("not moved: the title looks like a file name; fix it with the Metadata "
+                                          "Review first") and item.file_name_title and not item.selected
+        assert resolver is None or resolver.calls == []  # the Metadata Review reads the real title
+    # an identical file still proves it a duplicate (test_the_same_file_is_the_same_book_whatever_the_titles)
 
 
-def test_a_file_name_title_the_ai_cant_read_is_not_moved(libs):
-    src, tgt, trash = libs(source=[{"title": "scan_0012", "authors": ["Ernest Hemingway"]}], target=[])
-    for resolver in (None, FakeResolver({})):
-        item = build_plan(src, tgt, trash, resolver).items[0]
-        assert item.action is Action.LEAVE and "not moved without a real title" in item.reason
-        assert item.file_name_title == "scan_0012" and not item.selected
-    resolver = FakeResolver({"scan_0012": AIMetadata(title="Il vecchio e il mare")})
-    item = build_plan(src, tgt, trash, resolver).items[0]
-    assert item.action is Action.MOVE and item.identity.title == "Il vecchio e il mare"
-
-
-def test_a_target_file_name_title_is_read_when_a_book_by_its_author_finds_no_copy(libs):
+def test_a_target_book_with_a_file_name_title_holds_back_the_books_by_its_author(libs):
     src, tgt, trash = libs(
         source=[{"title": "Il vecchio e il mare", "authors": ["Ernest Hemingway"], "isbn": ISBN},
-                {"title": "Fiesta", "authors": ["Ernest Hemingway"]}],
+                {"title": "Fiesta", "authors": ["Ernest Hemingway"]},
+                {"title": "Emma", "authors": ["Jane Austen"]}],
         target=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"], "isbn": ISBN}])
     resolver = FakeResolver({"ITABOOK 0052 - Hemingway": AIMetadata(title="Il vecchio e il mare")})
     plan = build_plan(src, tgt, trash, resolver)
-    assert actions(plan) == [("Il vecchio e il mare", Action.TRASH), ("Fiesta", Action.MOVE)]
-    assert resolver.calls == ["ITABOOK 0052 - Hemingway"]  # read once, for the first book by its author
-    assert "the title 'ITABOOK 0052 - Hemingway' looks like a file name" in plan.items[0].reason
+    assert actions(plan) == [("Il vecchio e il mare", Action.LEAVE), ("Fiesta", Action.LEAVE), ("Emma", Action.MOVE)]
+    held = plan.items[0]
+    assert held.reason.startswith("not moved: the target's 'ITABOOK 0052 - Hemingway — Ernest Hemingway', by the "
+                                  "same author, has a file name for title: it may be this book; fix that title with "
+                                  "the Metadata Review first")
+    assert held.match.title == "ITABOOK 0052 - Hemingway" and resolver.calls == []
+
+
+# --- unproven duplicates: unticked, to review -------------------------------------------
+def test_an_unproven_duplicate_starts_unticked_to_review(libs):
+    from calibre_dedup.executor import plan_actions
+    from calibre_dedup.selection import mark_reviewed, needs_review
+    src, tgt, trash = libs(**NO_DATA)
+    plan = build_plan(src, tgt, trash, CoverResolver(None), cover_check=True)
+    item = plan.items[0]
+    assert item.action is Action.TRASH and item.add_formats == ["MOBI"]  # Merge & Trash, once checked
+    assert item.review == planner.REVIEW_NO_EDITION and needs_review(item) and not item.selected
+    assert plan_actions(plan) == []  # unticked: nothing is trashed, nothing added to the target copy
+    assert "1 to review before ticking" in planner.run_summary(plan)[0]
+    item.selected = True  # the user compared the copies
+    assert not needs_review(item) and [a["op"] for a in plan_actions(plan)] == ["trash"]
+    item.selected = False
+    assert needs_review(item) and mark_reviewed([item]) == 1 and not needs_review(item) and not item.selected
+    for same, review in ((True, planner.REVIEW_COVER), (False, "")):  # the same cover: also to review
+        item = build_plan(src, tgt, trash, CoverResolver(same), cover_check=True).items[0]
+        assert item.review == review and item.selected is (not review and item.action is not Action.LEAVE)
+
+
+def test_a_proven_duplicate_is_ticked(libs):
+    src, tgt, trash = libs(source=[{"title": "Dune", "isbn": ISBN, "formats": ["EPUB", "MOBI"]}],
+                           target=[{"title": "Dune", "isbn": ISBN}])
+    item = build_plan(src, tgt, trash).items[0]
+    assert item.action is Action.TRASH and item.add_formats == ["MOBI"] and item.selected and not item.review
+
+
+def test_authors_matched_by_the_surname_or_the_ai_are_to_review(libs):
+    src, tgt, trash = libs(source=[{"title": "Dune", "authors": ["Herbert"], "isbn": ISBN}],
+                           target=[{"title": "Dune", "authors": ["Frank Herbert"], "isbn": ISBN}])
+    item = build_plan(src, tgt, trash, author_variants=True).items[0]
+    assert item.action is Action.TRASH and not item.selected
+    assert item.review == "authors matched by the surname only: check they are the same person"
+
+
+# --- records with no file ---------------------------------------------------------------
+def test_an_empty_record_goes_to_the_trash_and_is_no_copy(libs):
+    from calibre_dedup.executor import plan_actions
+    src, tgt, trash = libs(source=[{"title": "Dune", "formats": []}, {"title": "Emma", "authors": ["Jane Austen"]}],
+                           target=[{"title": "Emma", "authors": ["Jane Austen"], "formats": []}])
+    plan = build_plan(src, tgt, trash)
+    assert actions(plan) == [("Dune", Action.TRASH), ("Emma", Action.MOVE)]  # the target's empty Emma is no copy
+    empty = plan.items[0]
+    assert empty.reason == planner.EMPTY_REASON and empty.selected and empty.match is None
+    assert plan_actions(plan)[0] == {"op": "trash", "src_id": 1, "title": "Dune", "add_formats": [],
+                                     "no_target": True, "stamp": empty.source.last_modified}
 
 
 # --- the best copy first ---------------------------------------------------------------

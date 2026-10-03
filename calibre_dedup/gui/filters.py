@@ -144,6 +144,9 @@ class FilterButton(QToolButton):
 
 STATUS_ENTRIES: list[Entry] = [
     ("checked", "Checked", "Ticked: Execute will act on them."),
+    ("review", "Needs review", "The analysis isn't sure (shown in the list as \"To review\"): check each book, then "
+                               "tick it, change its action, or right-click → Mark reviewed. Until then it is not "
+                               "ticked, and Execute leaves it as it is."),
     ("unchecked", "Not checked", "Not ticked: Execute leaves them as they are."),
     ("done", "Done", "Executed successfully in this session."),
     ("failed", "Failed", "Execute tried and failed: the reason is in the Result column."),
@@ -151,8 +154,8 @@ STATUS_ENTRIES: list[Entry] = [
 STATUS_TIP = "Status: show the books in any of the states ticked here. Nothing ticked: all books."
 
 
-def status_keys(checked: bool, status: str) -> set[str]:
-    keys = {"checked" if checked else "unchecked"}
+def status_keys(checked: bool, status: str, review: bool = False) -> set[str]:
+    keys = {"checked" if checked else "unchecked"} | ({"review"} if review else set())
     if status.startswith("OK"):
         keys.add("done")
     elif status.startswith("FAILED"):

@@ -126,3 +126,44 @@ def test_review_ask_the_ai_with_one_profile_leaves_the_choice_above(app):
     above = w._ask_settings(None)
     assert (above.text_profile, above.image_profile) == ("T", "G")
     assert (s.text_profile, s.image_profile) == ("T", "G")  # the window's own settings are untouched
+
+
+def test_status_lists_the_books_to_review():
+    assert status_keys(False, "", review=True) == {"unchecked", "review"}
+
+
+def test_dedup_books_to_review_are_listed_until_decided(app, tmp_path):
+    from calibre_dedup.models import Plan
+    from calibre_dedup.selection import SelectionStore
+    w = dedup.MainWindow(Settings(), dedup.QtLogHandler())
+    w.store = SelectionStore(tmp_path / "sel.json")  # never the real selections.json
+    doubt = PlanItem(book(1), Action.TRASH, "dup", Identity(title="T1", authors=["A"]), match=book(2))
+    doubt.review, doubt.selected, doubt.planned_selected = "no edition data", False, False
+    sure = PlanItem(book(3), Action.TRASH, "dup", Identity(title="T3", authors=["A"]), match=book(4))
+    w.plan = Plan("s", "t", "x", items=[doubt, sure])
+    w.model.set_plan(w.plan)
+    w.status_filter.set_selected({"review"})
+    assert shown(w) == [w.model.items.index(doubt)]
+    values = w.model.values(doubt)
+    assert values[0] == "?" and values[w.model.COL_REASON] == "To review: no edition data | dup"
+    w._mark_reviewed([doubt])
+    w.proxy.update()
+    assert shown(w) == [] and not doubt.selected  # reviewed, still unticked: left as it is
+    assert w.model.values(doubt)[w.model.COL_REASON] == "dup"
+
+
+def test_review_books_to_review_follow_the_fields_on(app):
+    w = review.ReviewWindow(Settings(), dedup.QtLogHandler())
+    doubt = ReviewItem(book(1), ReviewMetadata(title="Other", authors=["A"]))  # not checked against the book
+    assert doubt.doubts == {"title": "not checked against the book"}
+    w.model.reset([doubt])
+    w.book_filter.set_selected(set())
+    w.status_filter.set_selected({"review"})
+    assert shown(w) == [0] and w.model.text(doubt, w.model.COL_ACTION).endswith("To review")
+    w._field_toggled("title", False)  # the title is never changed: nothing left to review
+    w.proxy.update()
+    assert shown(w) == []
+    w._field_toggled("title", True)
+    w._mark_reviewed([doubt])
+    w.proxy.update()
+    assert shown(w) == [] and doubt.reviewed

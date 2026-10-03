@@ -128,8 +128,10 @@ def test_books_with_differences_are_proposed_for_update_the_others_kept():
 
 
 def test_only_checked_fields_that_are_on_and_not_excluded_are_written():
-    it = ReviewItem(book(), meta(title="Altro", year=1981, series="Oscar", series_index=3))
+    it = ReviewItem(book(), read(book(), meta(title="Altro", year=1981, series="Oscar", series_index=3),
+                                 PAGES + "\nOscar 3"))
     it.excluded.add("title")
+    it.reviewed = True  # as the window marks it when the user turns a field off
     trash = ReviewItem(book(id=2), None)
     trash.set_action(ReviewAction.TRASH)
     kept = ReviewItem(book(id=3), meta(year=1999))
@@ -137,9 +139,9 @@ def test_only_checked_fields_that_are_on_and_not_excluded_are_written():
     nothing = ReviewItem(book(id=4), meta(year=1999))  # only a field that is off
     actions = review_actions([it, trash, kept, nothing], {"title", "series"})
     assert actions == [
-        {"src_id": 1, "title": "Il nome della rosa", "op": "set", "set": {"series": "Oscar", "series_index": 3},
-         "tag": "AIReviewed", "updated_tag": "AIUpdated"},
-        {"src_id": 2, "title": "Il nome della rosa", "op": "trash", "no_target": True},
+        {"src_id": 1, "title": "Il nome della rosa", "stamp": "", "op": "set",
+         "set": {"series": "Oscar", "series_index": 3}, "updated_tag": "AIUpdated", "tag": "AIReviewed"},
+        {"src_id": 2, "title": "Il nome della rosa", "stamp": "", "op": "trash", "no_target": True},
         {"op": "tag", "src_ids": [3, 4], "tag": "AIReviewed"},
     ]
 
@@ -185,6 +187,7 @@ class FakeExtractor:
 
 REPLY = json.dumps({"title": "Dune", "authors": ["Frank Herbert"], "year": 1965, "series": "Dune",
                     "series_index": 1})
+DUNE_PAGES = "FRANK HERBERT\nDUNE\nIl ciclo di Dune 1\n1965"  # what REPLY reads, printed
 
 
 def test_reviewer_reads_once_then_uses_the_cache(tmp_path):
@@ -205,7 +208,7 @@ def test_asking_the_ai_again_skips_the_cache_and_rebuilds_the_row(tmp_path):
     assert old.changes == {}
     old.set_action(ReviewAction.TRASH)  # what the user did to the old row is not kept
     text = FakeProvider(REPLY)
-    reviewer = Reviewer(text, FakeExtractor(), cache)
+    reviewer = Reviewer(text, FakeExtractor(DUNE_PAGES), cache)
     seen = []
     [(was, new)] = ask_ai(reviewer, [old], on_item=lambda a, b: seen.append((a, b)))
     assert was is old and seen == [(old, new)] and len(text.calls) == 1
@@ -397,10 +400,10 @@ def test_books_tagged_reviewed_are_skipped_unless_asked(tmp_path):
     assert len(everything.items) == 2 and everything.skipped == 0
 
 
-def test_every_book_read_gets_the_tag_updated_or_not():
+def test_the_books_done_with_get_the_tag():
     updated = ReviewItem(book(), read(book(), meta(year=1981), "Umberto Eco IL NOME DELLA ROSA Bompiani 1981"))
     same = ReviewItem(book(id=2), meta())  # nothing to change
-    unchecked = ReviewItem(book(id=3), meta(year=1999))
+    unchecked = ReviewItem(book(id=3), meta(year=1999))  # left for later: untouched, shown again next time
     unchecked.selected = False
     unread = ReviewItem(book(id=4), None, "no readable file")  # retried by the next scan
     kept = ReviewItem(book(id=5), None, "AI error")
@@ -412,8 +415,22 @@ def test_every_book_read_gets_the_tag_updated_or_not():
     assert [(a.get("src_id"), a["op"], a.get("tag"), a.get("src_ids")) for a in actions] == [
         (1, "set", "AIReviewed", None),
         (6, "trash", None, None),
-        (None, "tag", "AIReviewed", [2, 3, 5]),
+        (None, "tag", "AIReviewed", [2, 5]),
     ]
+
+
+def test_a_book_to_review_is_written_but_not_tagged_until_decided():
+    pages = "UMBERTO ECO\nRomanzo\nBompiani\n1981"  # the year read is printed, "Altro" is not
+    it = ReviewItem(book(), read(book(), meta(title="Altro", year=1981), pages))
+    assert it.doubts == {"title": "the new value is not in the book's text"} and it.selected
+    assert it.review == "changes left out: title" and it.needs_review
+    [action] = review_actions([it], {"title", "year"})
+    assert action["set"] == {"year": 1981} and "tag" not in action  # the supported change only, no AIReviewed
+    it.selected = False
+    assert review_actions([it], {"title", "year"}) == []  # unticked: untouched, not tagged
+    it.reviewed = True  # right-click: Mark reviewed
+    assert not it.needs_review and review_actions([it], {"title", "year"}) == [
+        {"op": "tag", "src_ids": [1], "tag": "AIReviewed"}]
 
 
 def test_a_record_with_no_files_is_proposed_for_the_trash():
@@ -422,7 +439,7 @@ def test_a_record_with_no_files_is_proposed_for_the_trash():
     assert (empty.action, empty.selected) == (ReviewAction.TRASH, True)
     assert (missing.action, missing.selected) == (ReviewAction.KEEP, False)
     actions = review_actions([empty, missing], set(FIELDS))
-    assert actions == [{"src_id": 1, "title": "Il nome della rosa", "op": "trash", "no_target": True}]
+    assert actions == [{"src_id": 1, "title": "Il nome della rosa", "stamp": "", "op": "trash", "no_target": True}]
 
 
 def test_a_run_without_cache_is_written_as_csv(tmp_path):
@@ -473,14 +490,24 @@ def test_a_value_is_replaced_only_when_the_book_supports_it(calibre, found, why)
     assert it.doubts.get(name) == why and (name in it.excluded) == bool(why)
 
 
-def test_without_text_to_check_nothing_is_replaced_but_empty_fields_are_filled():
+def test_without_text_to_check_nothing_is_written():
     b = book(pub_year=1971, publisher=None)
     it = ReviewItem(b, meta(year=1980))  # e.g. a scanned book: no evidence
-    assert it.doubts == {"year": "not checked against the book"} and it.changes["publisher"] == "Bompiani"
-    assert it.to_write(FIELDS) == {"publisher": "Bompiani"} and it.selected
+    assert it.doubts == {"year": "not checked against the book", "publisher": "not checked against the book"}
+    assert it.to_write(FIELDS) == {} and not it.selected and it.action is ReviewAction.UPDATE
     changed = book(pub_year=1972)  # Calibre's value changed since the AI read the book
     assert ReviewItem(changed, read(b, meta(year=1980), PAGES)).doubts == {"year": "not checked against the book"}
 
+
+@pytest.mark.parametrize("found,why", [
+    (dict(publisher="Bompiani"), None),  # printed in the pages the AI read
+    (dict(publisher="Einaudi"), "the new value is not in the book's text"),
+])
+def test_an_empty_field_is_filled_only_with_a_value_printed_in_the_book(found, why):
+    b = book(publisher=None)
+    it = ReviewItem(b, read(b, meta(**found), PAGES))
+    assert set(it.changes) == {"publisher"} and it.doubts.get("publisher") == why
+    assert it.selected == (why is None)
 
 @pytest.mark.parametrize("authors", [["Heinlein, Bradbury, Amis"], ["F. Brown e altri"], ["Eco", "Rossi"]])
 def test_a_change_that_loses_an_author_is_left_out(authors):
@@ -526,7 +553,8 @@ def test_isbn_only_for_a_book_without_one_and_only_one_printed():
     assert "isbn" not in ReviewItem(b, two).changes  # two printed: the print and the e-book's, or another book's
     absent = read(b, meta(isbn=["9788804668237"]), PAGES)  # read, but not in the text
     assert "isbn" not in ReviewItem(b, absent).changes
-    assert ReviewItem(b, meta(isbn=["9788845207266"])).changes["isbn"] == "9788845207266"  # no text: as read
+    scanned = ReviewItem(b, meta(isbn=["9788845207266"]))  # no text to look in: as read, left out
+    assert scanned.changes["isbn"] == "9788845207266" and scanned.doubts["isbn"] == "not checked against the book"
 
 
 def test_the_language_is_the_texts_own():
@@ -536,7 +564,8 @@ def test_the_language_is_the_texts_own():
     assert it.changes["language"] == "ita" and "language" not in it.doubts
     it = ReviewItem(b, meta(language="ita"))  # no text to tell it: the AI's word alone
     assert it.doubts["language"] == "not told by the book's text"
-    assert ReviewItem(book(), meta(language="ita")).to_write(FIELDS)["language"] == "ita"  # empty: filled
+    assert ReviewItem(book(), read(book(), meta(language="ita"), italian)).to_write(FIELDS)["language"] == "ita"
+    assert ReviewItem(book(), meta(language="ita")).to_write(FIELDS) == {}  # empty, but nothing tells it
 
 
 def test_a_cover_the_ai_says_is_not_real_is_tagged_bad_cover():

@@ -26,6 +26,8 @@
 import importlib
 import sys
 import types
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +39,10 @@ def bridge(monkeypatch):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     sys.modules["calibre.db.copy_to_library"].copy_one_book = None
     sys.modules["calibre.library"].db = None
-    sys.modules["calibre.utils.date"].as_local_time = sys.modules["calibre.utils.date"].local_tz = None
+    date = sys.modules["calibre.utils.date"]
+    date.as_local_time = date.local_tz = None
+    date.as_utc = lambda d: d.astimezone(timezone.utc)
+    date.parse_date = lambda text, assume_utc=True, as_utc=True: datetime.fromisoformat(text).astimezone(timezone.utc)
     monkeypatch.delitem(sys.modules, "calibre_dedup.bridge_script", raising=False)
     return importlib.import_module("calibre_dedup.bridge_script")
 
@@ -75,17 +80,69 @@ class FieldsDB:
         self.fields.setdefault(name, {}).update(values)
 
 
-def test_swapped_title_and_author_are_written_only_if_unchanged(bridge):
-    swap = {"title": "Underwoods", "authors": ["Kingston"], "tag": "TitleAuthorSwapped",
-            "was_title": "Kingston", "was_authors": ["Underwoods"]}
-    db = FieldsDB(title="Kingston", authors=("Underwoods",), tags=("Novels",))
-    assert bridge.swap_title_author(db, 1, swap) == "; title and author swapped back, tagged TitleAuthorSwapped"
-    assert db.fields["title"][1] == "Underwoods" and db.fields["authors"][1] == ["Kingston"]
-    assert db.fields["tags"][1] == ("Novels", "TitleAuthorSwapped")
-    db = FieldsDB(title="Kingston", authors=("William Henry Giles Kingston",), tags=())  # fixed by hand meanwhile
-    assert "changed since the analysis" in bridge.swap_title_author(db, 1, swap)
-    assert db.fields["title"][1] == "Kingston" and db.fields["tags"][1] == ()
-    assert bridge.swap_title_author(db, 1, None) == ""
+def test_a_book_changed_since_the_analysis_is_told_by_its_last_modified(bridge):
+    db = FieldsDB(last_modified=datetime(2026, 10, 3, 9, 30, 15, tzinfo=timezone.utc))  # Calibre's API: no fractions
+    seen = "2026-10-03 09:30:15.123456+00:00"  # as metadata.db has it, read by the analysis
+    assert not bridge.changed_since(db, 1, seen)
+    assert not bridge.changed_since(db, 1, "")  # not known: not checked
+    assert bridge.changed_since(db, 1, "2026-10-03 09:30:14.999999+00:00")
+    assert bridge.stamp(db, 1) == "2026-10-03T09:30:15+00:00"
+    assert not bridge.changed_since(db, 1, bridge.stamp(db, 1))  # what the bridge returns, for the next Execute
+
+
+def test_one_library_is_one_folder_whatever_its_spelling(bridge, tmp_path):
+    assert bridge.same_folder(str(tmp_path / "Books"), str(tmp_path / "x" / ".." / "Books"))
+    assert not bridge.same_folder(str(tmp_path / "Books"), str(tmp_path / "Trash"))
+    assert not bridge.same_folder(str(tmp_path / "Books"), None)
+
+
+class FormatsDB:
+    """add_format as Calibre's: the file is copied in, unless the import plugins replace it."""
+
+    def __init__(self, folder, convert=False):
+        self.folder, self.convert, self.files, self.calls = folder, convert, {}, []
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def add_format(self, book_id, fmt, path, replace=True, run_hooks=True):
+        self.calls.append((fmt, replace, run_hooks))
+        if run_hooks and self.convert:
+            fmt = "ZIP"  # e.g. Calibre's "HTML to ZIP" plugin
+        dest = self.folder / f"book.{fmt.lower()}"
+        dest.write_bytes(Path(path).read_bytes())
+        self.files[fmt] = str(dest)
+
+    def format_abspath(self, book_id, fmt):
+        return self.files.get(fmt)
+
+    def formats(self, book_id):
+        return tuple(self.files)
+
+
+def test_a_format_is_added_as_it_is_and_checked(bridge, tmp_path):
+    page = tmp_path / "page.html"
+    page.write_bytes(b"<html>hello</html>")
+    db = FormatsDB(tmp_path / "lib", convert=True)
+    bridge.add_format(db, 1, "HTML", str(page))
+    assert db.calls == [("HTML", False, False)] and db.formats(1) == ("HTML",)  # no import plugin, no replacing
+
+    class Lost(FormatsDB):
+        def add_format(self, *a, **k):
+            pass  # Calibre did nothing
+    with pytest.raises(RuntimeError, match="HTML could not be added to book #1"):
+        bridge.add_format(Lost(tmp_path / "lost"), 1, "HTML", str(page))
+
+
+def test_merging_adds_only_the_formats_the_kept_copy_lacks(bridge, tmp_path):
+    src = FormatsDB(tmp_path / "source")
+    for fmt in ("EPUB", "MOBI"):
+        f = tmp_path / f"in.{fmt.lower()}"
+        f.write_bytes(fmt.encode())
+        src.add_format(1, fmt, str(f))
+    keep = FormatsDB(tmp_path / "kept")
+    keep.add_format(2, "EPUB", str(tmp_path / "in.epub"))
+    keep.calls.clear()
+    assert bridge.merge_formats(src, 1, keep, 2, ["EPUB", "MOBI"]) == ["MOBI"]
+    assert keep.calls == [("MOBI", False, False)]
 
 
 class BookDB(FieldsDB):

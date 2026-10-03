@@ -25,8 +25,10 @@
 Run as:  calibre-debug bridge_script.py plan.json
 
 Uses Calibre's library API (the same code as Calibre's "Copy to library"), so
-all metadata, covers, formats and custom columns are preserved. A book is only
-removed from the source after its copy has been verified.
+metadata, covers and formats are preserved; custom columns only where the library
+copied to has the same column (none is created). A book is only removed from the
+source after its copy has been verified. Files are added exactly as they are:
+Calibre's import plugins (which convert, e.g. an HTML file to a ZIP) are not run.
 
 Output: one line per action, prefixed with "@@CDR " and followed by JSON.
 Creating "<plan.json>.stop" stops execution before the next action.
@@ -44,7 +46,7 @@ from datetime import datetime
 
 from calibre.db.copy_to_library import copy_one_book
 from calibre.library import db as open_db
-from calibre.utils.date import as_local_time, local_tz
+from calibre.utils.date import as_local_time, as_utc, local_tz, parse_date
 
 
 def _load_archive_tool():
@@ -58,16 +60,31 @@ def _load_archive_tool():
 
 archive_tool = _load_archive_tool()
 
-UNKNOWN ={"", "unknown", "sconosciuto", "inconnu", "unbekannt", "desconocido", "desconhecido", "onbekend"}
-
 
 def emit(**kw):
     sys.stdout.write("@@CDR " + json.dumps(kw) + "\n")
     sys.stdout.flush()
 
 
-def is_unknown(value):
-    return value is None or str(value).strip().casefold() in UNKNOWN
+def same_folder(a, b):
+    return bool(a and b) and os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def stamp(db, book_id):
+    """The book's last_modified as text, for the next execution of the same list (see changed_since)."""
+    value = db.field_for("last_modified", book_id)
+    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+
+
+def changed_since(db, book_id, seen):
+    """Whether the book changed after the analysis read it (in Calibre, between Analyze and
+    Execute): Calibre changes last_modified with any change to the metadata, the cover or
+    the files. `seen` is the analysis' value; "" (not known): not checked. To the second:
+    Calibre's API gives no fractions (metadata.db has them)."""
+    if not seen:
+        return False
+    now = as_utc(db.field_for("last_modified", book_id)).replace(microsecond=0)
+    return now != parse_date(seen, assume_utc=True, as_utc=True).replace(microsecond=0)
 
 
 def copy_verified(src, book_id, dest):
@@ -101,7 +118,7 @@ def take_out(src, book_id, trash, action, tmp):
             have = set(src.formats(book_id))
             added = [fmt for fmt, file in files.items() if fmt not in have]
             for fmt in added:
-                src.add_format(book_id, fmt, files[fmt], replace=False)
+                add_format(src, book_id, fmt, files[fmt])
             notes.append(f"{u['format']} unpacked: added {', '.join(added) or 'nothing new'}")
     finally:
         for folder in folders:
@@ -113,6 +130,15 @@ def take_out(src, book_id, trash, action, tmp):
             raise RuntimeError(f"could not remove {', '.join(sorted(left))} from the source")
         notes.append(f"{', '.join(gone)} removed from source")
     return "; ".join(notes)
+
+
+def add_format(db, book_id, fmt, path):
+    """Add a file to a book exactly as it is (no import plugin runs: they convert), then
+    check it is there, whole."""
+    db.add_format(book_id, fmt, path, replace=False, run_hooks=False)
+    added = db.format_abspath(book_id, fmt)
+    if not added or not os.path.isfile(added) or os.path.getsize(added) != os.path.getsize(path):
+        raise RuntimeError(f"{fmt} could not be added to book #{book_id}")
 
 
 def extract_checked(db, book_id, u, folder):
@@ -165,48 +191,6 @@ def cleanup_empty_dirs(root, folders, attempts=3):
         if attempt + 1 < attempts:
             time.sleep(0.5 * (attempt + 1))
     return removed, len(deferred)
-
-
-def fill_metadata(db, book_id, values):
-    """Set AI-found values, only where the book's field is empty/unknown."""
-    changed = []
-    if values.get("title") and is_unknown(db.field_for("title", book_id)):
-        db.set_field("title", {book_id: values["title"]})
-        changed.append("title")
-    if values.get("authors") and all(is_unknown(a) for a in db.field_for("authors", book_id)):
-        db.set_field("authors", {book_id: values["authors"]})
-        changed.append("authors")
-    if values.get("publisher") and is_unknown(db.field_for("publisher", book_id)):
-        db.set_field("publisher", {book_id: values["publisher"]})
-        changed.append("publisher")
-    if values.get("year"):
-        pubdate = db.field_for("pubdate", book_id)
-        current_year = getattr(pubdate, "year", None)
-        if current_year is None or current_year < 1400:
-            db.set_field("pubdate", {book_id: datetime(int(values["year"]), 1, 1)})
-            changed.append("year")
-    if values.get("isbn"):
-        ids = dict(db.field_for("identifiers", book_id) or {})
-        if "isbn" not in ids:
-            ids["isbn"] = values["isbn"]
-            db.set_field("identifiers", {book_id: ids})
-            changed.append("isbn")
-    return changed
-
-
-def swap_title_author(db, book_id, swap):
-    """Put right a record whose title and author were swapped: overwrite both, then
-    tag the book. Only while both are still as the analysis saw them. Returns "; …"
-    for the result message."""
-    if not swap:
-        return ""
-    if (db.field_for("title", book_id) != swap["was_title"]
-            or list(db.field_for("authors", book_id)) != list(swap["was_authors"])):
-        return "; title/author not swapped back: changed since the analysis"
-    db.set_field("title", {book_id: swap["title"]})
-    db.set_field("authors", {book_id: swap["authors"]})
-    add_tag(db, [book_id], swap["tag"])
-    return f"; title and author swapped back, tagged {swap['tag']}"
 
 
 def set_metadata(db, book_id, values):
@@ -268,6 +252,17 @@ def add_tag(db, book_ids, tag):
         db.set_field("tags", values)
 
 
+def merge_formats(src, sid, db, keep, formats):
+    """Add the book's formats that `keep` (in `db`) lacks to it, exactly as they are."""
+    added = []
+    for fmt in formats or []:
+        path = src.format_abspath(sid, fmt)
+        if path and fmt not in db.formats(keep):
+            add_format(db, keep, fmt, path)
+            added.append(fmt)
+    return added
+
+
 def main(plan_path):
     with open(plan_path, encoding="utf-8") as f:
         plan = json.load(f)
@@ -276,12 +271,19 @@ def main(plan_path):
         if path:
             os.makedirs(path, exist_ok=True)
     src = open_db(plan["source"]).new_api
-    tgt = open_db(plan["target"]).new_api if plan.get("target") else None
+    tgt = None
+    if plan.get("target"):  # one library: one connection (two would not see each other's writes)
+        tgt = src if same_folder(plan["target"], plan["source"]) else open_db(plan["target"]).new_api
     trash = open_db(plan["trash"]).new_api if plan.get("trash") else None
     permanent = bool(plan.get("permanent"))
     moved = {}  # source id -> new id in target
     removed_folders = []  # source book folders, relative to the library
     stop_file = plan_path + ".stop"
+    touched = set()  # (library, book id) written by this run: their last_modified is its own
+
+    def unchanged(db, book_id, seen, what):
+        if (id(db), book_id) not in touched and changed_since(db, book_id, seen):
+            raise RuntimeError(f"{what} changed since the analysis (in Calibre?); analyze again")
 
     try:
         for action in plan["actions"]:
@@ -292,7 +294,8 @@ def main(plan_path):
                 try:
                     ids = [i for i in action["src_ids"] if i in src.all_book_ids()]
                     add_tag(src, ids, action["tag"])
-                    emit(event="tagged", src_ids=ids, tag=action["tag"], ok=True, msg=f"tagged {action['tag']}")
+                    emit(event="tagged", src_ids=ids, tag=action["tag"], ok=True, msg=f"tagged {action['tag']}",
+                         stamps={i: stamp(src, i) for i in ids})
                 except Exception as e:
                     emit(event="tagged", src_ids=action["src_ids"], tag=action["tag"], ok=False, msg=str(e),
                          trace=traceback.format_exc())
@@ -303,31 +306,22 @@ def main(plan_path):
                     raise RuntimeError("book is no longer in the source library")
                 if src.field_for("title", sid) != action["title"]:
                     raise RuntimeError("book changed since the analysis; re-run the analysis")
+                unchanged(src, sid, action.get("stamp"), "the book")
                 done = ""  # what was done before the action itself
                 if action.get("trash_formats") or action.get("unpack"):
+                    touched.add((id(src), sid))
                     done = take_out(src, sid, trash, action, plan.get("tmp") or tempfile.gettempdir()) + "; "
                 if action["op"] in ("trash_formats", "unpack"):  # nothing else to do for this book
                     formats = {fmt: src.format_abspath(sid, fmt) for fmt in src.formats(sid)}
-                    emit(event="result", src_id=sid, ok=True, msg=done[:-2], formats=formats)
+                    emit(event="result", src_id=sid, ok=True, msg=done[:-2], formats=formats, stamp=stamp(src, sid))
                     continue
 
                 if action["op"] == "move":
                     new_id = copy_verified(src, sid, tgt)
-                    changed = fill_metadata(tgt, new_id, action.get("set") or {})
                     moved[sid] = new_id
                     msg = f"moved to target (id {new_id})"
-                    if changed:
-                        msg += f"; filled {', '.join(changed)}" + tag_updated(tgt, new_id, changed, action)
-                    msg += swap_title_author(tgt, new_id, action.get("swap"))
-                elif action["op"] == "update":  # the book stays in the source
-                    changed = fill_metadata(src, sid, action.get("set") or {})
-                    msg = f"updated metadata in source"
-                    if changed:
-                        msg += f"; filled {', '.join(changed)}" + tag_updated(src, sid, changed, action)
-                    msg += swap_title_author(src, sid, action.get("swap"))
-                    emit(event="result", src_id=sid, ok=True, msg=done + msg)
-                    continue
                 elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes
+                    touched.add((id(src), sid))
                     changed, path, formats = set_metadata(src, sid, action["set"])
                     if action.get("tag"):  # only once the update is written
                         add_tag(src, [sid], action["tag"])
@@ -336,10 +330,11 @@ def main(plan_path):
                         tags.append(action["updated_tag"])
                     msg = f"updated {', '.join(changed) or 'nothing'}" + (f"; tagged {', '.join(tags)}"
                                                                           if tags else "")
-                    emit(event="result", src_id=sid, ok=True, msg=done + msg, path=path, formats=formats)
+                    emit(event="result", src_id=sid, ok=True, msg=done + msg, path=path, formats=formats,
+                         stamp=stamp(src, sid))
                     continue
                 elif action["op"] == "trash" and action.get("no_target"):
-                    # Forced by the user for a book with no copy in the target.
+                    # No copy elsewhere: unreadable, an empty record, or forced by the user.
                     new_id = copy_verified(src, sid, trash)
                     msg = f"moved to trash (id {new_id})" + ("; no copy in the target" if tgt is not None else "")
                 elif action["op"] == "trash" and action.get("keep_src_id"):
@@ -349,14 +344,11 @@ def main(plan_path):
                         db, keep = tgt, moved[kid]
                     elif kid in src.all_book_ids():
                         db, keep = src, kid
+                        unchanged(db, keep, action.get("keep_stamp"), f"the copy to keep (#{kid})")
                     else:
                         raise RuntimeError(f"the copy to keep (#{kid}) is no longer in the source")
-                    added = []
-                    for fmt in action.get("add_formats") or []:
-                        path = src.format_abspath(sid, fmt)
-                        if path and fmt not in db.formats(keep):
-                            db.add_format(keep, fmt, path, replace=False)
-                            added.append(fmt)
+                    touched.add((id(db), keep))
+                    added = merge_formats(src, sid, db, keep, action.get("add_formats"))
                     new_id = copy_verified(src, sid, trash)
                     msg = f"moved to trash (id {new_id}); copy #{kid} kept"
                     if added:
@@ -365,12 +357,10 @@ def main(plan_path):
                     tid = action.get("target_id") or moved.get(action.get("target_src_id"))
                     if tid is None or tid not in tgt.all_book_ids():
                         raise RuntimeError("the matching target book was not found")
-                    added = []
-                    for fmt in action.get("add_formats") or []:
-                        path = src.format_abspath(sid, fmt)
-                        if path and fmt not in tgt.formats(tid):
-                            tgt.add_format(tid, fmt, path, replace=False)
-                            added.append(fmt)
+                    if action.get("target_id"):
+                        unchanged(tgt, tid, action.get("target_stamp"), f"the target book #{tid}")
+                    touched.add((id(tgt), tid))
+                    added = merge_formats(src, sid, tgt, tid, action.get("add_formats"))
                     new_id = copy_verified(src, sid, trash)
                     msg = f"moved to trash (id {new_id})"
                     if added:
@@ -391,9 +381,8 @@ def main(plan_path):
             except Exception as e:
                 emit(event="result", src_id=sid, ok=False, msg=str(e), trace=traceback.format_exc())
     finally:
-        for db in (src, tgt, trash):
-            if db is not None:
-                db.close()
+        for db in {id(db): db for db in (src, tgt, trash) if db is not None}.values():
+            db.close()
     emit(event="cleanup_start")
     removed, deferred = cleanup_empty_dirs(plan["source"], removed_folders)
     emit(event="cleanup", removed=removed, deferred=deferred)
