@@ -160,7 +160,7 @@ class ReviewModel(QAbstractTableModel):
         if self.locked:
             return
         for it in items:
-            if it.checkable:
+            if it.checkable_for(self.fields_on):
                 it.selected = (not it.selected) if value is None else value
                 it.reviewed = True
         self.refresh()
@@ -179,7 +179,7 @@ class ReviewModel(QAbstractTableModel):
 
     def flags(self, index):
         f = super().flags(index)
-        if index.column() == self.COL_CHECK and not self.locked and self.items[index.row()].checkable:
+        if index.column() == self.COL_CHECK and not self.locked and self.items[index.row()].checkable_for(self.fields_on):
             f |= Qt.ItemIsUserCheckable
         return f
 
@@ -205,9 +205,12 @@ class ReviewModel(QAbstractTableModel):
         if col == self.COL_ID:
             return str(it.book.id)
         if col == self.COL_ACTION:
-            label = ACTION_LABELS[it.action]
-            if it.action is ReviewAction.UPDATE and not it.to_write(self.fields_on):
-                label += " (nothing to write)"
+            shown = it.shown_action(self.fields_on)
+            label = ACTION_LABELS[shown]
+            if shown is ReviewAction.KEEP and it.changes and not it.manual:
+                label += " (nothing to write)"  # its changes are left out, or in fields turned off
+            elif it.action is ReviewAction.UPDATE and not it.to_write(self.fields_on):
+                label += " (nothing to write)"  # Update chosen by the user
             label += " (manual)" if it.manual else ""
             if it.bad_formats and not it.broken and not (it.selected and it.action is ReviewAction.TRASH):
                 going = it.bad_formats_to_trash
@@ -240,7 +243,7 @@ class ReviewModel(QAbstractTableModel):
             return self.text(it, col) or None
         if role == CELL_ROLE and col in self.FIELD_COLS:
             return self.cell(it, self.FIELD_COLS[col])
-        if role == Qt.CheckStateRole and col == self.COL_CHECK and it.checkable:
+        if role == Qt.CheckStateRole and col == self.COL_CHECK and it.checkable_for(self.fields_on):
             return Qt.Checked if it.selected else Qt.Unchecked
         if role == Qt.FontRole and it.manual and col == self.COL_ACTION:
             return self.italic_font
@@ -248,7 +251,8 @@ class ReviewModel(QAbstractTableModel):
             return int(Qt.AlignLeft | Qt.AlignTop)
         if role == Qt.ForegroundRole:
             if col == self.COL_ACTION:
-                return QColor("#e65100" if it.needs_review_for(self.fields_on) else ACTION_COLORS[it.action])
+                return QColor("#e65100" if it.needs_review_for(self.fields_on)
+                              else ACTION_COLORS[it.shown_action(self.fields_on)])
             if col == self.COL_RESULT and it.status.startswith("FAILED"):
                 return QColor("#c62828")
             if col == self.COL_READ and it.found is None:
@@ -258,7 +262,7 @@ class ReviewModel(QAbstractTableModel):
     # --- sorting (in Python, see main_window.PlanModel) ----------------------------
     def sort_key(self, it: ReviewItem, col: int):
         if col == self.COL_CHECK:
-            return (2 if it.selected else 1) if it.checkable else 0
+            return (2 if it.selected else 1) if it.checkable_for(self.fields_on) else 0
         if col == self.COL_ID:
             return it.book.id
         return strip_accents(self.text(it, col)).casefold()
@@ -322,8 +326,8 @@ def book_kinds(it: ReviewItem) -> set[str]:
     return kinds or {"other"}
 
 
-def is_checked(it: ReviewItem) -> bool:
-    return it.selected and it.checkable
+def is_checked(it: ReviewItem, fields_on: set[str] | list[str] = FIELDS) -> bool:
+    return it.selected and it.checkable_for(fields_on)
 
 
 class ReviewFilter(QSortFilterProxyModel):
@@ -347,11 +351,11 @@ class ReviewFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent):
         model: ReviewModel = self.sourceModel()
         it = model.items[row]
-        if self.actions and it.action.value not in self.actions:
+        if self.actions and it.shown_action(self.sourceModel().fields_on).value not in self.actions:
             return False
         if self.kinds and not (self.kinds & book_kinds(it)):
             return False
-        if self.states and not (self.states & status_keys(is_checked(it), it.status,
+        if self.states and not (self.states & status_keys(is_checked(it, model.fields_on), it.status,
                                                           it.needs_review_for(model.fields_on))):
             return False
         if self.terms:
@@ -685,14 +689,14 @@ class ReviewWindow(QMainWindow):
         items = lambda: self.model.items  # noqa: E731
         self.action_filter = FilterButton(
             "Actions", "Actions: show the books with any of the actions ticked here. Nothing ticked: all books.",
-            ACTION_ENTRIES, lambda: Counter(it.action.value for it in items()))
+            ACTION_ENTRIES, lambda: Counter(it.shown_action(self.fields_on).value for it in items()))
         self.book_filter = FilterButton(
             "Books", "Books: show the kinds of book ticked here (any of them). Nothing ticked: all books.\n"
                      "A book can be of several kinds: it is shown if any of them is ticked.",
             BOOK_ENTRIES, lambda: Counter(k for it in items() for k in book_kinds(it)), default=DEFAULT_BOOKS)
         self.status_filter = FilterButton(
             "Status", STATUS_TIP, STATUS_ENTRIES,
-            lambda: Counter(k for it in items() for k in status_keys(is_checked(it), it.status,
+            lambda: Counter(k for it in items() for k in status_keys(is_checked(it, self.fields_on), it.status,
                                                                      it.needs_review_for(self.fields_on))))
         self.action_filter.changed.connect(lambda: self.proxy.update(actions=self.action_filter.selected()))
         self.book_filter.changed.connect(lambda: self.proxy.update(kinds=self.book_filter.selected()))
@@ -974,14 +978,14 @@ class ReviewWindow(QMainWindow):
     def _header_clicked(self, section: int):
         if section != ReviewModel.COL_CHECK or not self._can_edit():
             return
-        items = [it for it in self.model.items if it.checkable]
+        items = [it for it in self.model.items if it.checkable_for(self.fields_on)]
         if items:
             self.model.set_checked(items, not all(it.selected for it in items))
 
     def _toggle_selected_rows(self):
         if not self._can_edit():
             return
-        items = [i for i in self._selected_items() if i.checkable]
+        items = [i for i in self._selected_items() if i.checkable_for(self.fields_on)]
         if items:
             self.model.set_checked(items, not all(i.selected for i in items))
 

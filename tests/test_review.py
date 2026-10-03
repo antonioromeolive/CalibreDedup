@@ -624,3 +624,16 @@ def test_an_authors_name_is_not_a_publisher():
     b = book(publisher=None, authors=["La Contessa Di Ascot"])
     it = ReviewItem(b, read(b, meta(publisher="Edgar Fallace", authors=["Edgar Wallace"]), "EDGAR FALLACE"))
     assert it.doubts["publisher"] == "an author's name, not a publisher"  # one letter from the author's name
+
+
+def test_an_update_with_nothing_to_write_is_shown_as_keep():
+    from calibre_dedup.review import ReviewAction
+    b = book(publisher=None)
+    it = ReviewItem(b, read(b, meta(title="Il nome della rosa", publisher="Einaudi"), PAGES))
+    assert it.action is ReviewAction.UPDATE and "publisher" in it.excluded  # left out: not in the pages
+    assert it.shown_action() is ReviewAction.KEEP and not it.checkable and not it.selected
+    it.excluded.discard("publisher")  # right-click: Change publisher again
+    assert it.shown_action() is ReviewAction.UPDATE and it.checkable
+    assert it.shown_action({"title"}) is ReviewAction.KEEP  # the publisher field turned off
+    it.set_action(ReviewAction.UPDATE)  # chosen by the user: shown as such
+    assert it.shown_action({"title"}) is ReviewAction.UPDATE

@@ -75,7 +75,9 @@ def test_status_keys():
 
 def test_review_lists_combine_any_within_and_all_between(app):
     w = review.ReviewWindow(Settings(), dedup.QtLogHandler())
-    changed = ReviewItem(book(1), ReviewMetadata(title="Other", authors=["A"]))  # Update, ticked
+    changed = ReviewItem(book(1), ReviewMetadata(title="Other", authors=["A"]))
+    changed.excluded.clear()  # a change the book supports: Update, ticked
+    changed.selected = True
     unread = ReviewItem(book(2), None, "no text")
     same = ReviewItem(book(3), ReviewMetadata(title="T3", authors=["A"]))  # nothing to change: "other"
     generic = ReviewItem(book(4), ReviewMetadata(title="T4", authors=["A"]), generic_cover=34)

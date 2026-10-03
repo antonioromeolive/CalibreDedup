@@ -132,7 +132,18 @@ class ReviewItem:
     @property
     def checkable(self) -> bool:
         """Whether the row can be ticked: something to write or trash, or a cleanup."""
-        return self.action is not ReviewAction.KEEP or self.cleanup
+        return self.checkable_for(FIELDS)
+
+    def shown_action(self, fields_on: set[str] | list[str] = FIELDS) -> ReviewAction:
+        """The action as the list shows it: an Update with nothing to write (every change
+        left out, or in a field turned off) is a Keep, unless the user chose Update."""
+        if self.action is ReviewAction.UPDATE and not self.manual and not self.to_write(fields_on):
+            return ReviewAction.KEEP
+        return self.action
+
+    def checkable_for(self, fields_on: set[str] | list[str] = FIELDS) -> bool:
+        """checkable, with these fields on."""
+        return self.shown_action(fields_on) is not ReviewAction.KEEP or self.cleanup
 
     def review_for(self, fields_on: set[str] | list[str] = FIELDS) -> str:
         """What the user should check: changes left out (not supported by the book) of the
