@@ -35,8 +35,9 @@ If that still can't decide, the covers do (see _by_covers): with no edition data
 to compare, two books are the same unless their covers differ; the same cover is
 proof, unless it is a generic cover (the same image on books of different titles,
 see covers.py). Without the AI, identical files prove the same book whatever the
-metadata, and identical EPUB text proves it before any AI call (copies that differ
-only in metadata or cover). A copy whose text is in another language is another book.
+metadata, and the same text (same_text.py: the same book converted twice, in
+any format) proves it before any AI call, and again for a pair still undecided at the
+end. A copy whose text is in another language is another book.
 A duplicate that isn't proven (no edition data, decided by the covers, authors matched
 only by the AI or the surname) starts unticked, for the user to check (PlanItem.review).
 """
@@ -45,13 +46,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
 import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -60,19 +59,20 @@ from .archives import ask_once, prepare as unpack_archives
 from .ai import (
     AICache, AIError, AIMetadata, Provider, ask_fitting, compare_authors, compare_covers, extract_metadata,
 )
-from .covers import GENERIC_COVER_BOOKS, generic_covers, generic_note
-from .extract import (CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, epub_text_digest, openable_elsewhere,
-                      unreadable_formats)
+from .covers import GENERIC_COVER_BOOKS, PAGE_NOTE, generic_covers, generic_note, page_cover
+from .extract import CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, openable_elsewhere, unreadable_formats
 from .language import language_name
-from .library_cache import FileChecks, FileHashes, TextFacts
+from .library_cache import FileChecks, FileHashes, TextFacts, TextPrints
 from .library import read_books, tag_filter_text, tag_selects
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
+from .pause import Pause, wait_if_paused
 from .normalize import (
     MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, initials_match, is_unknown,
     looks_like_file_name, looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number,
     related_titles, series_key, similar_authors_keys, surname_match, title_key, title_variants,
 )
+from .same_text import SAME_TEXT, percent, share
 from .selection import action_label, has_cleanup
 
 log = logging.getLogger(__name__)
@@ -267,6 +267,8 @@ class AIResolver:
         for book, path in ((a, pa), (b, pb)):
             if str(path) in self.generic:
                 return False, f"{generic_note(self.generic[str(path)])} on {book.label()}: not proof", False
+            if page_cover(path):
+                return False, f"{PAGE_NOTE} on {book.label()}: not proof", False
         if _identical(pa, pb):
             self.stats["cover_identical"] += 1
             return True, "identical cover files", False
@@ -644,6 +646,7 @@ class _Context:
     generic: dict[str, int] = field(default_factory=dict)  # generic covers (covers.py): never proof
     files: _FileIndex | None = None
     texts: TextFacts | None = None  # language and length of the books' text; None: not read
+    prints: TextPrints | None = None  # fingerprints of the books' text (same_text.py)
     # Books that stay as they are (the target's) whose title is a file name, by author key:
     # one may be any book by that author, which is then not moved (see _plan_one).
     named: dict[tuple, list[_Candidate]] = field(default_factory=dict)
@@ -672,29 +675,30 @@ def _unreachable(paths: list[Path]) -> str:
     return ""
 
 
-def _same_text(sb: Book, ident: Identity, candidates: list[_Candidate]) -> Decision | None:
-    """A candidate that metadata can't tell apart and whose EPUB has the same text."""
-    mine = _epub_digest(sb)
-    if not mine:
+def _text_share(ctx: _Context, a: Book, b: Book) -> float | None:
+    """How much of the two books' text is the same (same_text.share), each read in its
+    one compared format; None when either has no text to compare."""
+    if ctx.prints is None:
         return None
+    mine = ctx.prints.get(a)
+    theirs = ctx.prints.get(b) if mine else None
+    return share(mine, theirs) if theirs else None
+
+
+def _same_text(ctx: _Context, sb: Book, ident: Identity, candidates: list[_Candidate],
+               undecided_only: bool = True) -> Decision | None:
+    """A candidate with the same text (SAME_TEXT): the same book, whatever the files,
+    formats and metadata. `undecided_only`: only those the metadata can't tell apart."""
     for i, c in enumerate(candidates):
-        if compare(ident, c.identity).verdict is Verdict.UNKNOWN and _epub_digest(c.book) == mine:
-            return Decision(Verdict.DUPLICATE, "identical EPUB text", i)
+        if undecided_only and compare(ident, c.identity).verdict is not Verdict.UNKNOWN:
+            continue
+        found = _text_share(ctx, sb, c.book)
+        if found is None and ctx.prints is not None and ctx.prints.get(sb) is None:
+            return None  # no text of its own to compare: no need to read the others
+        if found is not None and found >= SAME_TEXT:
+            ctx.stats["same_text"] += 1
+            return Decision(Verdict.DUPLICATE, f"same text ({percent(found)})", i)
     return None
-
-
-def _epub_digest(book: Book) -> str | None:
-    path = book.formats.get("EPUB")
-    try:
-        st = os.stat(path) if path else None
-    except OSError:
-        return None
-    return _digest(path, st.st_mtime_ns, st.st_size) if st else None
-
-
-@lru_cache(maxsize=4096)
-def _digest(path: str, mtime_ns: int, size: int) -> str | None:  # keyed on mtime/size: files change
-    return epub_text_digest(path)
 
 
 def _cover_path(book: Book) -> Path:
@@ -710,10 +714,10 @@ def _identical(a: Path, b: Path) -> bool:
 
 def _covers(ctx: _Context, a: Book, b: Book) -> tuple[str, str, bool, str]:
     """What the two books' covers say: SAME (identical files, which needs no AI, or the
-    same per the Image AI), DIFFERENT, UNCLEAR (a cover missing, a generic one, an image
-    that can't be read, or the AI unsure: the books' own doing) or SKIPPED (the check
-    can't run here: cover check off, no Image AI, the AI down). Returns (verdict, note,
-    model called, the check to report as skipped (PlanItem.skipped) or "")."""
+    same per the Image AI), DIFFERENT, UNCLEAR (a cover missing, a generic one, a page used
+    as cover, an image that can't be read, or the AI unsure: the books' own doing) or
+    SKIPPED (the check can't run here: cover check off, no Image AI, the AI down). Returns
+    (verdict, note, model called, the check to report as skipped (PlanItem.skipped) or "")."""
     if not (ctx.cover_check or ctx.always_cover):
         return SKIPPED, "", False, ""
     pa, pb = _cover_path(a), _cover_path(b)
@@ -733,6 +737,9 @@ def _covers(ctx: _Context, a: Book, b: Book) -> tuple[str, str, bool, str]:
     if generic:
         book, path = generic[0]
         return UNCLEAR, f"{generic_note(ctx.generic[str(path)])} on {book.label()!r}: not a real cover", False, ""
+    page = next((book for book, path in present if page_cover(path)), None)
+    if page is not None:  # the same page in both (identical files) is still proof: see above
+        return UNCLEAR, f"{PAGE_NOTE} on {page.label()!r}: not a real cover", False, ""
     verdict, note, called = resolver.ai_cover_verdict(a, b)
     return verdict, note, called, SKIP_IMAGE_AI if verdict == SKIPPED and resolver.image_disabled_reason else ""
 
@@ -799,6 +806,10 @@ def build_plan(
     unpack: Callable[[int], bool] | None = None,
     generic_check: bool = True,
     library_cache: Path | None = None,
+    pause: Pause | None = None,
+    only: set[int] | None = None,
+    moving: set[int] = frozenset(),
+    leaving: set[int] = frozenset(),
 ) -> Plan:
     """`on_item` is called with each book as soon as it is decided.
     Books with formats Calibre can't open (PlanItem.bad_formats) are always flagged;
@@ -821,7 +832,11 @@ def build_plan(
     never proof; off (for tests on a big library), any cover can be. `library_cache`:
     where what is found in the books' files (covers, unreadable formats, hashes, the
     language and length of the text) is kept for the next time (see library_cache);
-    None: not kept.
+    None: not kept. `pause`: the user may pause the run between two books (see pause.py).
+    `only`: the ids of the only source books to decide (the AI asked again about some books of
+    a plan: see redecide_ids); the tag filter is then not used. The other source books are
+    matched against as the plan shown decided them: `moving` (two libraries), those it moves,
+    as books this run moves; `leaving` (one library), those it trashes, never kept.
     `tag`: only the source books with this tag (with `tag_exclude`, without it) get an
     item; the others are still matched against (in one library, as copies that stay:
     see _keep_chosen). The target is always read whole.
@@ -832,7 +847,12 @@ def build_plan(
     tag = tag.strip()
     tag_exclude = tag_exclude and bool(tag)
     source_books = read_books(source)
-    chosen = [b for b in source_books if tag_selects(b, tag, tag_exclude)]
+    if only is not None:
+        tag, tag_exclude = "", False
+        chosen = [b for b in source_books if b.id in only]
+    else:
+        chosen = [b for b in source_books if tag_selects(b, tag, tag_exclude)]
+    chosen_ids = {b.id for b in chosen}
     unpack = ask_once(chosen, unpack) if resolver is not None else None
     same_library = str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
     target_books = read_books(target) if Path(target, "metadata.db").is_file() else []
@@ -847,6 +867,8 @@ def build_plan(
     # The books' text is read (for its language and length) only by the AI's extractor:
     # with the AI off, the analysis reads the metadata only.
     texts = TextFacts(library_cache, extractor) if hasattr(extractor, "text_profile") else None
+    # Without the AI's extractor, only EPUB and TXT texts are compared.
+    prints = TextPrints(library_cache, extractor if hasattr(extractor, "whole_text") else None)
     generic: dict[str, int] = {}
     if cover_check or always_cover:
         if generic_check:
@@ -901,6 +923,10 @@ def build_plan(
                 continue  # an empty record (no file) is no copy of a book
             tb = put_right(tb) or tb
             add_staying(_Candidate(tb, metadata_identity(tb, same_series), planned=False))
+        for mb in source_books:  # books the plan shown moves: copies in the target by then
+            if mb.id in moving and mb.id not in chosen_ids and mb.formats:
+                mb = put_right(mb) or mb
+                add_staying(_Candidate(mb, metadata_identity(mb, same_series), planned=True))
 
     total = len(chosen)
     cleanup = cleanup_only and not same_library
@@ -921,11 +947,11 @@ def build_plan(
     # One library, with a tag filter: the books it leaves out are copies that stay, matched
     # as they are (no AI reads them unless a chosen book needs it). candidate book -> record
     others: dict[int, tuple[_Candidate, Book]] = {}
-    if same_library and tag:
+    if same_library and (tag or only is not None):
         for ob in source_books:
             bad = {f: "" for f in ob.formats if f not in CALIBRE_INPUT_FORMATS}  # not opened: never analyzed
-            if tag_selects(ob, tag, tag_exclude) or not ob.formats or (bad and set(bad) >= set(ob.formats)):
-                continue  # an unreadable or empty book is no copy to keep
+            if ob.id in chosen_ids or ob.id in leaving or not ob.formats or (bad and set(bad) >= set(ob.formats)):
+                continue  # an unreadable or empty book is no copy to keep, nor one being trashed
             book = replace(ob, formats={f: p for f, p in ob.formats.items() if f not in bad}) if bad else ob
             book = put_right(book) or book
             c = _Candidate(book, metadata_identity(book, same_series), planned=False)
@@ -943,10 +969,11 @@ def build_plan(
     ctx = _Context(index, resolver, stats, ignore_subtitle=ignore_subtitle, same_library=same_library,
                    similar_matching=similar_matching, cover_check=cover_check, recheck_years=recheck_years,
                    same_series=same_series, always_cover=always_cover, similar=similar, by_title=by_title,
-                   persons=swaps, generic=generic, files=files, texts=texts, named=named)
+                   persons=swaps, generic=generic, files=files, texts=texts, prints=prints, named=named)
 
     perf.run_start("dedup", total, getattr(resolver, "provider", None), getattr(resolver, "vision", None))
     for n, sb in enumerate(analysis_books, 1):
+        wait_if_paused(pause, cancel)
         if cancel is not None and cancel.is_set():
             plan.stopped = True  # keep what was analyzed so far
             break
@@ -1012,7 +1039,8 @@ def build_plan(
         if item.action is Action.TRASH and item.match is not None and id(item.match) in others:
             c, record = others[id(item.match)]
             if keep_rank(sb) > keep_rank(record):
-                item = _keep_chosen(item, c, f"the other is {tag_filter_text(tag, not tag_exclude)}")
+                item = _keep_chosen(item, c, "the AI was not asked again about the other" if only is not None
+                                    else f"the other is {tag_filter_text(tag, not tag_exclude)}")
         elif item.action is Action.TRASH and item.match is not None and id(item.match) in records:
             c, record = records[id(item.match)]
             if keep_rank(sb) > keep_rank(record):  # its files, opened in its turn, made it worse
@@ -1049,6 +1077,7 @@ def build_plan(
     hashes.save()
     if texts is not None:
         texts.save()
+    prints.save()
     if resolver:
         resolver.cache.save()
         stats.update(resolver.stats)
@@ -1094,6 +1123,8 @@ def run_summary(plan: Plan) -> tuple[str, list[str]]:
         parts.append(f"{s['swapped']} books with title and author swapped")
     if s.get("identical_files"):
         parts.append(f"{s['identical_files']} duplicates by identical files")
+    if s.get("same_text"):
+        parts.append(f"{s['same_text']} duplicates by the same text")
     if s.get("no_edition"):
         parts.append(f"{s['no_edition']} duplicates without edition data (covers not different)")
     if s.get("held"):
@@ -1154,6 +1185,18 @@ def _review_files(item: PlanItem, trash_unreadable: bool) -> None:
     for u in item.archives:
         if u.doubt:
             _to_review(item, u.note, untick=False)
+
+
+def redecide_ids(plan: Plan, ids: set[int]) -> set[int]:
+    """The source books to decide again with these: those whose decision rests on one of
+    them (a duplicate of a book moved, or kept, by the plan), and so on."""
+    group = set(ids)
+    while True:
+        more = {it.source.id for it in plan.items if it.source.id not in group and it.match is not None
+                and (it.match_planned or it.match_in_source or plan.same_library) and it.match.id in group}
+        if not more:
+            return group
+        group |= more
 
 
 def _empty_item(sb: Book, same_series: bool) -> PlanItem:
@@ -1351,7 +1394,7 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
         nonlocal ident, ai_used, rechecked
         decision = decide(ident, [c.identity for c in cands])
         if decision.verdict is Verdict.UNKNOWN:
-            same = _same_text(sb, ident, cands)
+            same = _same_text(ctx, sb, ident, cands)
             if same is not None:
                 return _Outcome(same, content=True)
         if decision.verdict is Verdict.UNKNOWN and resolver:
@@ -1422,6 +1465,10 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
                   else f"different from target copies: {decision.reason}")
         return _logged(PlanItem(sb, action, _join(reason, notes), ident, match=candidates[0].book,
                                 match_planned=candidates[0].planned, different=True, ai_used=ai_used))
+    # Still undecided: the same text makes the same book, whatever else differs.
+    same = _same_text(ctx, sb, ident, candidates, undecided_only=False)
+    if same is not None:
+        return _duplicate_item(sb, ident, candidates[same.match_index], same.reason, notes, ai_used)
     return _logged(PlanItem(
         sb, Action.LEAVE,
         _join(f"same title/authors as {candidates[0].book.label()!r} but {decision.reason}", notes),
@@ -1579,18 +1626,19 @@ def _decide_similar(sb: Book, ident: Identity, similar: list[tuple[_Candidate, s
     """Books by the same author whose title contains this one's (or the other way
     round): "(Gutenberg - 0411- Brother Jacob - George Eliot)" and "Brother Jacob".
     Titles alike are weaker than the same title, so only proof makes a duplicate:
-    the same ISBN, ASIN or series number, identical EPUB text, or the same cover.
+    the same ISBN, ASIN or series number, the same text, or the same cover.
     A real difference in metadata (not only the year), a different cover or a text in
     another language rules a book out, unless "always compare covers" finds the same
     cover (inside the files too). Anything else is left for the user to check."""
     unproven: list[tuple[_Candidate, str]] = []
-    mine = _epub_digest(sb)
     for c, how in similar:
         comp = compare(ident, c.identity)
         proof = comp.reason if comp.proof else ""
-        same_text = not proof and bool(mine) and _epub_digest(c.book) == mine
+        found = None if proof else _text_share(ctx, sb, c.book)
+        same_text = found is not None and found >= SAME_TEXT
         if same_text:
-            proof = "identical EPUB text"
+            proof = f"same text ({percent(found)})"
+            ctx.stats["same_text"] += 1
         if not proof and comp.verdict is Verdict.DISTINCT and not comp.year_only and not ctx.always_cover:
             notes.append(f"similar title {c.book.label()!r} is another book: {comp.reason}")
             continue

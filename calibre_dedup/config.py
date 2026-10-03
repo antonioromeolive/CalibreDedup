@@ -118,6 +118,8 @@ class Settings:
     ])
     text_profile: str = "Ollama (local)"  # reads book text for missing metadata; "" = AI off
     image_profile: str = ""  # reads text and images (covers, scanned PDFs); "" = none
+    # The Judge AI, asked on demand about some books (right-click): a stronger model; "" = none
+    judge_profile: str = ""
     pdf_pages: int = 6  # pages read from the start/end of a PDF
     text_chars: int = 12000  # characters read from the start/end of other formats
     ignore_subtitle: bool = False
@@ -179,6 +181,9 @@ class Settings:
         if self.image_profile and self.image_profile not in names:
             log.info("Image AI %r no longer exists", self.image_profile)
             self.image_profile = ""
+        if self.judge_profile and self.judge_profile not in names:
+            log.info("Judge AI %r no longer exists", self.judge_profile)
+            self.judge_profile = ""
 
     # --- persistence -------------------------------------------------------
     @classmethod

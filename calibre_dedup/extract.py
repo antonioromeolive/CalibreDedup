@@ -33,7 +33,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -59,8 +58,11 @@ ARCHIVE_TOOL = Path(archive_tool.__file__)
 EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
 # Preferred formats for extraction, best first.
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
+# The one format of a book whose whole text is compared with another book's (same_text.py), best first:
+# then the other FORMAT_PRIORITY formats, then any other Calibre reads (archives and comics never).
+SAME_TEXT_FORMATS = ["EPUB", "KEPUB", "MOBI", "AZW3", "AZW", "PDF"]
+NO_TEXT_FORMATS = {"ZIP", "RAR", "7Z", "CB7", "CBC", "CBR", "CBZ", "DJV", "DJVU"}
 MIN_TEXT = 200  # below this a PDF is considered scanned (image only)
-MIN_EPUB_TEXT = 2000  # below this an EPUB is taken as images only (no text fingerprint)
 SAMPLE_CHARS = 20000  # text read from the middle of a book, for its language
 PDF_SAMPLE_PAGES = 3  # pages read from the middle of a PDF, for its language and length
 
@@ -200,6 +202,15 @@ class TextExtractor:
             if Path(path).is_file():  # not a file (or drive) that went away meanwhile
                 self.failed[path] = f"Calibre can't read the {fmt} file ({_error_line(str(e))})"
             return Excerpt(source=f"{fmt} extraction failed: {e}")
+
+    def whole_text(self, fmt: str, path: str) -> str:
+        """The whole text of one file (see whole_text). Raises when it can't be read."""
+        if fmt == "PDF":
+            return _clean(self._run("pdftotext", ["-enc", "UTF-8", path, "-"], timeout=600)
+                          .decode("utf-8", "replace"))
+        if fmt in ("EPUB", "KEPUB", "TXT"):
+            return whole_text(fmt, path)
+        return self._convert(path)
 
     def failed_formats(self, formats: dict[str, str]) -> dict[str, str]:
         """The book's formats whose text could not be read so far, with why."""
@@ -365,6 +376,26 @@ class TextExtractor:
         return proc.stdout
 
 
+def same_text_format(formats: dict[str, str]) -> tuple[str, str] | None:
+    """The one format of a book compared for the same text (SAME_TEXT_FORMATS): (format, path)."""
+    order = SAME_TEXT_FORMATS + [f for f in FORMAT_PRIORITY if f not in SAME_TEXT_FORMATS]
+    others = sorted(f for f in formats if f not in order and f in CALIBRE_INPUT_FORMATS)
+    for fmt in order + others:
+        path = formats.get(fmt)
+        if path and fmt not in NO_TEXT_FORMATS and Path(path).is_file():
+            return fmt, path
+    return None
+
+
+def whole_text(fmt: str, path: str) -> str | None:
+    """The whole text of a file read without Calibre's tools (EPUB, TXT), else None."""
+    if fmt in ("EPUB", "KEPUB"):
+        return _epub_text(path, "start", 1 << 62)
+    if fmt == "TXT":
+        return _clean(Path(path).read_text(encoding="utf-8", errors="replace"))
+    return None
+
+
 def _error_line(error: str) -> str:
     """The telling line of a tool's error: its last non-empty line (tracebacks end there)."""
     lines = [line.strip() for line in error.splitlines() if line.strip()]
@@ -499,29 +530,6 @@ def _epub_cover(path: str) -> bytes | None:
             return None
         name = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path), unquote(cover.get("href", ""))))
         return z.read(name) if name in z.namelist() else None
-
-
-def epub_text_digest(path: str) -> str | None:
-    """SHA-1 of an EPUB's (X)HTML documents, by name: the same for copies of one
-    file whose metadata or cover alone were changed. None if unreadable, or if
-    the book is mostly images (comics, scans): their pages are just <img> tags,
-    which can be identical in two different volumes."""
-    try:
-        with zipfile.ZipFile(path) as z:
-            names = sorted(n for n in z.namelist() if n.lower().endswith((".html", ".xhtml", ".htm")))
-            h = hashlib.sha1()
-            text_chars = 0
-            for name in names:
-                data = z.read(name)
-                h.update(name.encode() + b"\0" + data + b"\0")
-                text_chars += _visible_chars(data)
-    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError) as e:
-        log.debug("Cannot hash %s: %s", path, e)
-        return None
-    if text_chars < MIN_EPUB_TEXT:
-        log.debug("Not hashing %s: only %d characters of text", path, text_chars)
-        return None
-    return h.hexdigest()
 
 
 _NOT_TEXT = re.compile(rb"<(head|style|script)\b.*?</\1\s*>|<[^>]*>|&[#\w]+;|\s+", re.S | re.I)

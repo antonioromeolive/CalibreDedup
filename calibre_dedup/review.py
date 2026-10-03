@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import logging
 import re
 import shutil
@@ -49,14 +50,15 @@ from .executor import AI_UPDATED_TAG, ExecutionError, run_bridge
 from .journal import Journal
 from .calibre_env import calibre_is_running
 from .config import config_dir
-from .covers import BAD_COVER_TAG, cover_file, generic_covers, generic_note
+from .covers import BAD_COVER_TAG, PAGE_NOTE, cover_file, generic_covers, generic_note, page_cover
 from .extract import cover_png, openable_elsewhere, unreadable_formats
 from .language import detect_language
 from .library import LibraryError, read_books, tag_filter_text, tag_selects
 from .models import Book
+from .pause import Pause, wait_if_paused
 from .normalize import (
-    author_key, authors_key, is_unknown, looks_like_name, names_nearly_equal, normalize_isbn, publisher_tokens,
-    same_publisher, series_key, strip_accents, word_tokens,
+    author_key, authors_key, is_unknown, looks_like_name, names_nearly_equal, noise_words, normalize_isbn,
+    publisher_tokens, same_publisher, series_key, strip_accents, title_key, word_tokens,
 )
 from .planner import MAX_LIBRARY_PATH, AIResolver
 
@@ -110,6 +112,10 @@ class ReviewItem:
     archives: list = field(default_factory=list)
     # Its cover.jpg is a generic cover shown by this many books (covers.py), else 0.
     generic_cover: int = 0
+    # Its cover.jpg is a page of the book (covers.page_cover), not a real cover.
+    page_cover: bool = False
+    # Read by the Judge AI (judge_ai): its profile. A suggestion: unticked, to review.
+    judged: str = ""
     # The user looked at the book (a tick, a field turned on or off, Mark reviewed): it no
     # longer needs review (see needs_review).
     reviewed: bool = False
@@ -134,6 +140,8 @@ class ReviewItem:
         left = [FIELD_LABELS[n].lower() for n in self.doubts
                 if n in self.excluded and n in self.changes and n in fields_on]
         parts = [f"changes left out: {', '.join(left)}"] if left else []
+        if self.judged:
+            parts.append(f"read by the Judge AI ({self.judged}): check, then tick")
         return "; ".join(parts + [u.note for u in self.archives if u.doubt and not u.unpack])
 
     def needs_review_for(self, fields_on: set[str] | list[str] = FIELDS) -> bool:
@@ -169,9 +177,10 @@ class ReviewItem:
 
     @property
     def bad_cover(self) -> bool:
-        """Its cover is generic, or the AI says it is not a real cover (only a page of text, a
-        placeholder): tagged BAD_COVER_TAG on Execute, unless the book goes to the trash."""
-        return bool(self.generic_cover) or (self.found is not None and self.found.cover in ("text", "placeholder")
+        """Its cover is generic or a page of the book, or the AI says it is not a real cover (only
+        a page of text, a placeholder): tagged BAD_COVER_TAG on Execute, unless the book goes to
+        the trash."""
+        return bool(self.generic_cover) or self.page_cover or (self.found is not None and self.found.cover in ("text", "placeholder")
                                             and BAD_COVER_TAG.casefold() not in {t.casefold() for t in self.book.tags})
 
     def __post_init__(self):
@@ -249,11 +258,13 @@ def read_value(found: ReviewMetadata, name: str):
 
 def find_changes(book: Book, found: ReviewMetadata) -> dict:
     """The fields where the AI read something different from the metadata. A field
-    the AI did not find is never a change: nothing is ever erased. An ISBN only for a
+    the AI did not find is never a change: nothing is ever erased. Nor is a title that
+    only drops the current one's subtitle or volume part (_drops_part). An ISBN only for a
     book without one, and only one printed in its pages; the language is the text's own
     when it can be told (language.detect_language), else the AI's."""
     changes: dict = {}
-    if found.title and _loose(found.title) != _loose(current_value(book, "title")):
+    if (found.title and _loose(found.title) != _loose(current_value(book, "title"))
+            and not _drops_part(book, found)):
         changes["title"] = found.title
     if found.authors and authors_key(found.authors) != authors_key(book.authors):
         changes["authors"] = list(found.authors)
@@ -277,6 +288,26 @@ def find_changes(book: Book, found: ReviewMetadata) -> dict:
     if language and language not in book.languages:
         changes["language"] = language
     return changes
+
+
+def _drops_part(book: Book, found: ReviewMetadata) -> bool:
+    """Whether the title read is the book's title without its last words, and those words
+    are a subtitle or a volume part ("Fantozzi: la trilogia", "Storia d'Italia (2)"): the
+    shorter title says less. Not when they are noise around the title, which a shorter
+    title cleans up: an edition note or a collection ("(Italian Edition)", "(Everyman)"),
+    a bracket cut short, or the authors', series' or publisher's names; nor when the
+    number dropped is the series number read ("Galaxy N 04", series Galaxy 4)."""
+    current = current_value(book, "title")
+    mine, new = _loose(current), _loose(found.title)
+    if not current or not new or not mine.startswith(new + " "):
+        return False
+    if title_key(current) == title_key(found.title):
+        return False  # only noise dropped (see normalize.title_key)
+    dropped = mine[len(new):].split()
+    if found.series_index is not None and found.series_index in {float(w) for w in dropped if w.isdigit()}:
+        return False  # the number goes to the series
+    noise = noise_words(*book.authors, book.series, book.publisher)
+    return any(w not in noise for w in dropped)
 
 
 # --- what the book itself shows (no AI) -------------------------------------------------
@@ -461,6 +492,8 @@ class Reviewer(AIResolver):
     Errors and "AI not responding" are handled as in the analysis (AIResolver)."""
 
     fresh = False  # always ask the AI, never answer from the cache (the answer is still cached)
+    # The Judge AI (judge_ai): more to go on for a book, given with its pages; None: nothing.
+    hints: Callable[[Book], str] | None = None
 
     def review(self, book: Book) -> tuple[ReviewMetadata | None, str]:
         picked = self.extractor.pick_format(book.formats)
@@ -493,7 +526,8 @@ class Reviewer(AIResolver):
         read = excerpt.source + (" + cover" if cover else "")
         log.info("AI reading %s (%s)", book.label(), read)
         try:
-            meta, read = self._read(book, provider, excerpt.text, images, bool(cover), read)
+            hints = self.hints(book) if self.hints is not None else ""
+            meta, read = self._read(book, provider, excerpt.text, images, bool(cover), read, hints)
         except AIError as e:
             note = self._error(book, e, image=vision is not None)
             if note is None:  # the user chose Retry
@@ -511,7 +545,7 @@ class Reviewer(AIResolver):
         return meta, _join(f"AI read {read}", cover_note)
 
     def _read(self, book: Book, provider, text: str, images: list[str], has_cover: bool,
-              read: str) -> tuple[ReviewMetadata, str]:
+              read: str, hints: str = "") -> tuple[ReviewMetadata, str]:
         """Ask the AI; when its content filter refuses the pages (a violent novel),
         ask again with less: the first FILTERED_RETRY_CHARS characters (the title
         page is at the start), then the text without images (a refused cover), then
@@ -526,7 +560,8 @@ class Reviewer(AIResolver):
             attempts.append(("", images[:1], "cover only (content filter)"))
         for i, (t, imgs, what) in enumerate(attempts):
             try:
-                meta, cut = ask_fitting(lambda text: read_book_metadata(provider, text, imgs, has_cover=has_cover),
+                meta, cut = ask_fitting(lambda text: read_book_metadata(provider, text, imgs, has_cover=has_cover,
+                                                                        hints=hints),
                                         t, book.label())
                 return meta, (f"{what} (first {cut} chars: context size)" if cut else what)
             except AIError as e:
@@ -614,12 +649,13 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  skip_reviewed: bool = True,
                  unpack: Callable[[int], bool] | None = None,
                  tag: str = "", tag_exclude: bool = False,
-                 library_cache: Path | None = None) -> ReviewResult:
+                 library_cache: Path | None = None, pause: Pause | None = None) -> ReviewResult:
     """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
     `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
     of the n books that have one (see archives.ask_once); None: archives are read as they are.
     `tag`: review only the books with this tag (with `tag_exclude`, without it); "" = all.
-    `library_cache`: where generic_covers keeps what it found (see library_cache)."""
+    `library_cache`: where generic_covers keeps what it found (see library_cache).
+    `pause`: the user may pause the run between two books (see pause.py)."""
     check_libraries(library, trash)
     books = read_books(library)
     library_books = books
@@ -641,6 +677,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     unpack = ask_once(books, unpack)
     perf.run_start("review", len(books), reviewer.provider, reviewer.vision)
     for n, book in enumerate(books):
+        wait_if_paused(pause, cancel)
         if cancel is not None and cancel.is_set():
             result.stopped = True
             log.info("Review stopped after %d of %d books", n, len(books))
@@ -649,7 +686,7 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
         if progress:
             progress(n, len(books), f"Reading {book.label()}")
         item = _scan_book(reviewer, book, unpack)
-        _mark_generic(item, generic.get(str(cover_file(book)), 0))
+        _mark_cover(item, generic.get(str(cover_file(book)), 0))
         result.items.append(item)
         if on_item:
             on_item(item)
@@ -688,7 +725,7 @@ def ask_ai(reviewer: Reviewer, items: list[ReviewItem],
             decided = {u.path: u.unpack for u in old.archives}
             unpack = (lambda book, u, d=decided: d.get(u.path, False)) if old.archives else None
             new = _scan_book(reviewer, old.book, unpack)
-            _mark_generic(new, old.generic_cover)
+            _mark_cover(new, old.generic_cover)
             mark_series_publishers([new], (series or set()) | series_names([], [new]))
             done.append((old, new))
             if on_item:
@@ -701,10 +738,57 @@ def ask_ai(reviewer: Reviewer, items: list[ReviewItem],
     return done
 
 
-def _mark_generic(item: ReviewItem, count: int) -> None:
-    if count and BAD_COVER_TAG.casefold() not in {t.casefold() for t in item.book.tags}:
+JUDGE_END_CHARS = 5000  # of the last pages, given to the Judge AI
+
+
+def judge_hints(reviewer: Reviewer, old: ReviewItem) -> str:
+    """What the Judge AI is told besides the first pages and the cover: Calibre's metadata,
+    the earlier reading, the last pages."""
+    current = {name: format_value(name, current_value(old.book, name)) for name in FIELDS}
+    lines = [f"Calibre's metadata now: {json.dumps(current, ensure_ascii=False)}"]
+    if old.found is not None:
+        read = {name: format_value(name, read_value(old.found, name)) for name in FIELDS}
+        lines.append(f"A first reading by a smaller model: {json.dumps(read, ensure_ascii=False)}")
+    end = reviewer.extractor.excerpt(old.book.formats, "end").text[-JUDGE_END_CHARS:]
+    if end.strip():
+        lines.append(f"Text of the last pages:\n{end}")
+    return "\n".join(lines)
+
+
+def judge_ai(reviewer: Reviewer, items: list[ReviewItem],
+             progress: Callable[[int, int, str], None] | None = None,
+             cancel: threading.Event | None = None,
+             on_item: Callable[[ReviewItem, ReviewItem], None] | None = None,
+             series: set[str] | None = None) -> list[tuple[ReviewItem, ReviewItem]]:
+    """Ask the Judge AI (the reviewer's provider, a stronger model) about these books: as
+    ask_ai, with more to go on (judge_hints). Each new row is a suggestion: unticked, to
+    review (ReviewItem.judged), whatever it proposes."""
+    olds = {it.book.id: it for it in items}
+    model = (reviewer.vision or reviewer.provider).profile.name
+    reviewer.hints = lambda book: judge_hints(reviewer, olds[book.id])
+
+    def judged(old: ReviewItem, new: ReviewItem) -> None:
+        new.judged = model
+        new.selected = False
+        new.note = _join(new.note, f"read by the Judge AI ({model})")
+        if on_item:
+            on_item(old, new)
+    try:
+        return ask_ai(reviewer, items, progress, cancel, judged, series)
+    finally:
+        reviewer.hints = None
+
+
+def _mark_cover(item: ReviewItem, count: int) -> None:
+    """A cover that is not a real one: generic (shown by `count` books), or a page of the book."""
+    if BAD_COVER_TAG.casefold() in {t.casefold() for t in item.book.tags}:
+        return
+    if count:
         item.generic_cover = count
         item.note = _join(item.note, f"{generic_note(count)}: tagged {BAD_COVER_TAG} on Execute")
+    elif item.book.has_cover and page_cover(cover_file(item.book)):
+        item.page_cover = True
+        item.note = _join(item.note, f"{PAGE_NOTE}: tagged {BAD_COVER_TAG} on Execute")
 
 
 def _scan_book(reviewer: Reviewer, book: Book,
@@ -938,9 +1022,9 @@ def execute_review(result: ReviewResult, fields_on: set[str] | list[str], calibr
             if msg["ok"]:
                 for sid in msg["src_ids"]:
                     items[sid].book.tags = set(items[sid].book.tags) | {BAD_COVER_TAG}
-                    items[sid].generic_cover = 0
+                    items[sid].generic_cover, items[sid].page_cover = 0, False
                     restamp(items[sid], stamps.get(str(sid)))
-                log.info("%d book(s) with a generic cover %s", len(msg["src_ids"]), msg["msg"])
+                log.info("%d book(s) with a cover that is not a real one %s", len(msg["src_ids"]), msg["msg"])
             else:
                 failed += len(msg["src_ids"])
                 log.error("Tagging %s failed: %s", BAD_COVER_TAG, msg.get("trace") or msg["msg"])

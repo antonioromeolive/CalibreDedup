@@ -1025,12 +1025,17 @@ class ReviewMetadata:
         return self.__dict__.copy()
 
 
+JUDGE_HINTS = ("Hints, which may be wrong (use them only to look closer; decide from the pages and the "
+               "cover, by the rules above):")
+
+
 def read_book_metadata(provider: Provider, text: str, images: list[str] | None = None,
-                       has_cover: bool = False) -> ReviewMetadata:
+                       has_cover: bool = False, hints: str = "") -> ReviewMetadata:
     """Ask for title, authors, publisher, year, series, ISBN, language and what the cover
     is. With `has_cover`, the first image is the cover; the other images are pages of a
-    scanned book."""
-    parts = []
+    scanned book. `hints`: more to go on (the Judge AI: Calibre's metadata, a first
+    reading, the last pages)."""
+    parts = [f"{JUDGE_HINTS}\n{hints}\n"] if hints else []
     if has_cover:
         parts.append("The first attached image is the book's cover.")
     pages = len(images or []) - int(has_cover)

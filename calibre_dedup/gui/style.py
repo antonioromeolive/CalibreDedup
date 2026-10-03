@@ -31,6 +31,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QWidget
 GREEN = ("#218739", "#2ea043", "#176b2c", "#196b2d")  # colour, hover, pressed, border
 BLUE = ("#1769aa", "#2186c4", "#0f4f7f", "#125a91")
 RED = ("#c62828", "#d84343", "#8e1c1c", "#a01f1f")
+SLATE = ("#546e7a", "#62808d", "#3d5159", "#455a64")  # Pause / Continue
 
 
 def button_css(color: str, hover: str, pressed: str, border: str) -> str:

@@ -28,6 +28,7 @@ import json
 import logging
 import subprocess
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -50,10 +51,57 @@ class ExecutionError(Exception):
 
 
 def _keep_failed_in_source(item: PlanItem) -> None:
-    item.action = Action.LEAVE
+    """A book that failed keeps its action, unticked: the user may tick it again and execute
+    the plan again (its dependents are blocked meanwhile, see selection.blocked)."""
     item.selected = False
-    item.manual = False
-    item.reason = f"kept in source after execution failure: {item.reason}"
+
+
+def _same_book(book, library: str, book_id: int) -> bool:
+    return book is not None and book.id == book_id and Path(book.library).resolve() == Path(library).resolve()
+
+
+def apply_result(plan: Plan, item: PlanItem, msg: dict) -> None:
+    """What an execution did to a book, written into the plan so that it can be executed
+    again (its other books) without a new analysis:
+    - a book moved or trashed has left the source (`done`); a move is remembered
+      (plan.moved), and the books that were to be trashed into it now point to its copy
+      in the target, with that copy's id and last_modified;
+    - a book written in place (formats taken out, an archive unpacked, formats merged into
+      it) gets its new last_modified and formats, in every row that shows it (as the book
+      or as the match), so the bridge's "changed since the analysis" check still holds;
+    - formats taken out are no longer the book's (nothing left to clean up)."""
+    sent = msg.get("op")
+    src = plan.source_library
+    if msg.get("stamp") is not None:  # the book itself was written and stays (cleanup only)
+        _refresh_book(plan, src, item.source.id, msg["stamp"], msg.get("formats"))
+        item.bad_formats = {f: why for f, why in item.bad_formats.items() if f in item.source.formats}
+        if item.action is Action.LEAVE:
+            item.selected = item.planned_selected = False  # nothing left to do for it
+    if sent in ("move", "trash"):
+        item.done = True
+    kept = msg.get("kept") or {}
+    if not kept:
+        return
+    library = plan.target_library if kept["library"] == "target" else src
+    if sent == "move":
+        plan.moved[item.source.id] = kept["id"]
+        for it in plan.items:
+            if it.match_planned and it.match is not None and it.match.id == item.source.id:
+                it.match = replace(it.match, id=kept["id"], library=library, path=kept["path"],
+                                   formats=dict(kept["formats"]), last_modified=kept["stamp"])
+                it.match_planned = False
+    else:
+        _refresh_book(plan, library, kept["id"], kept["stamp"], kept["formats"])
+
+
+def _refresh_book(plan: Plan, library: str, book_id: int, stamp: str, formats: dict | None) -> None:
+    """The book's new last_modified (and formats), wherever the plan shows it."""
+    for it in plan.items:
+        for book in (it.source, it.match):
+            if _same_book(book, library, book_id):
+                book.last_modified = stamp
+                if formats is not None:
+                    book.formats = dict(formats)
 
 
 def plan_actions(plan: Plan) -> list[dict]:
@@ -197,6 +245,9 @@ def execute_plan(
         return 0, 0
     items = {i.source.id: i for i in plan.items}
     sent = {a["src_id"]: a for a in actions}
+    for i in plan.items:
+        if i.source.id in sent:
+            i.status = ""  # a row failed before, ticked again
     ok = failed = 0
 
     with Journal("dedup", journal) as book_log:
@@ -216,6 +267,7 @@ def execute_plan(
                 ok += 1
                 if item.archives_to_unpack:  # done: the book no longer has them
                     item.archives = [u for u in item.archives if not u.unpack]
+                apply_result(plan, item, {**msg, "op": op})
                 log.info("Book %s (%s): %s", item.source.id, item.source.title, msg["msg"])
             else:
                 failed += 1

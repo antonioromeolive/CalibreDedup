@@ -90,6 +90,27 @@ def test_what_the_ai_did_not_find_is_never_a_change():
     assert find_changes(book(), ReviewMetadata()) == {}
 
 
+@pytest.mark.parametrize("current,read", [
+    ("Fantozzi: la trilogia", "Fantozzi"),  # a subtitle
+    ("Il nome della rosa - Postille", "Il nome della rosa"),
+    ("Storia d'Italia (2)", "Storia d'Italia"),  # a volume
+    ("Dune parte 2", "Dune"),
+])
+def test_a_title_that_only_drops_a_subtitle_or_volume_is_not_proposed(current, read):
+    assert "title" not in find_changes(book(title=current), meta(title=read))
+
+
+@pytest.mark.parametrize("current,read", [
+    ("La forza della ragione (Italian Edition)", "La forza della ragione"),  # an edition note
+    ("Il nome della rosa - Umberto Eco", "Il nome della rosa"),  # the author's name
+    ("Il nome della rosa (Everyman)", "Il nome della rosa"),  # a collection
+    ("Il nome della rosa (Itali", "Il nome della rosa"),  # cut short
+    ("Il nome", "Il nome della rosa"),  # longer: says more
+])
+def test_a_title_that_cleans_up_noise_is_proposed(current, read):
+    assert find_changes(book(title=current), meta(title=read))["title"] == read
+
+
 def test_real_differences_are_changes():
     found = meta(title="Il pendolo di Foucault", authors=["Umberto Eco", "Mario Rossi"], publisher="Mondadori",
                  year=1988, series="Oscar", series_index=12)
@@ -519,9 +540,11 @@ def test_a_change_that_loses_an_author_is_left_out(authors):
 def test_a_title_that_loses_its_issue_number_is_left_out_unless_it_is_the_series_number():
     b = book(title="Galaxy Mensile Di Fantascienza N 04")
     it = ReviewItem(b, read(b, meta(title="Galaxy"), "GALAXY mensile"))
+    assert "title" not in it.changes  # it only drops a part of the title: not proposed (_drops_part)
+    it = ReviewItem(b, read(b, meta(title="Galaxy Fantascienza"), "GALAXY Fantascienza"))
     assert it.doubts["title"] == "the issue or volume number would be lost"
     it = ReviewItem(b, read(b, meta(title="Galaxy", series="Galaxy", series_index=4), "GALAXY mensile"))
-    assert "title" not in it.doubts
+    assert "title" in it.changes and "title" not in it.doubts
 
 
 def test_a_series_name_is_not_a_publisher():

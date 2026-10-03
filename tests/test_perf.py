@@ -130,3 +130,18 @@ def test_two_runs_at_once_count_their_own_calls(records, monkeypatch):
     assert [(c["program"], c["book"]) for c in calls] == [("review", 7), ("review-ask", 1)]
     ends = {r["program"]: r for r in records() if r["event"] == "run_end"}
     assert ends["review"]["calls"] == ends["review-ask"]["calls"] == 1
+
+
+def test_time_paused_is_left_out_of_the_run(records, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(perf.time, "monotonic", lambda: now[0])
+    perf.run_start("dedup", 10)
+    now[0] += 5
+    perf.pause()
+    now[0] += 600
+    perf.resume()
+    now[0] += 5
+    perf.run_end(10)
+    start, pause, resume, end = records()
+    assert (pause["event"], resume["event"], resume["paused_seconds"]) == ("pause", "resume", 600)
+    assert end["seconds"] == 10 and end["paused_seconds"] == 600

@@ -24,6 +24,15 @@ Both programs work the same way, in three steps:
 2. **Review** the list: filter it, tick or untick books, change any proposal.
 3. **Execute** (button *2. Execute checked*): only the ticked books, with Calibre closed.
 
+**Shut down the PC when done** (a box by the buttons, in both programs) shuts the computer
+down when the analysis or execution running now, or the next one, ends. It asks first, and
+it is one switch for every window running: ticked (or unticked) in one, it is in all, and
+while it is on every window shows it in a red banner across its top and in its title. A
+window that has finished waits while any other window of either program is still working;
+the last one to finish shuts down, after a minute you can cancel (*Cancel* turns the switch
+off everywhere). Idle windows close themselves first; other programs with unsaved work may
+still ask Windows to wait.
+
 **Your books are never lost.** A "deleted" book is copied, whole (files, cover, metadata),
 into a **trash library**, a normal Calibre library you choose, and only then removed from its
 library, into Calibre's own recycle bin by default. Every write goes through Calibre's own
@@ -145,6 +154,9 @@ How a duplicate is recognised is explained in [How duplicates are found](#how-du
 
 - Rows can be ticked, unticked and overridden while the analysis runs (the list is sorted at
   the end); *Execute* waits for it to finish.
+- **Pause** stops the analysis after the current book, until **Continue** (the button
+  becomes it): the time paused is left out of the time left and of the performance log.
+  *Stop* also ends a pause.
 - **Stop** ends the analysis after the current book. The books analyzed so far can be
   reviewed and executed; analyze again for the rest (fast: AI answers are cached).
 - If a library's drive disconnects or reports errors, the analysis stops the same way, with
@@ -175,6 +187,23 @@ until you decide:
 Open both books, then tick the row (or untick it again), change its action, or right-click →
 **Mark reviewed** to keep what the list shows. A row you decided leaves *Needs review*, and your
 decision is remembered at the next analysis.
+
+Two right-click actions ask an AI about the selected books, when nothing else runs:
+
+- **Ask the AI again** decides the books again with the AI asked again, never from the cache:
+  with the Text AI / Image AI selected above, or with any configured AI picked in its submenu.
+  The books whose decision rests on them are decided again too (a duplicate of a book the list
+  moves, or keeps); the others stay as the list has them (a book it moves counts as moved).
+  Each row is replaced as if this were the first answer.
+- **Judge AI** asks a stronger model (Settings → Analysis → *Judge AI*, e.g. a cloud model with
+  reasoning on) about a book and its match, with everything known about both: their Calibre
+  metadata, what the everyday AI read in them, their files, the first 20,000 and last 5,000
+  characters of each text, both covers, and the facts the program found (the share of the same
+  text, a cover that is a page, identical cover files). Its answer becomes the row's
+  suggestion, **unticked, to review** (*Needs review*), with its evidence in the reason:
+  *duplicate* is a Merge & Trash (or Trash only) into the match, *different* a move (within one
+  library, kept), *unsure* only adds its answer to the reason. Nothing it reads is written to a
+  book. Meant for the books left *to check*, a few at a time: it costs a large request each.
 
 - **Filter** with the search box (all words must match, across title, authors, reason and
   match) and three drop-down lists. **Within a list, a book is shown if it matches any ticked
@@ -243,6 +272,14 @@ Books moved or trashed successfully leave the list (the log keeps a line for eac
 unticked and *Leave* rows stay. At the end, book and author folders that Windows left behind
 empty are deleted; folders with files in them are never touched.
 
+**The rest can be executed without a new analysis.** After an Execute, the list stays usable:
+tick more books (e.g. those you left unticked to review) and execute again. What the first
+Execute did is known to the list: a duplicate of a book it moved is trashed into that book's
+new copy in the target, and a copy it changed (formats merged into it, unreadable formats
+taken out) is checked against its new state, not against the analysis. A book that failed
+keeps its action, unticked: tick it to try again. **Pause** while executing stops after the
+current book; **Continue** then executes the remaining ticked books (no new question).
+
 ### How duplicates are found
 
 #### Which books are compared
@@ -300,9 +337,9 @@ In this order; the first rule that decides wins:
    "O'Reilly", "Arnoldo Mondadori Editore" = "A. Mondadori", "DeAgostini Periodici S.r.l." =
    "De Agostini periodici".
    - Both the same: duplicate. Either one different: a different book.
-   - Either one unknown: if both books have an EPUB with **identical text**, they are
-     duplicates, without AI. Otherwise the AI reads both books for the missing fields, and
-     they are compared again.
+   - Either one unknown: if both books have **the same text** (below), they are duplicates,
+     without AI. Otherwise the AI reads both books for the missing fields, and they are
+     compared again.
    - **Only the years differ**: Calibre's date is often the original publication, not this
      edition's. With *Re-check year differences* (on by default) the AI reads both books and
      the years printed in them decide; if it can't find a year in both, the covers decide
@@ -332,6 +369,12 @@ In this order; the first rule that decides wins:
    look at new or changed books; the first time, a big library on a network drive can take
    minutes. *Skip looking for generic covers* (settings) skips this step, for tests only:
    a placeholder cover may then make two different books duplicates.
+   Nor is **a page used as cover**: Calibre's first page of a PDF or a document, rendered as
+   the cover (a page of text, a title page, a blank page). It is told without AI: the image
+   has the exact shape of an A4 or US Letter sheet (upright, or two pages side by side) and is
+   mostly white with no colour; real covers, even plain ones, have other shapes (measured on
+   400 covers of a real library, where one in five was such a page). Two identical files of
+   the same page are still proof.
 
 **Another language, another content.** A duplicate found this way is not one when the two
 texts are in different languages, even with the same ISBN (a translation, or a wrong ISBN):
@@ -346,10 +389,21 @@ and an abridged edition): it stays in the source. The text is read only with an 
 A duplicate is **Merge & Trash** when it has formats the kept copy lacks (except PDF), which
 are added to the kept copy first; otherwise it is **Trash only**.
 
-**Identical EPUB text.** The text files inside each EPUB (the chapters, not the metadata or
-the images) are compared by fingerprint. Identical text means the same file with only its
-metadata or cover changed. It is checked only when edition or publisher can't be compared,
-never to overrule a difference, and needs an EPUB on both sides.
+**The same text.** Two books whose text is the same are the same book, whatever their files,
+formats and metadata: the same book converted twice, a TXT and an EPUB of one edition. It is
+checked when edition or publisher can't be compared (before any AI call), and again for a
+pair still undecided at the end (e.g. only Calibre's years differ, or the covers differ);
+never to overrule a real difference in the metadata. One format of each book is read, whole:
+the first of EPUB, MOBI, AZW3, AZW, PDF, then any other with text (MOBI and the others are
+converted with Calibre's `ebook-convert`; without an AI selected, only EPUB and TXT are
+read). The texts are the same when **95% or more** of each one's 5-word runs are in the
+other, after making uniform what differs between copies of one text: apostrophes, accented or
+mis-encoded letters (a file in the wrong code page: "piů" for "più"), old accents
+("perche'"), words hyphenated at line ends. The reason says how much, e.g. "same text (99%)".
+An excerpt inside a whole book, an abridged edition or another translation share much less.
+A text whose language can't be told (symbols from a PDF with a broken font) is not compared.
+Tested on 211 real undecided pairs: 155 had the same text, the others another translation,
+another content or an extended edition.
 
 #### Options that find more duplicates
 
@@ -391,7 +445,7 @@ dropping the author, bare numbers and a collection name followed by a number. So
 
 But "Dune Messiah" and "Dune" don't: "Messiah" is part of the title. Alike titles are weaker
 than the same title, so **only proof makes a duplicate**: the same ISBN, ASIN or series
-number, identical EPUB text, or the same cover. A real difference in edition or publisher
+number, the same text, or the same cover. A real difference in edition or publisher
 (not only the year), a different cover, or a text in another language rules the book out: it
 is moved. Anything else is
 left in the source, "similar title to …, not proven the same book: check manually", with the
@@ -497,6 +551,7 @@ RAR and 7Z are opened with Calibre's own libraries, ZIP directly.
 
 | Setting | Default | What it does |
 |---|---|---|
+| Judge AI | none | The AI profile asked on demand, right-click → *Judge AI* (see Step 2). |
 | PDF pages to read / Characters to read | 6 / 12,000 | How much of a book the AI reads, from the start (and the end). |
 | Ignore subtitles when comparing titles | off | "Dune: Messiah" = "Dune". |
 | Similar author matching | on | Initials ignored; one shared author is enough. |
@@ -560,8 +615,11 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
 - Books where the AI read something different show two lines: the current value, then
   `→ proposed value` in green. Case, accents, punctuation, author order and publisher
   suffixes ("Editore", "S.p.A.") are not differences, and a field the AI did not find is
-  never proposed: **nothing is erased**. The cover of the selected book is shown on the
-  right.
+  never proposed: **nothing is erased**. Nor is a title that only drops the current one's
+  subtitle or volume part ("Fantozzi: la trilogia" → "Fantozzi", "Dune parte 2" → "Dune"): it
+  says less. A shorter title that only drops noise is proposed: an edition note ("(Italian
+  Edition)"), a collection ("(Everyman)"), the author's name, or a number that becomes the
+  series number. The cover of the selected book is shown on the right.
 - **Filters:** the search box and three drop-down lists, combined as in the Duplicate
   Remover (any ticked entry within a list, all lists together):
   - **Actions:** *Update*, *Keep*, *Trash*.
@@ -581,8 +639,8 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     the title of the magazine issue that holds it);
   - *the new value is not in the book's text* (e.g. read from the cover only);
   - *an author would be lost* ("Heinlein, Bradbury, Amis" or "F. Brown e altri" cut to one name);
-  - *the issue or volume number would be lost* ("Galaxy N 04" → "Galaxy"), unless it becomes
-    the series number;
+  - *the issue or volume number would be lost* ("Galaxy N 04" → "Galaxy Fantascienza"), unless
+    it becomes the series number;
   - *a series name, not a publisher* ("Galassia", "Urania": any series of the library or read
     by the AI), *an author's name, not a publisher*;
   - *not checked against the book*: no text to check (a scanned book: nothing is ticked), or
@@ -620,6 +678,11 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
     is replaced as if this were the first answer, and the answer is cached for that model:
     the other models' answers are kept. Handy for books the AI failed on, or for a second
     opinion; e.g. filter *Not read*, select all, right-click.
+  - Right-click → **Judge AI** asks the stronger model chosen in Settings → Analysis → *Judge
+    AI* in the same way, with more to go on: 20,000 characters of the first pages, the last
+    pages, the cover, and as hints Calibre's metadata and the earlier reading. Its reading is
+    checked against the book like any other (the rules below), but the row starts **unticked,
+    to review** (*Needs review*), whatever it proposes.
   - *Check visible* / *Uncheck visible* act on the rows the filters show.
 - **Books with no file Calibre can open**: a record without files, or whose files open
   nowhere (empty, or not what their format says), is proposed for the trash, ticked. A file
@@ -633,8 +696,9 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   Merge and Dedup (see [Books stored as an archive](#books-stored-as-an-archive-rar-zip-7z));
   an unpacked book stays visible with *With differences*, since Execute changes it.
 - **Books with a bad cover**: a generic cover (the same image on books of 3 or more different
-  titles and authors, see above), which is not sent to the AI (it would mislead it), or a
-  cover the Image AI says is not a real one (only a page of text, or a placeholder). They are
+  titles and authors, see above), which is not sent to the AI (it would mislead it), a page
+  used as cover (see above: still sent to the AI, since a title page shows title and authors),
+  or a cover the Image AI says is not a real one (only a page of text, or a placeholder). They are
   listed by the *Bad cover* filter, and Execute tags them **`BadCover`** (unless they go to the
   trash), so you can find them in Calibre later and give them a real cover. Nothing else is
   changed: neither Calibre's cover nor the e-book files.
@@ -648,7 +712,8 @@ reviewed library when trashing*). Updated and trashed books leave the list. As i
 Dedup, the library's `metadata.db` is copied first, each book acted on gets a line in the
 journal with its values before and after, and a book changed in Calibre since the analysis is
 not touched. The list can be executed again (e.g. after changing more rows): the books updated
-by the first Execute are checked against their new state.
+by the first Execute are checked against their new state. **Pause** and **Continue** work as in
+Merge and Dedup, for the analysis and for Execute.
 
 ### Continue another day, on any computer
 
@@ -843,7 +908,7 @@ there automatically.
 | `selections.json` | Merge and Dedup | remembered ticks and changes (and *Mark reviewed*), per source/target pair |
 | `snapshots\<library>_<id>\metadata_<date>.db` | both | a copy of each library's `metadata.db` taken before each Execute that writes it (not the trash library), the last 3 per library; `library.txt` says which library. To undo an Execute's metadata changes: close Calibre and copy it back over the library's `metadata.db` (the files moved or trashed since are in the target, the trash library or Calibre's recycle bin) |
 | `journal\dedup_<date>.csv`, `journal\review_<date>.csv` | each | one per Execute: each book acted on, what was done, why (the analysis' reason), the copy it duplicated, and for the review the values before and after; e.g. why a book is in the trash library |
-| `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text |
+| `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text, its text's fingerprint (the same text) |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
 
@@ -883,8 +948,8 @@ names. Every request also asks the server for JSON (`format: "json"` for Ollama,
 `response_format: json_object` for Azure and OpenAI; Anthropic has only the prompt's own
 instruction).
 
-The AI is used only in **Step 1: Analyze**, never on Execute (which writes what the analysis
-found). Every answer is cached (see [Cache](#cache)): a question already answered for the
+The AI is used only in **Step 1: Analyze** and when you right-click → *Ask the AI* / *Judge
+AI*, never on Execute (which writes what the analysis found). Every answer is cached (see [Cache](#cache)): a question already answered for the
 same file is not asked again (for covers, authors and the review: also by the same model).
 Tick **No AI cache** to ask every question again. With *Text AI* set to None, no prompt is sent at all.
 
@@ -894,6 +959,11 @@ Tick **No AI cache** to ask every question again. With *Text AI* set to None, no
 | 2 | Comparing two covers | Merge and Dedup | Image AI | The metadata can't decide, and both books have a cover |
 | 3 | Same person, name written differently | Merge and Dedup | Text AI | Same title, authors that don't match |
 | 4 | Identifying a book | Metadata Review | Image AI if set, else Text AI | Every book analyzed |
+| 5 | Judging a pair | Merge and Dedup | Judge AI | Right-click → *Judge AI* |
+
+The Metadata Review's *Judge AI* sends prompt 4 to the Judge AI, its message starting with
+hints: Calibre's metadata, the earlier reading and the last pages ("Hints, which may be wrong
+(use them only to look closer; decide from the pages and the cover, by the rules above)").
 
 ### Merge and Dedup
 
@@ -957,7 +1027,7 @@ images, plus this extracted text:` and the text (or `…page images.` when there
   - **Compare covers when metadata can't decide** is on (the default): same title and
     authors, still undecided after prompt 1 and the year re-check;
   - **Match similar titles by the same author** is on (the default): titles alike, with no
-    proof from the ISBN, series number or EPUB text (the cover check still needs one of the
+    proof from the ISBN, series number or the same text (the cover check still needs one of the
     two cover options on);
   - **Always compare covers** is on (off by default): also when the metadata says the books
     **differ** (year, publisher, edition). For similar titles whose metadata differs, the covers
@@ -1095,6 +1165,29 @@ The other N attached images are its first pages.     (scanned books)
 Text of the first pages:
 
 <text>                                               (or "No text could be extracted.")
+```
+
+### Judge AI (Merge and Dedup, [judge.py](calibre_dedup/judge.py))
+
+The message holds FACTS (the analysis' reason, covers that are pages, the share of the same
+text, identical cover files), then for each book its Calibre metadata, what the everyday AI
+read, the first 20,000 and last 5,000 characters of its text; the covers are attached when
+the Judge AI reads images.
+
+```
+You are an expert librarian judging two e-book records that an automatic deduplicator could not decide. BOOK SOURCE is in the library being cleaned; BOOK TARGET is the other copy (in the main library, or in the same library). For each you get its Calibre metadata, what a small AI read in it (often incomplete or wrong), its files, the first and last pages of its text, and, when attached, its Calibre cover. FACTS are checks the program made without AI: trust them.
+
+Decide from evidence only. Calibre's dates are often the date the book was added, or the original publication; a "cover" may be only a page of the book.
+
+Respond with a single JSON object with exactly these keys:
+{"verdict": "duplicate"|"different"|"unsure", "same_work": "yes"|"no"|"unsure",
+ "same_edition": "yes"|"no"|"unsure", "better": "SOURCE"|"TARGET"|"equal", "confidence": integer 0-100,
+ "evidence": [string], "covers": string}
+
+- "verdict": "duplicate" when both records are the same edition of the same work (the same text, possibly in another file format): SOURCE can go to the trash. "different" when they are different books or editions (another translation, an abridged or extended edition, another content). "unsure" when the evidence does not prove either. Be conservative: without proof, "unsure".
+- "better": which record is the better copy to keep (more complete text, a real cover).
+- "evidence": short concrete facts from the pages or the FACTS that support the verdict.
+- "covers": what each cover image really is (a real cover, a page of text...), in a few words.
 ```
 
 ### Connection tests (Settings, both programs)

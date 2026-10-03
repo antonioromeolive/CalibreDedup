@@ -30,6 +30,7 @@ tried: it follows every stretch (minutes during cached books, hours during scann
 PDFs) and was further off (loc-ita2 review of 2026-10-01: 56-73% mean error against
 39-58%). Its cost: after a long stretch of cached books it stays too low, until the
 new books outweigh them. The shown estimate changes at most every REFRESH seconds.
+Time paused by the user (pause/resume) is left out.
 Cheap enough to call for every book: one comparison, sometimes one division.
 """
 
@@ -51,6 +52,21 @@ class Eta:
         self._start: tuple[float, int] | None = None  # (time, books done) at the first book
         self._done = self._total = 0
         self._shown, self._shown_at = "", float("-inf")
+        self._paused_at: float | None = None
+
+    def pause(self) -> None:
+        """The run waits for the user: the clock stops until resume()."""
+        if self._paused_at is None:
+            self._paused_at = self.clock()
+
+    def resume(self) -> None:
+        if self._paused_at is None:
+            return
+        if self._start is not None:  # the start moves forward by the time paused
+            t0, d0 = self._start
+            self._start = (t0 + self.clock() - self._paused_at, d0)
+        self._paused_at = None
+        self._shown_at = float("-inf")  # show the new estimate now
 
     def update(self, done: int, total: int) -> None:
         """Called for every book. The clock starts at the first call, so what came
@@ -65,7 +81,8 @@ class Eta:
         if self._start is None:
             return None
         t0, d0 = self._start
-        elapsed, books = self.clock() - t0, self._done - d0
+        now = self._paused_at if self._paused_at is not None else self.clock()
+        elapsed, books = now - t0, self._done - d0
         if elapsed < MIN_ELAPSED or books < MIN_DONE:
             return None
         if self._done >= self._total:

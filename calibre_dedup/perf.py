@@ -25,8 +25,9 @@
 providers (calls, tokens, time). Holds no book metadata: a book is only its
 number in the run, and texts and images only their sizes.
 
-Events: "run_start" / "run_end" around an analysis or a review scan, and "call"
-for each AI request (the connection test's too, with "book": null). A run belongs to
+Events: "run_start" / "run_end" around an analysis or a review scan, "pause" /
+"resume" when the user pauses it (the run's "seconds" leave the time paused out, given
+apart as "paused_seconds"), and "call" for each AI request (the connection test's too, with "book": null). A run belongs to
 the thread that started it, so that two can run at once (a review scan and the AI
 asked again about some books): each call counts in its own thread's run, and names
 its program."""
@@ -82,6 +83,7 @@ def run_start(program: str, books: int, text_provider=None, image_provider=None)
             _end_locked(done=None, stopped=True, aborted=True)
         _runs[threading.get_ident()] = {
             "program": program, "books": books, "started": time.monotonic(), "book": None, "calls": 0, "ok": 0,
+            "paused": 0.0, "paused_at": None,
             "ai_seconds": 0.0, "books_with_ai": set(), "input_tokens": 0, "output_tokens": 0,
             "reasoning_tokens": 0}
     _write("run_start", program=program, version=app_version(), books=books,
@@ -96,6 +98,29 @@ def book(n: int) -> None:
             r["book"] = n
 
 
+def pause() -> None:
+    """This thread's run waits for the user (Pause): until resume(), its time isn't counted."""
+    with _lock:
+        r = _runs.get(threading.get_ident())
+        if r is None or r["paused_at"] is not None:
+            return
+        r["paused_at"] = time.monotonic()
+        program, n = r["program"], r["book"]
+    _write("pause", program=program, book=n)
+
+
+def resume() -> None:
+    with _lock:
+        r = _runs.get(threading.get_ident())
+        if r is None or r["paused_at"] is None:
+            return
+        seconds = time.monotonic() - r["paused_at"]
+        r["paused"] += seconds
+        r["paused_at"] = None
+        program, n = r["program"], r["book"]
+    _write("resume", program=program, book=n, paused_seconds=round(seconds, 3))
+
+
 def run_end(done: int, stopped: bool = False) -> None:
     with _lock:
         _end_locked(done, stopped)
@@ -105,8 +130,10 @@ def _end_locked(done: int | None, stopped: bool, aborted: bool = False) -> None:
     r = _runs.pop(threading.get_ident(), None)
     if r is None:
         return
+    now = time.monotonic()
+    paused = r["paused"] + (now - r["paused_at"] if r["paused_at"] is not None else 0.0)
     _write("run_end", program=r["program"], books=r["books"], books_done=done, stopped=stopped,
-           aborted=aborted, seconds=round(time.monotonic() - r["started"], 3),
+           aborted=aborted, seconds=round(now - r["started"] - paused, 3), paused_seconds=round(paused, 3),
            books_with_ai=len(r["books_with_ai"]), calls=r["calls"], calls_ok=r["ok"],
            ai_seconds=round(r["ai_seconds"], 3), input_tokens=r["input_tokens"],
            output_tokens=r["output_tokens"], reasoning_tokens=r["reasoning_tokens"])

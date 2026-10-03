@@ -428,6 +428,16 @@ class SettingsDialog(QDialog):
         self.a_chars.setRange(1000, 200_000)
         self.a_chars.setSingleStep(1000)
         self.a_chars.setValue(s.text_chars)
+        self.a_judge = QComboBox()
+        self.a_judge.addItem("None", "")
+        for p in self.profiles:
+            self.a_judge.addItem(f"{p.name}  ({p.kind}: {p.model or 'no model'})", p.name)
+        self.a_judge.setCurrentIndex(max(0, self.a_judge.findData(s.judge_profile)))
+        self.a_judge.setToolTip(
+            "A stronger model asked only when you right-click books → Judge AI, never during the analysis:\n"
+            "it gets much more of each book (its first and last pages, the cover, Calibre's metadata, what\n"
+            "the everyday AI read). Its answer is a suggestion, unticked, to review. Use a profile with\n"
+            "reasoning on if the model has it (e.g. Advanced parameters think = true for Ollama).")
         self.a_subtitle = QCheckBox("Ignore subtitles when comparing titles")
         self.a_subtitle.setChecked(s.ignore_subtitle)
         self.a_similar = QCheckBox("Similar author matching (ignore initials; one shared author is enough)")
@@ -497,7 +507,7 @@ class SettingsDialog(QDialog):
             "other's, with only numbers, the author, the series, the publisher or a date around it,\n"
             "e.g. \"1 Haunted London\" or \"(Gutenberg - 0411- Brother Jacob - George Eliot)\" and \"Brother Jacob\".\n"
             "Titles like these are weaker than the same title: it's a duplicate only with the same ISBN,\n"
-            "identical EPUB text or the same cover. A different cover or edition rules the book out;\n"
+            "the same text or the same cover. A different cover or edition rules the book out;\n"
             "otherwise the book is left in the source for you to check.")
         self.a_similar_titles.setChecked(s.similar_titles)
         self.a_series = QCheckBox("Same series + same number = same book, even if titles and authors differ")
@@ -532,6 +542,7 @@ class SettingsDialog(QDialog):
         crow.addWidget(self.a_calibre, 1)
         crow.addWidget(browse)
 
+        form.addRow("Judge AI (right-click, on demand)", self.a_judge)
         form.addRow("PDF pages to read (start/end)", self.a_pdf_pages)
         form.addRow("Characters to read (other formats)", self.a_chars)
         form.addRow(self.a_subtitle)
@@ -653,6 +664,9 @@ class SettingsDialog(QDialog):
         s.image_profile = self._follow_rename(s.image_profile)
         if s.image_profile not in names:
             s.image_profile = ""
+        s.judge_profile = self._follow_rename(self.a_judge.currentData() or "")
+        if s.judge_profile not in names:
+            s.judge_profile = ""
         s.pdf_pages = self.a_pdf_pages.value()
         s.text_chars = self.a_chars.value()
         s.ignore_subtitle = self.a_subtitle.isChecked()

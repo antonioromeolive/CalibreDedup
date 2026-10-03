@@ -20,10 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from dataclasses import replace
+
 import pytest
 
 from calibre_dedup.ai import AICache
-from calibre_dedup.executor import _keep_failed_in_source, plan_actions
+from calibre_dedup.executor import _keep_failed_in_source, apply_result, plan_actions
 from calibre_dedup.models import Action, Book, Identity, Plan, PlanItem
 from calibre_dedup.selection import (
     SelectionStore, action_label, actionable, blocked, can_override, checkable, is_changed, mark_reviewed,
@@ -59,16 +61,63 @@ def test_a_move_writes_no_metadata():
     assert action == {"op": "move", "src_id": 1, "title": "T1", "stamp": ""}
 
 
-def test_failed_execution_keeps_book_in_source():
+def test_a_failed_book_keeps_its_action_unticked_and_can_be_ticked_again():
     plan = make_plan()
     item = plan.items[0]
-
     _keep_failed_in_source(item)
+    assert item.action is Action.MOVE and not item.selected
+    assert 2 in blocked(plan)  # its duplicate waits for it
+    item.selected = True
+    assert [i.source.id for i in actionable(plan)] == [1, 2]
 
-    assert item.action is Action.LEAVE
-    assert not item.selected
-    assert not item.manual
-    assert "kept in source after execution failure" in item.reason
+
+def _moved_to_target(plan, new_id=77):
+    apply_result(plan, plan.items[0], {"op": "move", "ok": True, "kept": {
+        "id": new_id, "library": "target", "stamp": "2026-10-03T10:00:00+00:00", "path": "A/T1 (77)",
+        "formats": {"EPUB": "tgt/A/T1 (77)/t1.epub"}}})
+
+
+def test_after_a_move_its_duplicates_are_trashed_into_the_copy_in_the_target():
+    plan = make_plan()
+    plan.items[1].selected = False  # executed later
+    _moved_to_target(plan)
+    assert plan.items[0].done and plan.moved == {1: 77} and plan.items[0] not in actionable(plan)
+    dup = plan.items[1]
+    assert not dup.match_planned and dup.match.id == 77 and dup.match.library == "tgt"
+    dup.selected = True
+    assert 2 not in blocked(plan)
+    action = next(a for a in plan_actions(plan) if a["src_id"] == 2)
+    assert action["target_id"] == 77 and action["target_stamp"] == "2026-10-03T10:00:00+00:00"
+    assert "target_src_id" not in action
+
+
+def test_a_copy_written_by_an_execution_gets_its_new_stamp_and_formats_in_every_row():
+    target = book(10)
+    plan = Plan("src", "tgt", "trash", [
+        PlanItem(book(1, ("EPUB", "MOBI")), Action.TRASH, "dup", Identity(), match=target, add_formats=["MOBI"]),
+        PlanItem(book(2, ("EPUB", "MOBI")), Action.TRASH, "dup", Identity(), match=replace(target),
+                 add_formats=["MOBI"])])
+    for b in (plan.items[0].match, plan.items[1].match):
+        b.library = "tgt"
+    apply_result(plan, plan.items[0], {"op": "trash", "ok": True, "kept": {
+        "id": 10, "library": "target", "stamp": "2026-10-03T11:00:00+00:00", "path": "A/T10 (10)",
+        "formats": {"EPUB": "e", "MOBI": "m"}}})
+    other = plan.items[1].match
+    assert other.last_modified == "2026-10-03T11:00:00+00:00" and set(other.formats) == {"EPUB", "MOBI"}
+    assert [a["target_stamp"] for a in plan_actions(plan)] == ["2026-10-03T11:00:00+00:00"]
+
+
+def test_a_book_cleaned_up_in_place_is_not_sent_again():
+    plan = make_plan()
+    plan.source_library = "lib"  # where book() puts the books
+    item = plan.items[2]
+    item.bad_formats = {"PDF": "empty file"}
+    item.selected = True
+    assert item in actionable(plan)
+    apply_result(plan, item, {"op": "trash_formats", "ok": True, "stamp": "2026-10-03T12:00:00+00:00",
+                              "formats": {"EPUB": "e", "MOBI": "m"}})
+    assert item.source.last_modified == "2026-10-03T12:00:00+00:00" and set(item.source.formats) == {"EPUB", "MOBI"}
+    assert item.bad_formats == {} and not item.done and item not in actionable(plan)
 
 
 def test_ai_cache_is_model_independent():

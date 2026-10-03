@@ -252,6 +252,13 @@ def add_tag(db, book_ids, tag):
         db.set_field("tags", values)
 
 
+def book_facts(db, book_id, library):
+    """What a later execution of the same plan needs to know of a book this one wrote: the
+    copy a book was moved to or merged into ("library": "source" or "target")."""
+    return {"id": book_id, "library": library, "stamp": stamp(db, book_id), "path": db.field_for("path", book_id),
+            "formats": {fmt: db.format_abspath(book_id, fmt) for fmt in db.formats(book_id)}}
+
+
 def merge_formats(src, sid, db, keep, formats):
     """Add the book's formats that `keep` (in `db`) lacks to it, exactly as they are."""
     added = []
@@ -316,9 +323,11 @@ def main(plan_path):
                     emit(event="result", src_id=sid, ok=True, msg=done[:-2], formats=formats, stamp=stamp(src, sid))
                     continue
 
+                kept = {}  # the copy the book is now in (its id, last_modified, folder, formats), for the plan
                 if action["op"] == "move":
                     new_id = copy_verified(src, sid, tgt)
                     moved[sid] = new_id
+                    kept = book_facts(tgt, new_id, "target")
                     msg = f"moved to target (id {new_id})"
                 elif action["op"] == "set":  # calibre-review: the book stays, its metadata changes
                     touched.add((id(src), sid))
@@ -350,6 +359,7 @@ def main(plan_path):
                     touched.add((id(db), keep))
                     added = merge_formats(src, sid, db, keep, action.get("add_formats"))
                     new_id = copy_verified(src, sid, trash)
+                    kept = book_facts(db, keep, "target" if db is tgt and db is not src else "source")
                     msg = f"moved to trash (id {new_id}); copy #{kid} kept"
                     if added:
                         msg += f"; added {', '.join(added)} to it"
@@ -362,6 +372,7 @@ def main(plan_path):
                     touched.add((id(tgt), tid))
                     added = merge_formats(src, sid, tgt, tid, action.get("add_formats"))
                     new_id = copy_verified(src, sid, trash)
+                    kept = book_facts(tgt, tid, "source" if tgt is src else "target")
                     msg = f"moved to trash (id {new_id})"
                     if added:
                         msg += f"; added {', '.join(added)} to target book {tid}"
@@ -377,7 +388,7 @@ def main(plan_path):
                     if sid in src.all_book_ids():
                         raise
                     msg += "; source record removed, empty folder cleanup deferred"
-                emit(event="result", src_id=sid, ok=True, msg=done + msg)
+                emit(event="result", src_id=sid, ok=True, msg=done + msg, kept=kept)
             except Exception as e:
                 emit(event="result", src_id=sid, ok=False, msg=str(e), trace=traceback.format_exc())
     finally:

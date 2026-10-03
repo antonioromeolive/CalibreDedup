@@ -27,7 +27,7 @@ from calibre_dedup.ai import AICache, ReviewMetadata
 from calibre_dedup.covers import BAD_COVER_TAG, cover_file, generic_covers
 from calibre_dedup.models import Book
 from calibre_dedup.planner import AIResolver
-from calibre_dedup.review import ReviewAction, ReviewItem, Reviewer, _mark_generic, review_actions, scan_library
+from calibre_dedup.review import ReviewAction, ReviewItem, Reviewer, _mark_cover, review_actions, scan_library
 from tests.test_planner import make_library
 from tests.test_review import REPLY, FakeExtractor, FakeProvider
 
@@ -103,7 +103,7 @@ def test_review_tags_generic_covers_except_books_going_to_the_trash(tmp_path):
 
 def test_a_book_already_tagged_bad_cover_is_not_tagged_again(tmp_path):
     it = ReviewItem(book(tmp_path, 1, "Uno", LOGO, tags=[BAD_COVER_TAG]), ReviewMetadata())
-    _mark_generic(it, 34)
+    _mark_cover(it, 34)
     assert it.generic_cover == 0 and "generic" not in it.note
     assert not [a for a in review_actions([it], set()) if a.get("tag") == BAD_COVER_TAG]
 
@@ -171,3 +171,59 @@ def test_a_damaged_cache_is_ignored(tmp_path):
     file.write_text("{not json", encoding="utf-8")
     assert len(generic_covers(books, cache_dir=cache)) == 4
     assert json.loads(file.read_text(encoding="utf-8"))["version"] == 1
+
+
+def _image(width: int, height: int, background: str, lines: str | None = None) -> bytes:
+    """A JPEG of this size and colour, with dark text-like lines across it."""
+    from PySide6.QtCore import QBuffer, QIODevice
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    image = QImage(width, height, QImage.Format_RGB32)
+    image.fill(QColor(background))
+    if lines:
+        painter = QPainter(image)
+        for y in range(height // 10, height - height // 10, height // 40):
+            painter.fillRect(width // 10, y, width * 5 // 10, max(1, height // 250), QColor(lines))
+        painter.end()
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    image.save(buffer, "JPG")
+    return bytes(buffer.data())
+
+
+def test_a_page_used_as_cover_is_found(tmp_path):
+    from calibre_dedup.covers import page_cover
+    cases = {"text_page.jpg": (_image(1240, 1754, "white", "black"), True),  # A4, white with text
+             "letter_page.jpg": (_image(850, 1100, "white", "black"), True),  # US Letter
+             "blank_page.jpg": (_image(1240, 1754, "white"), True),
+             "spread.jpg": (_image(1754, 1240, "white", "black"), True),  # two pages side by side
+             "plain_cover.jpg": (_image(1000, 1500, "white", "black"), False),  # a cover's shape
+             "coloured_a4.jpg": (_image(1240, 1754, "#c03020", "white"), False),
+             "not_an_image.jpg": (b"not an image", False)}
+    for name, (data, page) in cases.items():
+        (tmp_path / name).write_bytes(data)
+        assert page_cover(tmp_path / name) is page, name
+
+
+def test_a_page_used_as_cover_is_not_a_real_cover_in_the_review(tmp_path):
+    page = _image(1240, 1754, "white", "black")
+    it = ReviewItem(book(tmp_path, 1, "Uno", page), ReviewMetadata())
+    _mark_cover(it, 0)
+    assert it.page_cover and it.bad_cover and "a page used as cover" in it.note
+    tagged = ReviewItem(book(tmp_path, 2, "Due", page, tags=[BAD_COVER_TAG]), ReviewMetadata())
+    _mark_cover(tagged, 0)
+    assert not tagged.page_cover and not tagged.bad_cover
+
+
+def test_a_page_used_as_cover_is_not_compared_in_dedup(tmp_path, monkeypatch):
+    from tests.test_planner import CoverResolver
+    from calibre_dedup.models import Action
+    from calibre_dedup.planner import build_plan
+    monkeypatch.setattr("calibre_dedup.planner.MAX_LIBRARY_PATH", 10_000)
+    src = make_library(tmp_path / "src", [{"title": "Fiesta di morte", "cover": True}])
+    tgt = make_library(tmp_path / "tgt", [{"title": "Fiesta di morte", "cover": True}])
+    (tmp_path / "src" / "a/b (1)" / "cover.jpg").write_bytes(_image(1240, 1754, "white", "black"))
+    resolver = CoverResolver(False)  # the Image AI would call them different
+    item = build_plan(src, tgt, str(tmp_path / "trash"), resolver, cover_check=True).items[0]
+    assert resolver.cover_calls == [] and "a page used as cover" in item.reason
+    assert item.action is Action.TRASH and item.no_edition  # no edition data, the covers say nothing: to review

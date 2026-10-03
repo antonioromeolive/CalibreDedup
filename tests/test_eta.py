@@ -92,3 +92,16 @@ def test_durations():
     assert format_duration(125) == "2 min"
     assert format_duration(3 * 3600 + 600) == "3 h 10 min"
     assert format_duration(50 * 3600) == "2 d 2 h"
+
+
+def test_time_paused_is_not_counted():
+    clock = Clock()
+    eta = Eta(clock)
+    run(eta, clock, range(1, 101), 1, 200)  # 100 books in 100 s
+    eta.pause()
+    clock.now += 3600  # an hour paused
+    assert eta.seconds_left() == 100.0  # frozen while paused
+    eta.resume()
+    assert eta.seconds_left() == 100.0
+    run(eta, clock, range(101, 111), 1, 200)
+    assert eta.seconds_left() == 90.0

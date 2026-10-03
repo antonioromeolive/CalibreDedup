@@ -137,6 +137,7 @@ class PlanItem:
     # their `unpack` is on, ticked or not (like the unreadable formats).
     archives: list = field(default_factory=list)
     status: str = ""  # filled during execution
+    done: bool = False  # executed: moved or trashed, the book has left the source (see executor.apply_result)
     # What to check before ticking, when the analysis isn't sure (an unproven duplicate,
     # files that open nowhere, a doubtful archive): see selection.needs_review. Such a
     # book starts unticked, and unticked nothing happens to it.
@@ -195,6 +196,9 @@ class Plan:
     stats: dict[str, int] = field(default_factory=dict)
     # An AI that stopped responding during the run, e.g. "text AI stopped at book 812 of 1500".
     ai_down: list[str] = field(default_factory=list)
+    # Books moved by an execution of this plan: source id -> id in the target. A plan can be
+    # executed again (the rest of its books) without a new analysis: see executor.apply_result.
+    moved: dict[int, int] = field(default_factory=dict)
 
     def count(self, action: Action) -> int:
         return sum(1 for i in self.items if i.action is action)

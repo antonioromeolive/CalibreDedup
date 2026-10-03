@@ -167,10 +167,11 @@ def blocked_reason(it: PlanItem, by_id: dict[int, PlanItem]) -> str:
 
 def actionable(plan: Plan) -> list[PlanItem]:
     """Items that execution will process, in plan order: the ticked ones (an unticked
-    book is left as it is). A blocked book, or one left in place, is processed only for
-    its unreadable formats and its archives (has_cleanup)."""
+    book is left as it is), not done by an earlier execution of the plan. A blocked book,
+    or one left in place, is processed only for its unreadable formats and its archives
+    (has_cleanup)."""
     stuck = blocked(plan)
-    return [i for i in plan.items if i.selected and (runs_main_action(i, stuck) or has_cleanup(i))]
+    return [i for i in plan.items if i.selected and not i.done and (runs_main_action(i, stuck) or has_cleanup(i))]
 
 
 def runs_main_action(i: PlanItem, stuck: dict[int, str]) -> bool:

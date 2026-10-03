@@ -22,8 +22,8 @@
 
 
 """What was found in the files of each book (its cover, its formats, their hashes, the
-language and length of its text), kept between runs: a library on a network drive is
-not read again, file by file, at each analysis.
+language and length of its text, its fingerprint), kept between runs: a library on a
+network drive is not read again, file by file, at each analysis.
 An entry holds while the book's last_modified is the same: Calibre changes it when
 the book's cover or formats change (not when a file is replaced by hand)."""
 
@@ -37,9 +37,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .extract import unreadable_formats
+from .extract import same_text_format, unreadable_formats, whole_text
 from .library_use import library_hash
 from .models import Book
+from .same_text import fingerprint
 
 log = logging.getLogger(__name__)
 
@@ -197,6 +198,47 @@ class TextFacts:
                 self.cache.put(b, {"formats": names, "language": language, "chars": chars})
                 self._read[key] = (language, chars)
         return self._read[key]
+
+    def save(self) -> None:
+        self.cache.save()
+
+
+class TextPrints:
+    """The fingerprint of each book's text (same_text.fingerprint) from its one compared
+    format (extract.same_text_format), kept: computed only for books still undecided, and
+    a whole text takes seconds to read (a MOBI is converted). `extractor`: a
+    TextExtractor, for PDF and the formats Calibre converts; None: EPUB and TXT only.
+    A file that can't be read has none (only the AI's reading marks a file unreadable)."""
+
+    def __init__(self, folder: Path | None, extractor=None):
+        self.cache = LibraryCache(folder, "prints")
+        self.extractor = extractor
+        self._read: dict[str, str | None] = {}  # path -> fingerprint, this run
+
+    def get(self, b: Book) -> str | None:
+        picked = same_text_format(b.formats)
+        if picked is None:
+            return None
+        fmt, path = picked
+        if path in self._read:
+            return self._read[path]
+        name = Path(path).name
+        known = self.cache.get(b)
+        if isinstance(known, dict) and known.get("name") == name:
+            fp = known.get("print")
+        else:
+            fp = self._fingerprint(fmt, path)
+            self.cache.put(b, {"name": name, "print": fp})
+        self._read[path] = fp
+        return fp
+
+    def _fingerprint(self, fmt: str, path: str) -> str | None:
+        try:
+            text = self.extractor.whole_text(fmt, path) if self.extractor is not None else whole_text(fmt, path)
+        except Exception as e:  # corrupt, DRM, unsupported...
+            log.info("Cannot read the whole text of %s: %s", path, e)
+            return None
+        return fingerprint(text) if text else None
 
     def save(self) -> None:
         self.cache.save()

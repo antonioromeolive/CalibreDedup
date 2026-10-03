@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 
 from .. import perf, tempdirs
 from ..awake import keep_awake
-from ..ai import AICache
+from ..ai import AICache, AIError, make_provider
 from ..calibre_env import calibre_is_running, known_libraries
 from ..config import Settings, config_dir, library_cache_dir
 from ..eta import Eta
@@ -56,8 +56,11 @@ from ..library_use import Conflict, LibraryInUse, LibraryUse, execution_conflict
 from ..extract import TextExtractor
 from ..models import Action, Plan, PlanItem
 from ..normalize import strip_accents
+from ..pause import Pause
+from ..judge import Judgement, apply_judgement, judge_pair
+from ..library_cache import TextPrints
 from ..planner import (
-    AI_OFF, MAX_CONSECUTIVE_AI_ERRORS, RETRY, SKIP_BOOK, build_plan, check_libraries,
+    AI_OFF, MAX_CONSECUTIVE_AI_ERRORS, RETRY, SKIP_BOOK, build_plan, check_libraries, redecide_ids,
     run_summary,
 )
 from ..report import write_csv
@@ -73,7 +76,8 @@ from .filters import STATUS_ENTRIES, STATUS_TIP, Entry, FilterButton, showing_te
 from .filters import filter_row as make_filter_row
 from .icons import DEDUP, app_icon, set_taskbar_identity
 from .settings_dialog import SettingsDialog
-from .style import BLUE, GREEN, RED, button_css, mark_inactive, set_running, style_none_item
+from .shutdown_box import ShutdownWhenDone
+from .style import BLUE, GREEN, RED, SLATE, button_css, mark_inactive, set_running, style_none_item
 
 log = logging.getLogger("calibre_dedup")
 
@@ -376,14 +380,13 @@ class PlanModel(QAbstractTableModel):
 
     def remove_done(self) -> int:
         """Drop the books executed successfully: they have left the source library.
-        Failed, unticked and Leave rows stay (a Leave row may be "OK" too: its
-        metadata was updated in place). Returns how many were removed."""
+        Failed, unticked and Leave rows stay (a row may be "OK" when only its cleanup
+        ran: unreadable formats, archive). Returns how many were removed."""
         if not self.plan:
             return 0
 
         def gone(it: PlanItem) -> bool:
-            # (a book left in place is "OK" when only its cleanup ran: unreadable formats, archive)
-            return it.status.startswith("OK") and it.action is not Action.LEAVE and it.selected
+            return it.done
         keep = [it for it in self.plan.items if not gone(it)]
         removed = len(self.plan.items) - len(keep)
         if removed:
@@ -652,6 +655,11 @@ class PlanTable(QTableView):
         super().keyPressEvent(event)
 
 
+# What a window is busy with, for the other windows (see shutdown.py).
+OPERATION_NAMES = {"analyze": "analyzing", "scan": "analyzing", "execute": "executing",
+                   "ask": "asking the AI again", "judge": "asking the Judge AI"}
+
+
 # --- workers --------------------------------------------------------------------
 class AnalyzeWorker(QThread, UnpackQuestion):
     progress = Signal(int, int, str)
@@ -660,13 +668,20 @@ class AnalyzeWorker(QThread, UnpackQuestion):
     failed = Signal(str)
     ai_down = Signal(str, bool)  # message, image AI: the GUI asks the user, then calls answer()
     unpack_asked = Signal(int)  # the GUI asks, then calls answer_unpack()
+    pause_waiting = Signal(bool)  # the analysis waits (Pause), or goes on
     BATCH_SECONDS = 0.3  # books with no duplicate go by by the thousand: send them in batches
 
-    def __init__(self, settings: Settings, source: str, target: str, trash: str, no_cache: bool = False):
+    def __init__(self, settings: Settings, source: str, target: str, trash: str, no_cache: bool = False,
+                 only: set[int] | None = None, moving: set[int] = frozenset(), leaving: set[int] = frozenset(),
+                 unpack: bool | None = None):
+        """`only`, `moving`, `leaving`: the AI asked again about some books of a plan (see
+        planner.build_plan); `unpack`: then, whether their archives are unpacked (not asked)."""
         super().__init__()
         self.settings, self.source, self.target, self.trash = settings, source, target, trash
         self.no_cache = no_cache
+        self.only, self.moving, self.leaving, self.unpack = only, moving, leaving, unpack
         self.cancel = threading.Event()
+        self.pause = Pause(on_wait=self.pause_waiting.emit)
         self._answered = threading.Event()
         self._choice = AI_OFF
         self._init_unpack()
@@ -719,9 +734,11 @@ class AnalyzeWorker(QThread, UnpackQuestion):
                               trash_unreadable=self.settings.trash_unreadable,
                               cleanup_only=self.settings.cleanup_only,
                               tag=self.settings.only_tag, tag_exclude=self.settings.only_tag_exclude,
-                              on_item=on_item, unpack=self.ask_unpack,
+                              on_item=on_item,
+                              unpack=self.ask_unpack if self.unpack is None else (lambda n: self.unpack),
                               generic_check=not self.settings.skip_generic_covers,
-                              library_cache=library_cache_dir())
+                              library_cache=library_cache_dir(), pause=self.pause,
+                              only=self.only, moving=self.moving, leaving=self.leaving)
             if batch:
                 self.items_ready.emit(batch.copy())
             self.finished_ok.emit(plan)
@@ -760,6 +777,61 @@ class ExecuteWorker(QThread):
             self.failed.emit(str(e))
 
 
+class JudgeWorker(QThread):
+    """Asks the Judge AI about some rows, one by one (judge.judge_pair)."""
+    judged = Signal(object, object)  # the item, its Judgement
+    progress = Signal(int, int, str)
+    finished_ok = Signal(int)  # rows judged
+    failed = Signal(str)
+    MAX_ERRORS = 3  # in a row: the judge is down, stop
+
+    def __init__(self, settings: Settings, items: list[PlanItem]):
+        super().__init__()
+        self.settings, self.items = settings, items
+        self.cancel = threading.Event()
+
+    def run(self):
+        with keep_awake():
+            self._run()
+
+    def _run(self):
+        extractor = None
+        try:
+            profile = self.settings.profile(self.settings.judge_profile)
+            if profile is None:
+                raise RuntimeError("Choose a Judge AI in Settings.")
+            provider = make_provider(profile)
+            extractor = TextExtractor(require_calibre_dir(self.settings), self.settings.pdf_pages,
+                                      self.settings.text_chars)
+            prints, cache = TextPrints(library_cache_dir(), extractor), AICache()
+            done = errors = 0
+            perf.run_start("dedup-judge", len(self.items), provider)
+            try:
+                for n, item in enumerate(self.items):
+                    if self.cancel.is_set():
+                        break
+                    perf.book(n + 1)
+                    self.progress.emit(n, len(self.items), f"Judge AI: {item.source.label()}")
+                    try:
+                        self.judged.emit(item, judge_pair(provider, item, extractor, cache, prints))
+                        done, errors = done + 1, 0
+                    except AIError as e:
+                        errors += 1
+                        log.warning("Judge AI on %s: %s", item.source.label(), e)
+                        if errors >= self.MAX_ERRORS:
+                            raise RuntimeError(f"The Judge AI failed {errors} times in a row: {e}") from e
+            finally:
+                perf.run_end(done, self.cancel.is_set())
+                prints.save()
+            self.finished_ok.emit(done)
+        except Exception as e:
+            log.exception("Judge AI failed")
+            self.failed.emit(str(e))
+        finally:
+            if extractor is not None:
+                extractor.close()
+
+
 # --- main window ------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, settings: Settings, log_handler: QtLogHandler):
@@ -768,6 +840,9 @@ class MainWindow(QMainWindow):
         self.plan: Plan | None = None
         self.worker: QThread | None = None
         self._stopping = False  # Stop pressed; the worker ends after the current book
+        self._paused = False  # the analysis waits (Pause), see pause.py
+        self._exec_pausing = False  # Pause pressed while executing: it stops after the current book
+        self._exec_paused = False  # an execution paused: Continue executes the remaining checked books
         self._close_pending = False  # quit requested; close once the worker has ended
         self._library_use: LibraryUse | None = None  # the libraries of the plan shown (see library_use)
         self._operation = ""  # "analyze" or "execute" while a worker thread exists
@@ -861,6 +936,9 @@ class MainWindow(QMainWindow):
         self.analyze_btn = QPushButton("1. Analyze (dry run)")
         self.execute_btn = QPushButton("2. Execute checked")
         self.stop_btn = QPushButton("Stop")
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setStyleSheet(button_css(*SLATE))
+        self.pause_btn.clicked.connect(self._toggle_pause)
         self.analyze_btn.setStyleSheet(button_css(*BLUE))
         self.execute_btn.setStyleSheet(button_css(*GREEN))
         # Red while something can be stopped, grey otherwise.
@@ -871,9 +949,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop)
         self.export_btn.clicked.connect(self._export)
         self.summary = _elastic(QLabel())
+        self.shutdown = ShutdownWhenDone(self, "dedup", lambda text: self.status_label.setText(text))
         btn_row = QHBoxLayout()
-        for w in (self.analyze_btn, self.execute_btn, self.stop_btn, self.export_btn):
+        for w in (self.analyze_btn, self.execute_btn, self.pause_btn, self.stop_btn, self.export_btn):
             btn_row.addWidget(w)
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self.shutdown.box)
         btn_row.addStretch(1)
         btn_row.addWidget(self.summary)
 
@@ -984,6 +1065,7 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.addWidget(self.shutdown.banner)  # shown only while "shut down when done" is on
         layout.addWidget(libs)
         layout.addLayout(ai_row)
         layout.addLayout(btn_row)
@@ -1146,6 +1228,8 @@ class MainWindow(QMainWindow):
         set_running(self.stop_btn, busy and self._stopping)
         self.export_btn.setEnabled(not busy and self.plan is not None)
         self.stop_btn.setEnabled(busy and not self._stopping)
+        self._update_pause_button()
+        self.shutdown.set_busy(self.worker is not None, OPERATION_NAMES.get(self._operation, ""))
         self.table.setSortingEnabled(not busy)  # no sorting while rows arrive or results come in
         for box in self.lib_boxes.values():
             box.setEnabled(not busy)
@@ -1171,27 +1255,14 @@ class MainWindow(QMainWindow):
             f"<b style='color:{ACTION_COLORS[Action.MOVE]}'>{p.count(Action.MOVE)} move</b> · "
             f"<b style='color:{ACTION_COLORS[Action.TRASH]}'>{p.count(Action.TRASH)} trash</b> · "
             f"<b style='color:{ACTION_COLORS[Action.LEAVE]}'>{p.count(Action.LEAVE)} leave</b>")
-        if self.model.locked and not self._busy and self.worker is None:
-            # Executed (fully or stopped): the libraries have changed and this plan
-            # can't run again. A new analysis is quick (AI answers are cached).
-            done = self._executed_removed + sum(1 for i in p.items if i.status)
-            text = f"{done} executed"
-            if self._executed_removed:
-                text += f" ({self._executed_removed} done, removed from the list)"
-            self.checked_label.setText(text + " · analyze again for the rest")
-            self.execute_btn.setText("Analyze again to continue")
-            self.execute_btn.setToolTip("This plan has been executed and the libraries have changed.\n"
-                                        "Analyze again (fast: AI answers are cached) to continue with the rest.")
-            self.execute_btn.setEnabled(False)
-            set_running(self.execute_btn, False)
-            return
-        self.execute_btn.setToolTip("")
         todo = actionable(p)
-        possible = sum(1 for i in p.items if checkable(i))
+        possible = sum(1 for i in p.items if checkable(i) and not i.done)
         n_blocked = len(self.model.blocked)
         text = f"{len(todo)} of {possible} checked"
         if n_blocked:
             text += f" · <b style='color:#e65100'>{n_blocked} blocked</b>"
+        if self._executed_removed:  # executed books leave the list; the others can be executed too
+            text += f" · {self._executed_removed} executed, taken off the list"
         self.checked_label.setText(text)
         executing = self.worker is not None and self._operation == "execute"
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
@@ -1291,7 +1362,110 @@ class MainWindow(QMainWindow):
         if items and self._can_edit():
             menu.addSeparator()
             self._add_override_actions(menu, items)
+        if items and self.plan is not None:
+            menu.addSeparator()
+            self._add_ai_actions(menu, items)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # --- the AI asked again, the Judge AI ---------------------------------------------------
+    def _ask_choices(self) -> list[tuple[str, str | None]]:
+        """The entries of the Ask the AI menu: (label, profile name), None for the AIs selected above."""
+        text, image = self.text_box.currentData(), self.image_box.currentData()
+        above = "With the AIs selected above"
+        if text:
+            above += f" ({text}" + (f" + {image}" if image and image != text else "") + ")"
+        return [(above, None)] + [(self._profile_label(p) + (" · text and covers" if p.vision else " · text only"),
+                                   p.name) for p in self.settings.profiles]
+
+    def _add_ai_actions(self, menu: QMenu, items: list[PlanItem]):
+        """Ask the AI again about these books (and those whose decision rests on them), never
+        from the cache; or ask the Judge AI about the pairs. Not while something runs."""
+        items = [i for i in items if not i.done]
+        why = ("something is running" if self.worker is not None
+               else "executing" if self.model.locked else "no book" if not items else "")
+        ask = menu.addMenu(f"Ask the AI again ({len(items)})" if len(items) > 1 else "Ask the AI again")
+        ask.setToolTip("Decide these books again, with the AI asked again (not from the cache);\n"
+                       "the books whose decision rests on them are decided again too.")
+        ask.setEnabled(not why)
+        for label, name in self._ask_choices():
+            act = ask.addAction(label)
+            act.triggered.connect(lambda _=False, n=name: self._ask_ai(items, n))
+            if name is None:
+                act.setEnabled(bool(self.text_box.currentData()))
+                ask.addSeparator()
+        pairs = [i for i in items if i.match is not None]
+        judge = self.settings.judge_profile
+        label = f"Judge AI ({judge})" if judge else "Judge AI (choose one in Settings → Analysis)"
+        act = menu.addAction(f"{label} ({len(pairs)})" if len(items) > 1 else label)
+        act.setToolTip("A stronger model judges the book and its match with everything known about them;\n"
+                       "its answer becomes the row's suggestion, unticked, to review.")
+        act.setEnabled(bool(judge) and bool(pairs) and not why)
+        act.triggered.connect(lambda: self._judge(pairs))
+
+    def _ask_settings(self, profile: str | None) -> Settings:
+        if profile is None:
+            return replace(self.settings)
+        return replace(self.settings, text_profile=profile,
+                       image_profile=profile if (p := self.settings.profile(profile)) and p.vision else "")
+
+    def _ask_ai(self, items: list[PlanItem], profile: str | None = None):
+        if self.worker is not None or self.plan is None or self.model.locked:
+            return
+        self._sync_settings()
+        settings = self._ask_settings(profile)
+        p = self.plan
+        ids = redecide_ids(p, {i.source.id for i in items})
+        moving = {i.source.id for i in p.items if i.action is Action.MOVE and i.selected and not i.done
+                  and i.source.id not in ids}
+        leaving = {i.source.id for i in p.items if i.action is Action.TRASH and i.selected and not i.done
+                   and i.source.id not in ids} if p.same_library else set()
+        unpack = any(u.unpack for i in p.items if i.source.id in ids for u in i.archives)
+        worker = AnalyzeWorker(settings, p.source_library, p.target_library, p.trash_library, no_cache=True,
+                               only=ids, moving=moving, leaving=leaving, unpack=unpack)
+        worker.progress.connect(self._on_progress)
+        worker.finished_ok.connect(self._redecided)
+        worker.failed.connect(self._worker_failed)
+        worker.ai_down.connect(self._on_ai_down)
+        worker.pause_waiting.connect(self._on_pause_waiting)
+        self._eta.reset()
+        self._start(worker, "ask")
+        ais = " + ".join(dict.fromkeys(n for n in (settings.text_profile, settings.image_profile) if n))
+        log.info("Asking the AI (%s) again about %d book(s), %d with those whose decision rests on them",
+                 ais or "none", len(items), len(ids))
+
+    def _redecided(self, new: Plan):
+        """The books decided again replace their rows (what the user did to those rows is not kept)."""
+        by_id = {it.source.id: it for it in new.items}
+        p = self.plan
+        p.items = [by_id.get(it.source.id, it) for it in p.items]
+        self.model.set_plan(p)
+        self._finish()
+        msg = f"The AI was asked again: {len(by_id)} book(s) decided again"
+        log.info(msg)
+        self.status_label.setText(msg)
+
+    def _judge(self, items: list[PlanItem]):
+        if self.worker is not None or self.plan is None or self.model.locked or not items:
+            return
+        self._sync_settings()
+        worker = JudgeWorker(replace(self.settings), items)
+        worker.progress.connect(self._on_progress)
+        worker.judged.connect(self._on_judged)
+        worker.finished_ok.connect(self._judge_done)
+        worker.failed.connect(self._worker_failed)
+        self._start(worker, "judge")
+        log.info("Asking the Judge AI (%s) about %d book(s)", self.settings.judge_profile, len(items))
+
+    def _on_judged(self, item: PlanItem, judgement: Judgement):
+        if self.plan is not None and item in self.plan.items:
+            apply_judgement(self.plan, item, judgement)
+            self.model.refresh()
+
+    def _judge_done(self, count: int):
+        self._finish()
+        msg = f"The Judge AI answered about {count} book(s): its suggestions are unticked, to review"
+        log.info(msg)
+        self.status_label.setText(msg)
 
     def _add_open_actions(self, menu: QMenu, item: PlanItem):
         """Open the book and its match with the apps the system associates with them."""
@@ -1548,6 +1722,9 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._analysis_failed)
         worker.ai_down.connect(self._on_ai_down)
         worker.unpack_asked.connect(self._on_unpack_asked)
+        worker.pause_waiting.connect(self._on_pause_waiting)
+        self._exec_paused = False
+        self._executed_removed = 0
         self._start(worker, "analyze")
         log.info("Analysis started")
 
@@ -1597,8 +1774,16 @@ class MainWindow(QMainWindow):
         if not self._busy or not self._status_msg:
             return
         text = with_eta(self._status_msg, self._eta.text() if self._operation == "analyze" else "")
+        pause = getattr(self.worker, "pause", None)
         if self._stopping:
             text = f"Stopping after the current book… · {text}"
+        elif self._exec_pausing:
+            text = f"Pausing after the current book… · {text}"
+        elif pause is not None and pause.paused:
+            text = f"{'Paused' if self._paused else 'Pausing after the current book…'} · {text}"
+            if self._paused:  # the seconds counter would count the pause
+                self.status_label.setText(text)
+                return
         elapsed = int(time.monotonic() - self._status_since)
         if elapsed >= 3:
             text += f" · {elapsed} s"
@@ -1633,7 +1818,8 @@ class MainWindow(QMainWindow):
                 "then analyze again (fast: AI answers are cached).")
 
     # --- execute --------------------------------------------------------------------
-    def _execute(self):
+    def _execute(self, continuing: bool = False):
+        """`continuing`: Continue after Pause, the remaining checked books without asking again."""
         if not self.plan:
             return
         if calibre_is_running():
@@ -1657,7 +1843,7 @@ class MainWindow(QMainWindow):
         bad = sum(1 for i in todo if i.bad_formats_to_trash and id(i) not in trashed_whole)
         unpacked = sum(1 for i in todo if i.archives_to_unpack)
         to_review = sum(1 for i in p.items if needs_review(i))
-        answer = QMessageBox.question(
+        answer = QMessageBox.Yes if continuing else QMessageBox.question(
             self, "Execute checked books",
             f"{moves} books will be moved to the target library.\n"
             f"{trashes} books will be moved to the trash library ({p.trash_library}).\n"
@@ -1681,9 +1867,10 @@ class MainWindow(QMainWindow):
         self._sync_settings()
         self.store.save(p)
         self.model.locked = True
+        self._exec_paused = self._exec_pausing = False
         worker = ExecuteWorker(self.settings, p)
         total = len(todo)
-        self._done_count = self._executed_removed = 0
+        self._done_count = 0
         self.progress.setMaximum(total)
         self.progress.setValue(0)
         worker.result.connect(self._on_result)
@@ -1729,14 +1916,28 @@ class MainWindow(QMainWindow):
         self._done_count += 1
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})")
         self.progress.setValue(self._done_count)
-        self.status_label.setText(f"{item.source.label()}: {item.status}")
+        prefix = "Pausing after the current book… · " if self._exec_pausing else ""
+        self.status_label.setText(f"{prefix}{item.source.label()}: {item.status}")
         self.model.item_changed(item)
 
     def _execution_done(self, ok: int, failed: int):
-        self._finish()  # the model stays locked: the plan is spent; analyze again
+        """The executed books leave the list; the plan can be executed again for the others
+        (executor.apply_result wrote what was done into it): no new analysis needed."""
+        paused, self._exec_pausing = self._exec_pausing and not self._stopping, False
+        self._exec_paused = paused and bool(actionable(self.plan))
+        self.model.locked = False
+        self._finish()
         self._remove_executed()
         self.model.refresh()
+        if self._exec_paused:
+            msg = (f"Execution paused: {ok} succeeded, {failed} failed. Continue executes the remaining "
+                   f"{len(actionable(self.plan))} checked books.")
+            log.info(msg)
+            self.status_label.setText(msg)
+            return
         msg = f"Execution finished: {ok} succeeded, {failed} failed."
+        if failed:
+            msg += " The failed books stay in the list, unticked: tick them to try again."
         log.info(msg)
         if not self._close_pending:
             (QMessageBox.warning if failed else QMessageBox.information)(self, "Done", msg)
@@ -1761,6 +1962,8 @@ class MainWindow(QMainWindow):
             self.worker, self._operation = None, ""
         worker.deleteLater()
         self._set_busy(self._busy)  # re-enable Analyze/Execute now that the thread is gone
+        if self.worker is None and not self._exec_paused and not self._close_pending:
+            self.shutdown.run_ended()
         if self._close_pending and self.worker is None:
             QTimer.singleShot(0, self.close)
 
@@ -1773,10 +1976,10 @@ class MainWindow(QMainWindow):
 
     def _worker_failed(self, message: str):
         if isinstance(self.worker, ExecuteWorker):
-            if not self._done_count:
-                self.model.locked = False  # nothing was executed; the plan is still usable
-            else:
-                self._remove_executed()
+            # What was done is in the plan (executor.apply_result): the rest can be executed again.
+            self.model.locked = False
+            self._exec_pausing = self._exec_paused = False
+            self._remove_executed()
         self._finish()
         log.error(message)
         if not self._close_pending:
@@ -1791,6 +1994,61 @@ class MainWindow(QMainWindow):
                 self._show_status()
             else:
                 self.status_label.setText("Stopping after the current book…")
+
+    # --- pause ------------------------------------------------------------------------
+    def _update_pause_button(self):
+        """Pause an analysis between two books, or an execution (it stops after the current
+        book; Continue executes the remaining checked books). Continue goes on."""
+        worker = self.worker
+        if isinstance(worker, AnalyzeWorker) and self._busy:
+            paused = worker.pause.paused
+            self.pause_btn.setText("Continue" if paused else "Pause")
+            self.pause_btn.setToolTip("Go on with the analysis" if paused else
+                                      "Pause the analysis after the current book (Stop still keeps what is done)")
+            self.pause_btn.setEnabled(not self._stopping)
+            set_running(self.pause_btn, paused)
+        elif isinstance(worker, ExecuteWorker) and self._busy:
+            self.pause_btn.setText("Pausing…" if self._exec_pausing else "Pause")
+            self.pause_btn.setToolTip("Stop after the current book; Continue then executes the remaining checked books")
+            self.pause_btn.setEnabled(not self._exec_pausing and not self._stopping)
+            set_running(self.pause_btn, self._exec_pausing)
+        else:
+            can_continue = (self._exec_paused and worker is None and self.plan is not None
+                            and bool(actionable(self.plan)))
+            self.pause_btn.setText("Continue" if can_continue else "Pause")
+            self.pause_btn.setToolTip("Execute the remaining checked books" if can_continue else "")
+            self.pause_btn.setEnabled(can_continue)
+            set_running(self.pause_btn, can_continue)
+
+    def _toggle_pause(self):
+        worker = self.worker
+        if isinstance(worker, AnalyzeWorker):
+            if worker.pause.paused:
+                worker.pause.resume()
+                log.info("Analysis continued")
+            else:
+                worker.pause.pause()
+                log.info("Pausing the analysis after the current book")
+        elif isinstance(worker, ExecuteWorker):
+            self._exec_pausing = True
+            worker.cancel.set()  # it stops after the current book; the plan stays executable
+            log.info("Pausing the execution after the current book")
+            self.status_label.setText("Pausing after the current book…")
+        elif self._exec_paused:
+            self._execute(continuing=True)
+            return
+        self._set_busy(self._busy)
+        self._show_status()
+
+    def _on_pause_waiting(self, waiting: bool):
+        """The analysis has stopped between two books (Pause), or goes on."""
+        self._paused = waiting
+        if waiting:
+            self._eta.pause()
+        else:
+            self._eta.resume()
+        self._set_busy(self._busy)
+        self._show_status()
 
     def _export(self):
         if not self.plan:
@@ -1822,6 +2080,7 @@ class MainWindow(QMainWindow):
         self.settings.window_geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self._sync_settings()
         self._release_libraries()
+        self.shutdown.close()
         event.accept()
 
 

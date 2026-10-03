@@ -23,7 +23,8 @@
 """Generic covers: the same image on books of different titles and authors, e.g. the "Microsoft
 Word 2000" logo a converter took from a document, or a publisher's stock picture.
 Such a cover says nothing about the book: it is never proof of a duplicate, and
-calibre-review tags its books BAD_COVER_TAG so that a real cover can be found later."""
+calibre-review tags its books BAD_COVER_TAG so that a real cover can be found later.
+So is a page used as cover (page_cover): a page of the book that Calibre took for its cover."""
 
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ import hashlib
 import logging
 import threading
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 from .library_cache import LibraryCache
@@ -119,3 +121,50 @@ def generic_covers(books: list[Book], cancel: threading.Event | None = None,
 
 def generic_note(count: int) -> str:
     return f"generic cover (the same image on {count} books)"
+
+
+# A page used as cover: Calibre's first page of a PDF or a document, rendered as the cover.
+# Measured on 400 covers of a real library (TODO.md): pages have the exact shape of a sheet
+# of paper and are white with no colour; real covers, even plain ones, have other shapes.
+PAGE_SHAPES = (1.414, 1.294, 0.707, 0.773)  # height/width: A4, US Letter, upright and as a spread
+PAGE_SHAPE_TOLERANCE = 0.02
+PAGE_WHITE = 0.75  # at least this share of near-white pixels
+PAGE_COLOUR = 0.03  # at most this share of coloured pixels
+PAGE_NOTE = "a page used as cover"
+
+
+def page_cover(path: str | Path) -> bool:
+    """Whether the cover image is a page of the book (text, a title page, a blank page)
+    rather than a real cover. False when it can't be read."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return False
+    return _page_cover(str(path), st.st_mtime_ns, st.st_size)
+
+
+@lru_cache(maxsize=4096)
+def _page_cover(path: str, mtime_ns: int, size: int) -> bool:  # keyed on mtime/size: covers change
+    # Imported here so the module stays usable without Qt.
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage
+
+    image = QImage(path)
+    if image.isNull() or not image.width():
+        return False
+    shape = image.height() / image.width()
+    if not any(abs(shape - s) <= PAGE_SHAPE_TOLERANCE * s for s in PAGE_SHAPES):
+        return False
+    small = image.scaled(96, max(1, round(96 * shape)), Qt.IgnoreAspectRatio,
+                         Qt.SmoothTransformation).convertToFormat(QImage.Format_RGB32)
+    white = colour = 0
+    for y in range(small.height()):
+        for x in range(small.width()):
+            c = small.pixel(x, y)
+            r, g, b = (c >> 16) & 255, (c >> 8) & 255, c & 255
+            if max(r, g, b) - min(r, g, b) > 40:
+                colour += 1
+            if (r * 299 + g * 587 + b * 114) // 1000 > 200:
+                white += 1
+    n = small.width() * small.height()
+    return white >= PAGE_WHITE * n and colour <= PAGE_COLOUR * n

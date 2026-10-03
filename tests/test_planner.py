@@ -51,6 +51,17 @@ CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, name TEXT,
 """
 
 
+def prose(seed: str, words: int = 1500) -> str:
+    """English-like text made from `seed`: the same seed, the same text; another, another text."""
+    import random
+    from calibre_dedup.language import _WORDS
+    rng = random.Random(seed)
+    common = _WORDS["eng"].split()
+    letters = "abcdefghijklmnoprstuvz"
+    vocabulary = ["".join(rng.choice(letters) for _ in range(rng.randint(4, 9))) for _ in range(400)]
+    return " ".join(rng.choice(common) if rng.random() < 0.4 else rng.choice(vocabulary) for _ in range(words)) + "."
+
+
 def make_library(path: Path, books: list[dict]) -> str:
     path.mkdir()
     conn = sqlite3.connect(path / "metadata.db")
@@ -80,11 +91,19 @@ def make_library(path: Path, books: list[dict]) -> str:
         for kind, val in b.get("ids", {}).items():
             conn.execute("INSERT INTO identifiers (book, type, val) VALUES (?,?,?)", (i, kind, val))
         folder = path / f"a/b ({i})"
-        if "text" in b:  # a real EPUB with this text and a per-book OPF and cover
+        if "text" in b or "prose" in b:  # a real EPUB with this text and a per-book OPF and cover
             folder.mkdir(parents=True)
             with zipfile.ZipFile(folder / "book.epub", "w") as z:
-                z.writestr("content.opf", f"<package>{b['title']} {i}</package>")
-                body = b["text"] if b["text"].startswith("<") else f"<p>{b['text'] * 200}</p>"
+                if "prose" in b:  # a text whose fingerprint can be taken (see same_text.py): a whole EPUB
+                    z.writestr("META-INF/container.xml", '<container><rootfiles><rootfile full-path="content.opf"/>'
+                                                         '</rootfiles></container>')
+                    z.writestr("content.opf", f'<package xmlns="http://www.idpf.org/2007/opf"><metadata>{b["title"]} {i}</metadata><manifest>'
+                                              '<item id="c1" href="text/ch1.xhtml"/></manifest>'
+                                              '<spine><itemref idref="c1"/></spine></package>')
+                    body = f"<p>{prose(b['prose'])}</p>"
+                else:
+                    z.writestr("content.opf", f"<package>{b['title']} {i}</package>")
+                    body = b["text"] if b["text"].startswith("<") else f"<p>{b['text'] * 200}</p>"
                 z.writestr("text/ch1.xhtml", f"<html><head><style>p {{ x: y }}</style></head><body>{body}</body></html>")
                 z.writestr("cover.jpeg", bytes([i]) * 50)
         if b.get("cover"):  # a cover.jpg of its own: no two books' are the same file
@@ -472,16 +491,16 @@ def test_shared_asin_proves_duplicate(libs):
     assert item.action is Action.TRASH and "same ASIN (B01BLYJWMA)" in item.reason
 
 
-def test_identical_epub_text_proves_duplicate_before_ai(libs):
+def test_same_text_proves_duplicate_before_ai(libs):
     src, tgt, trash = libs(
-        source=[{"title": "Children of Dune", "text": "Chapter one."},
-                {"title": "Dune Messiah", "text": "Other words."}],
-        target=[{"title": "Children of Dune", "publisher": "Ace", "text": "Chapter one."},
-                {"title": "Dune Messiah", "publisher": "Ace", "text": "Different words."}],
+        source=[{"title": "Children of Dune", "prose": "Chapter one."},
+                {"title": "Dune Messiah", "prose": "Other words."}],
+        target=[{"title": "Children of Dune", "publisher": "Ace", "prose": "Chapter one."},
+                {"title": "Dune Messiah", "publisher": "Ace", "prose": "Different words."}],
     )
     resolver = FakeResolver({})
     plan = build_plan(src, tgt, trash, resolver)
-    assert plan.items[0].action is Action.TRASH and "identical EPUB text" in plan.items[0].reason
+    assert plan.items[0].action is Action.TRASH and "same text (100%)" in plan.items[0].reason
     assert plan.items[1].action is Action.LEAVE
     assert resolver.calls == ["Dune Messiah", "Dune Messiah"]  # AI only where the text differs
 
@@ -493,7 +512,7 @@ def test_image_only_epubs_are_not_matched_by_text(libs):
         target=[{"title": "Children of Dune", "publisher": "Ace", "text": page}],
     )
     item = build_plan(src, tgt, trash).items[0]
-    assert item.action is Action.LEAVE and "identical EPUB text" not in item.reason
+    assert item.action is Action.LEAVE and "same text" not in item.reason
 
 
 def test_empty_ai_reply_means_nothing_found():
@@ -806,10 +825,10 @@ def test_similar_file_name_title_is_a_duplicate_with_proof(libs):
     assert item.action is Action.TRASH and "'brother jacob'" in item.reason and "same ISBN" in item.reason
 
 
-def test_similar_title_with_identical_epub_text(libs):
-    item = _similar(libs, [{"title": "SHIFTING WINDS", "authors": ["AA.VV."], "text": "Una storia. "}],
-                    [{"title": "SHIFTING WINDS Inverno 2001", "authors": ["Autori Vari"], "text": "Una storia. "}])
-    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+def test_similar_title_with_the_same_text(libs):
+    item = _similar(libs, [{"title": "SHIFTING WINDS", "authors": ["AA.VV."], "prose": "Una storia. "}],
+                    [{"title": "SHIFTING WINDS Inverno 2001", "authors": ["Autori Vari"], "prose": "Una storia. "}])
+    assert item.action is Action.TRASH and "same text (100%)" in item.reason
 
 
 def test_similar_title_cover_decides(libs):
@@ -928,8 +947,8 @@ def test_epub_cover_is_read_from_the_package(tmp_path):
 
 # --- authors written differently ------------------------------------------------------
 MARRYAT = dict(
-    source=[{"title": "The Mission", "authors": ["Frederickk Marryat"], "text": "A mission at sea. "}],
-    target=[{"title": "The Mission", "authors": ["Frederick Marryat"], "text": "A mission at sea. "}],
+    source=[{"title": "The Mission", "authors": ["Frederickk Marryat"], "prose": "A mission at sea. "}],
+    target=[{"title": "The Mission", "authors": ["Frederick Marryat"], "prose": "A mission at sea. "}],
 )
 
 
@@ -938,7 +957,7 @@ def test_author_one_letter_apart_is_the_same_person(libs):
     assert build_plan(src, tgt, trash).items[0].action is Action.MOVE  # option off
     resolver = FakeResolver({})
     item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
-    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+    assert item.action is Action.TRASH and "same text (100%)" in item.reason
     assert "same person: 'Frederickk Marryat' / 'Frederick Marryat' (one letter apart)" in item.reason
     assert resolver.person_calls == []  # no AI needed
     assert build_plan(src, tgt, trash, None, author_variants=True).items[0].action is Action.TRASH  # nor any AI
@@ -946,8 +965,8 @@ def test_author_one_letter_apart_is_the_same_person(libs):
 
 def test_other_author_spellings_are_asked_to_the_ai(libs):
     src, tgt, trash = libs(
-        source=[{"title": "Delitto e castigo", "authors": ["Dostoevskij"], "text": "Pietroburgo. "}],
-        target=[{"title": "Delitto e castigo", "authors": ["Fyodor Dostoyevsky"], "text": "Pietroburgo. "},
+        source=[{"title": "Delitto e castigo", "authors": ["Dostoevskij"], "prose": "Pietroburgo. "}],
+        target=[{"title": "Delitto e castigo", "authors": ["Fyodor Dostoyevsky"], "prose": "Pietroburgo. "},
                 {"title": "Delitto e castigo", "authors": ["Mario Rossi"]}],
     )
     resolver = FakeResolver({})
@@ -990,8 +1009,8 @@ def test_same_person_asks_in_english_and_caches(tmp_path):
 
 def test_first_names_as_initials_are_the_same_person_without_ai(libs):
     src, tgt, trash = libs(
-        source=[{"title": "Under the Mendips", "authors": ["Marshall, Emma"], "text": "Silenzio nello spazio profondo. "}],
-        target=[{"title": "Under The Mendips", "authors": ["E.Marshall"], "text": "Silenzio nello spazio profondo. "}],
+        source=[{"title": "Under the Mendips", "authors": ["Marshall, Emma"], "prose": "Silenzio nello spazio profondo. "}],
+        target=[{"title": "Under The Mendips", "authors": ["E.Marshall"], "prose": "Silenzio nello spazio profondo. "}],
     )
     resolver = FakeResolver({})
     item = build_plan(src, tgt, trash, resolver, author_variants=True).items[0]
@@ -1046,9 +1065,9 @@ def test_cleanup_only_keeps_the_epub_copy(libs):
 
 # --- title and author swapped ---------------------------------------------------------
 KINGSTON = dict(
-    source=[{"title": "Kingston", "authors": ["The Log House by the Lake"], "text": "A log house. "},
+    source=[{"title": "Kingston", "authors": ["The Log House by the Lake"], "prose": "A log house. "},
             {"title": "The Boy who sailed with Blake", "authors": ["William Henry Giles Kingston"]}],
-    target=[{"title": "The Log House by the Lake", "authors": ["William Henry Giles Kingston"], "text": "A log house. "}],
+    target=[{"title": "The Log House by the Lake", "authors": ["William Henry Giles Kingston"], "prose": "A log house. "}],
 )
 
 
@@ -1057,7 +1076,7 @@ def test_swapped_title_and_author_are_put_right(libs):
     resolver = FakeResolver({})
     item = build_plan(src, tgt, trash, resolver, author_variants=True, fix_swapped=True).items[0]
     assert item.swapped and item.identity.title == "The Log House by the Lake" and item.identity.authors == ["Kingston"]
-    assert item.action is Action.TRASH and "identical EPUB text" in item.reason
+    assert item.action is Action.TRASH and "same text (100%)" in item.reason
     assert "(surname only)" in item.reason and "title and author were swapped" in item.reason
     assert item.source.title == "Kingston"  # the record itself, as the executor finds it
     assert resolver.person_calls == []
@@ -1144,3 +1163,35 @@ def test_the_files_of_one_library_are_checked_once(tmp_path, monkeypatch):
     again = build_plan(library, library, str(tmp_path / "trash"), library_cache=cache)
     assert len(checked) == 2  # from the cache
     assert actions(again) == actions(first)
+
+
+def test_only_some_books_are_decided_again_against_the_plan_shown(libs):
+    from calibre_dedup.planner import redecide_ids
+    src, tgt, trash = libs(source=[{"title": "Dune", "publisher": "Ace", "year": 1965},
+                                   {"title": "Dune", "publisher": "Ace", "year": 1965},
+                                   {"title": "Emma", "authors": ["Jane Austen"]}],
+                           target=[])
+    plan = build_plan(src, tgt, trash)
+    move, dup, emma = plan.items
+    assert (move.action, dup.action) == (Action.MOVE, Action.TRASH) and dup.match_planned
+    assert redecide_ids(plan, {move.source.id}) == {move.source.id, dup.source.id}  # the duplicate rests on it
+    assert redecide_ids(plan, {dup.source.id}) == {dup.source.id}
+    # Only the duplicate again: the book the plan moves is matched as a book moved by this run
+    again = build_plan(src, tgt, trash, only={dup.source.id}, moving={move.source.id})
+    [item] = again.items
+    assert item.action is Action.TRASH and item.match_planned and item.match.id == move.source.id
+    # Without the move, it is not in the target: moved itself
+    [item] = build_plan(src, tgt, trash, only={dup.source.id}).items
+    assert item.action is Action.MOVE
+
+
+def test_one_library_only_some_books_against_the_books_kept(libs):
+    src, _, trash = libs(source=[{"title": "Dune", "publisher": "Ace", "year": 1965, "formats": ["EPUB", "MOBI"]},
+                                 {"title": "Dune", "publisher": "Ace", "year": 1965}], target=[])
+    plan = build_plan(src, src, trash)
+    keep, dup = plan.items if plan.items[0].action is Action.LEAVE else plan.items[::-1]
+    assert dup.action is Action.TRASH and dup.match.id == keep.source.id
+    [item] = build_plan(src, src, trash, only={dup.source.id}).items
+    assert item.action is Action.TRASH and item.match.id == keep.source.id
+    [item] = build_plan(src, src, trash, only={dup.source.id}, leaving={keep.source.id}).items
+    assert item.action is Action.LEAVE and item.match is None  # the other copy is being trashed: no copy to keep
