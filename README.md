@@ -53,6 +53,7 @@ analyze again.
 **Contents**
 
 - [Installation](#installation)
+- [Every check, step by step](#every-check-step-by-step)
 - [Merge and Dedup](#merge-and-dedup)
 - [Metadata Review](#metadata-review)
 - [AI](#ai)
@@ -94,6 +95,280 @@ go to sleep on its idle timer, so a run left overnight isn't paused halfway. The
 may still turn off, and closing the lid or choosing *Sleep* still works. When the run
 ends, the idle timer starts again from zero: the computer sleeps after its usual
 *Sleep after* time.
+
+
+## Every check, step by step
+
+What the two programs check, in the order they do it. A book stops at the first step that
+decides it. Each step links to where it is explained in full.
+
+### Merge and Dedup: Analyze
+
+**Before the first book**
+
+1. **The libraries.** Source, target and trash are all set; the trash library differs from the
+   other two; the source is a Calibre library; target and trash are a library or an empty
+   folder; every path is shorter than 89 characters (Calibre's limit). A library that another
+   window is analyzing, or uses as its trash library, can't be analyzed.
+2. **The metadata of both libraries** is read; no book file is opened yet. With a tag filter
+   only the source books with the tag (or without it) are analyzed; the target is always read
+   whole.
+3. **Archives** (with an AI selected): if source books are stored as clear RAR/ZIP/7Z archives,
+   you are asked once whether to unpack them ([archives](#books-stored-as-an-archive-rar-zip-7z)).
+4. **Generic covers** (with a cover check on): every cover of both libraries is looked at, to
+   find the same image on books of 3 or more titles and authors (remembered per library).
+5. **The target books** with at least one file are indexed by title and authors, by series and
+   number (option), and by file format and size. A record with title and author swapped is
+   indexed put right.
+6. **The source books are sorted best copy first**: an EPUB that opens, then MOBI, then AZW,
+   then the richer metadata (formats, cover, description, publisher, year, ISBNs). Of two
+   copies, the one analyzed first is the one kept.
+
+**For each source book** (*Pause* and *Stop* act between two books)
+
+1. **No file at all**: an empty record → *Trash*, ticked.
+2. **Its files**, checked without reading them: a format Calibre doesn't read, an empty file, a
+   file that isn't what its format says ([files Calibre can't open](#files-calibre-cant-open)).
+   None usable: *Trash* if none opens anywhere (to review, unless *Move files Calibre can't open
+   … without asking* is on), else it stays in the source (a DOC, an RTF Word opens). Some
+   usable: the book is decided on those.
+3. **Title and author swapped** ("Kingston" by "The Log House by the Lake"): analyzed put right;
+   such a book may be trashed, never moved.
+4. **An identical file** in another book (same format and size, then the same content) →
+   duplicate, whatever the titles. A file shared by books of 3 or more titles and authors is a
+   placeholder and proves nothing.
+5. **Same series and number** (option *Same series + same number*), with the title or an author
+   in common → duplicate, unless its text is in another language.
+6. **No title or no authors** → stays in the source ("fix it with the Metadata Review first").
+7. **The copies to compare with**: books with the same title and authors
+   ([which books are compared](#which-books-are-compared)). If none:
+   - *Same title, author written differently*: the same title, the author one letter apart, as
+     initials, by surname only, or the same person according to the Text AI;
+   - still none, *Match similar titles by the same author*: a similar title by the same author,
+     a duplicate only with proof (ISBN, ASIN, series number, the same text, the same cover);
+   - still none → **Move** (within one library: *Leave: no duplicate*).
+8. **Compared with each copy** ([how two books are compared](#how-two-books-are-compared)); a
+   duplicate of any copy wins:
+   1. the same ISBN or ASIN, or (option) the same series and number → duplicate;
+   2. edition (its number, else the year) and publisher: both the same → duplicate; either
+      different → another book;
+   3. either unknown, and **the same text** (95% or more, any formats) → duplicate, no AI;
+   4. still unknown, with an AI: the AI reads both books (first pages, then the last pages if
+      something is still missing) for edition, year and publisher, and they are compared again;
+   5. only Calibre's years differ (*Re-check year differences*): the AI reads the years printed
+      in both books, and they are compared again;
+   6. still undecided: **the covers** (*Compare covers*, needs an Image AI): the same cover →
+      duplicate; with no edition data to compare, the same book unless the covers differ (a
+      cover missing, generic, a page of the book, or the AI unsure changes nothing), but not
+      when one text is 3 times longer than the other (another content);
+   7. a duplicate whose text is in **another language** is another book: compared again
+      without that copy;
+   8. **still undecided: the same text** again, with every copy → duplicate;
+   9. otherwise: different from every copy → **Move**; undecided → stays in the source,
+      *Leave: to check*.
+9. **After the decision**:
+   - a *Move* is held back (stays in the source) when the title looks like a file name, when a
+     target book by the same author has a file-name title (it may be this book), or when title
+     and author were swapped;
+   - a duplicate that isn't proven (no edition data, decided by the covers, authors matched
+     only by the surname or the AI) starts **unticked, to review**;
+   - a duplicate with formats its kept copy lacks (except PDF) is *Merge & Trash*, else
+     *Trash only* (always *Trash only* when the same cover overruled the metadata);
+   - files that open nowhere are taken out on Execute; archives are unpacked if you said so;
+   - *Cleanup source only*: nothing goes to the target, see [three ways](#three-ways-to-use-it);
+   - your earlier choices for the book (ticks, overrides) are applied again.
+10. A library's drive that goes away stops the analysis; the books done so far stay listed.
+
+**In pictures.** Chart A: a source book's way to the copies it is compared with. Chart B: the
+comparison with those copies (with several copies, any duplicate wins, and the book moves
+only if it differs from all of them).
+
+Chart A
+
+```mermaid
+flowchart TD
+    start([Next source book, best copy first]) --> nofile{Any file?}
+    nofile -- no --> trashEmpty[Trash: empty record]
+    nofile -- yes --> usable{A file Calibre<br/>can open?}
+    usable -- no --> elsewhere{Opens in another<br/>program?}
+    elsewhere -- yes --> stayFiles[Stays in source]
+    elsewhere -- no --> trashBad[Trash, to review]
+    usable -- yes --> swapped[Title and author swapped?<br/>put right]
+    swapped --> identical{Identical file<br/>in another book?}
+    identical -- yes --> dup[Duplicate]
+    identical -- no --> series{Same series and number?<br/>option}
+    series -- yes --> dup
+    series -- no --> named{Title and authors?}
+    named -- no --> stayFix[Stays in source:<br/>fix it with the Metadata Review]
+    named -- yes --> cands{Copies with the same<br/>title and authors?}
+    cands -- yes --> compare[[Compare with the copies:<br/>chart B]]
+    cands -- no --> variant{Same title, author<br/>written differently?}
+    variant -- yes --> compare
+    variant -- no --> similar{Similar title,<br/>same author?}
+    similar -- no --> move[Move]
+    similar -- yes --> proof{Proof? ISBN, ASIN,<br/>same text, same cover}
+    proof -- yes --> dup
+    proof -- no --> check[Leave: to check]
+```
+
+Chart B
+
+```mermaid
+flowchart TD
+    compare{ISBN or ASIN,<br/>edition and publisher} -- same --> dup[Duplicate]
+    compare -- unknown --> text1{Same text?}
+    text1 -- yes --> dup
+    text1 -- no --> ai[With an AI: it reads both books<br/>for edition, year, publisher]
+    ai --> again{Compared again}
+    again -- same --> dup
+    again -- different --> moving
+    again -- unknown --> covers{Covers}
+    covers -- same --> dup
+    covers -- differ --> late
+    covers -- "missing, generic, a page,<br/>or the AI unsure" --> longer{One text 3 times<br/>longer?}
+    longer -- no --> dupReview[Duplicate, to review:<br/>no edition data]
+    longer -- yes --> late
+    compare -- different --> years{Only Calibre's<br/>years differ?}
+    years -- no --> moving
+    years -- yes --> printed{AI: years printed<br/>in both books}
+    printed -- same --> dup
+    printed -- differ --> moving
+    printed -- "not found" --> covers2{Covers}
+    covers2 -- same --> dup
+    covers2 -- differ --> moving
+    covers2 -- unclear --> late
+    late{Same text as<br/>any copy?} -- yes --> dup
+    late -- no --> check[Leave: to check]
+    dup --> language{Text in another<br/>language?}
+    language -- yes --> next[Another book: compare<br/>with the other copies]
+    language -- no --> trash[Merge and Trash,<br/>or Trash only]
+    dupReview --> language
+    moving{Title a file name,<br/>or title and author swapped?} -- no --> move[Move]
+    moving -- yes --> stay[Stays in source]
+```
+
+**On demand (right-click, when nothing else runs)**: *Ask the AI again* decides the selected
+books again, with the AI cache off, together with the books whose decision rests on them;
+*Judge AI* asks a stronger model about a book and its match, and its answer becomes an unticked
+suggestion ([Step 2](#step-2-review-the-list)).
+
+### Merge and Dedup: Execute
+
+**Before the first book**
+
+1. Calibre (and calibre-server) must be closed.
+2. The trash library chosen now is checked (it may differ from the analysis'), and no other
+   execution may be writing one of these libraries.
+3. You confirm, with the counts of what will happen (skipped by *Continue* after *Pause*).
+4. Only **ticked** rows run. A duplicate of a book that isn't being moved, or whose kept copy is
+   being trashed too, is **blocked**.
+5. The `metadata.db` of the source and the target is copied (the last 3 are kept); if it can't
+   be, nothing is done. A journal of the run is started.
+
+**For each ticked book** (*Pause* and *Stop* act between two books)
+
+1. The book is still in the source, with the same title, and **unchanged** since the analysis
+   (Calibre's *last modified*, to the second; or since the Execute that last wrote it). Else it
+   fails, *changed since the analysis*, and stays.
+2. **Cleanup first**: an archive is extracted and checked against what the analysis listed;
+   if formats are taken out, the whole record is copied to the trash library first; the
+   archive's files are added exactly as they are (no Calibre import plugin) and checked; the
+   unreadable formats and the archive are removed.
+3. **Move**: the book is copied to the target, the copy is checked (every format there), then
+   the book is removed from the source.
+4. **Trash**: its kept copy is found (a target book, a book moved by this or an earlier
+   Execute, or the copy kept in the source) and must be unchanged since the analysis too; the
+   formats it lacks are added to it (*Merge*); the book is copied whole to the trash library,
+   checked, then removed from the source (Calibre's recycle bin, or permanently).
+5. The result goes to the row and the journal; books moved or trashed leave the list.
+
+**After the last book**: empty book and author folders left in the source are removed. The
+list stays usable: tick more books and execute again ([no new analysis needed](#step-3-execute)).
+
+**In pictures:**
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant W as Window
+    participant E as Executor
+    participant C as calibre-debug (bridge)
+    participant S as Source library
+    participant T as Target library
+    participant X as Trash library
+    You->>W: 2. Execute checked
+    W->>W: Calibre closed? trash library ok? confirm
+    W->>E: ticked, unblocked books
+    E->>E: lock the libraries, start the journal
+    E->>S: copy metadata.db (snapshot)
+    E->>T: copy metadata.db (snapshot)
+    E->>C: plan of actions
+    loop each ticked book (Pause or Stop: after the current one)
+        C->>S: still there, same title, unchanged since the analysis?
+        opt unreadable formats or an archive
+            C->>X: copy the whole record first
+            C->>S: add the archive's files, remove the bad formats
+        end
+        alt Move
+            C->>T: copy the book, check every format
+        else Trash
+            C->>T: kept copy (or the one kept in the source) unchanged? add the formats it lacks
+            C->>X: copy the book whole, check it
+        end
+        C->>S: remove the book (recycle bin)
+        C-->>E: result, and the copy written (id, last modified)
+        E-->>W: row done, plan updated for the next Execute
+    end
+    C->>S: remove empty folders
+    E->>E: unlock, close the journal
+    W-->>You: done rows leave the list, the rest can be executed again
+```
+
+### Metadata Review: Analyze
+
+**Before the first book**
+
+1. The library to review and the trash library are checked as above; a library that another
+   window is analyzing can't be reviewed.
+2. Every cover of the library is looked at for generic covers.
+3. The tag filter is applied, and books tagged `AIReviewed` are skipped (*Skip books tagged
+   AIReviewed*).
+4. Clear archives: you are asked once whether to unpack them.
+
+**For each book** (*Pause* and *Stop* act between two books)
+
+1. **Its files**, as in Merge and Dedup: none usable → the AI isn't asked; *Trash* if none
+   opens anywhere, else kept (*Not read*).
+2. **The AI reads** the first pages of the best format, and the cover with an Image AI (a
+   generic cover is not sent; a scanned PDF's pages are sent as images), or the answer comes
+   from the cache (same book, file and model). A file that fails to open: the next format.
+3. **What the pages show, without AI**: whether Calibre's value and the AI's are printed in
+   them, the language of the text, the ISBNs printed.
+4. **The changes**: the fields where the AI read something different. Never: erasing a value,
+   a title that only drops the current one's subtitle or volume, an ISBN for a book that
+   already has one (or when the pages print none, or several).
+5. **Each change is checked** ([which changes are ticked](#step-2-review-the-list-1)): left out
+   when the new value isn't printed in the pages, when Calibre's is, when an author or the
+   issue number would be lost, or when a series or an author is proposed as the publisher.
+6. **The cover**: generic, a page of the book, or one the AI calls not real → tagged
+   `BadCover` on Execute.
+7. Ticked when it has changes the book supports; **to review** when changes were left out, an
+   archive is in doubt, or the Judge AI read it.
+
+**After the last book**: the series names read in the library are never taken as a publisher.
+
+### Metadata Review: Execute
+
+1. As in Merge and Dedup: Calibre closed, the trash library checked, no other execution on the
+   library, your confirmation, a copy of `metadata.db`, a journal.
+2. For each ticked book: **unchanged since the analysis** (else it fails); **cleanup first**
+   (unreadable formats, archive); then **update** (the ticked fields are written: a new year
+   keeps the date's month and day, an ISBN is added only to a book without one; tagged
+   `AIUpdated` when a field changes, and `AIReviewed` unless it still needs review) or
+   **trash** (copied whole to the trash library, checked, removed).
+3. Then the books done with and nothing to write are tagged `AIReviewed`, and the bad covers
+   `BadCover` (not the trashed books).
+4. Updated, tagged and trashed books leave the list; the rest can be executed again.
 
 
 ## Merge and Dedup
