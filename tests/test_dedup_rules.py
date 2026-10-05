@@ -268,11 +268,29 @@ def test_a_proven_duplicate_is_ticked(libs):
 
 
 def test_authors_matched_by_the_surname_or_the_ai_are_to_review(libs):
+    src, tgt, trash = libs(source=[{"title": "Dune", "authors": ["Herbert"], "publisher": "Ace"}],
+                           target=[{"title": "Dune", "authors": ["Frank Herbert"], "publisher": "Ace"}])
+    item = build_plan(src, tgt, trash, CoverResolver(None), author_variants=True, cover_check=True).items[0]
+    assert item.action is Action.TRASH and not item.selected and "(surname only)" in item.reason
+    assert "authors matched by the surname only: check they are the same person" in item.review
+
+
+def test_the_same_isbn_needs_no_review_of_the_authors(libs):
+    # 74 such pairs in real libraries ("Ondaatje" / "Michael Ondaatje"), every one the same book.
     src, tgt, trash = libs(source=[{"title": "Dune", "authors": ["Herbert"], "isbn": ISBN}],
                            target=[{"title": "Dune", "authors": ["Frank Herbert"], "isbn": ISBN}])
     item = build_plan(src, tgt, trash, author_variants=True).items[0]
-    assert item.action is Action.TRASH and not item.selected
-    assert item.review == "authors matched by the surname only: check they are the same person"
+    assert item.action is Action.TRASH and "(surname only)" in item.reason and item.selected and not item.review
+
+
+def test_an_isbn_on_many_different_books_proves_nothing(libs):
+    # "9780639366388" on ten unrelated books in a real library: a converter's default.
+    others = [{"title": t, "authors": [a], "isbn": ISBN} for t, a in (("Kiss", "Ted Dekker"), ("Bartleby", "Melville"))]
+    src, tgt, trash = libs(source=[{"title": "Dune", "isbn": ISBN}],
+                           target=[{"title": "Dune", "publisher": "Ace", "isbn": ISBN}] + others)
+    item = build_plan(src, tgt, trash).items[0]
+    assert item.action is Action.LEAVE and "ISBN" not in item.reason
+    assert planner.placeholder_isbns(planner.read_books(tgt)) == {ISBN}
 
 
 # --- records with no file ---------------------------------------------------------------

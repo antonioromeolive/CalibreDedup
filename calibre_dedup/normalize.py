@@ -458,10 +458,15 @@ def same_publisher(a: str, b: str) -> bool:
 
 
 def normalize_isbn(raw: str | None) -> str | None:
-    """Return an ISBN-13 string, or None if `raw` is not a valid ISBN."""
+    """Return an ISBN-13 string, or None if `raw` is not a valid ISBN. A checksum is not
+    enough: a book's ISBN-13 starts with 978 or 979, and filler such as "0000000000" (whose
+    checksum is right) is no ISBN."""
     if not raw:
         return None
     s = re.sub(r"[^0-9Xx]", "", raw).upper()
+    body = s[:9] if len(s) == 10 else s[3:12]
+    if len(set(body)) < 2:
+        return None
     if len(s) == 10:
         if not s[:9].isdigit() or not (s[9].isdigit() or s[9] == "X"):
             return None
@@ -471,7 +476,19 @@ def normalize_isbn(raw: str | None) -> str | None:
         s = "978" + s[:9]
         check = (10 - sum((1 if i % 2 == 0 else 3) * int(c) for i, c in enumerate(s)) % 10) % 10
         return s + str(check)
-    if len(s) == 13 and s.isdigit():
+    if len(s) == 13 and s.isdigit() and s[:3] in ("978", "979"):
         check = (10 - sum((1 if i % 2 == 0 else 3) * int(c) for i, c in enumerate(s[:12])) % 10) % 10
         return s if check == int(s[12]) else None
+    return None
+
+
+def normalize_asin(raw: str | None) -> str | None:
+    """Return an Amazon ASIN, or None if `raw` is not one: "B" and 9 letters or digits, or
+    (a printed book's) a valid ISBN-10. Converters fill the field with junk shared by
+    thousands of books ("F20", "0000000000", UUIDs), which would make them all one book."""
+    s = (raw or "").strip().upper()
+    if len(set(s)) < 2:
+        return None  # "", "0000000000", "XXXXXXXXXX"
+    if re.fullmatch(r"B[0-9A-Z]{9}", s) or (len(s) == 10 and normalize_isbn(s)):
+        return s
     return None

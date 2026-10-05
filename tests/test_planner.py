@@ -491,6 +491,13 @@ def test_shared_asin_proves_duplicate(libs):
     assert item.action is Action.TRASH and "same ASIN (B01BLYJWMA)" in item.reason
 
 
+def test_junk_asins_prove_nothing(libs):
+    src, tgt, trash = libs(source=[{"title": "Children of Dune", "ids": {"mobi-asin": "F20"}}],
+                           target=[{"title": "Children of Dune", "publisher": "Ace", "ids": {"amazon": "F20"}}])
+    item = build_plan(src, tgt, trash).items[0]
+    assert item.action is Action.LEAVE and "ASIN" not in item.reason
+
+
 def test_same_text_proves_duplicate_before_ai(libs):
     src, tgt, trash = libs(
         source=[{"title": "Children of Dune", "prose": "Chapter one."},

@@ -150,11 +150,12 @@ decides it. Each step links to where it is explained in full.
 8. **Compared with each copy** ([how two books are compared](#how-two-books-are-compared)); a
    duplicate of any copy wins:
    1. the same ISBN or ASIN, or (option) the same series and number → duplicate;
-   2. edition (its number, else the year) and publisher: both the same → duplicate; either
-      different → another book;
-   3. either unknown, and **the same text** (95% or more, any formats) → duplicate, no AI;
-   4. still unknown, with an AI: the AI reads both books (first pages, then the last pages if
-      something is still missing) for edition, year and publisher, and they are compared again;
+   2. edition (its number, else the year) and publisher: both the same → duplicate;
+   3. **the same text** (95% or more, any formats) → duplicate, whatever else differs: no AI,
+      nothing to review (*Trash only* when the metadata differs);
+   4. edition or publisher different → another book; either unknown, with an AI: the AI reads
+      both books (first pages, then the last pages if something is still missing) for edition,
+      year and publisher, and they are compared again;
    5. only Calibre's years differ (*Re-check year differences*): the AI reads the years printed
       in both books, and they are compared again;
    6. still undecided: **the covers** (*Compare covers*, needs an Image AI): the same cover →
@@ -163,17 +164,17 @@ decides it. Each step links to where it is explained in full.
       when one text is 3 times longer than the other (another content);
    7. a duplicate whose text is in **another language** is another book: compared again
       without that copy;
-   8. **still undecided: the same text** again, with every copy → duplicate;
-   9. otherwise: different from every copy → **Move**; undecided → stays in the source,
+   8. otherwise: different from every copy → **Move**; undecided → stays in the source,
       *Leave: to check*.
 9. **After the decision**:
    - a *Move* is held back (stays in the source) when the title looks like a file name, when a
      target book by the same author has a file-name title (it may be this book), or when title
      and author were swapped;
    - a duplicate that isn't proven (no edition data, decided by the covers, authors matched
-     only by the surname or the AI) starts **unticked, to review**;
+     only by the surname or the AI) starts **unticked, to review**; never one with the same
+     ISBN, ASIN or text;
    - a duplicate with formats its kept copy lacks (except PDF) is *Merge & Trash*, else
-     *Trash only* (always *Trash only* when the same cover overruled the metadata);
+     *Trash only* (always *Trash only* when the same cover or text overruled the metadata);
    - files that open nowhere are taken out on Execute; archives are unpacked if you said so;
    - *Cleanup source only*: nothing goes to the target, see [three ways](#three-ways-to-use-it);
    - your earlier choices for the book (ticks, overrides) are applied again.
@@ -216,19 +217,19 @@ Chart B
 ```mermaid
 flowchart TD
     compare{ISBN or ASIN,<br/>edition and publisher} -- same --> dup[Duplicate]
-    compare -- unknown --> text1{Same text?}
-    text1 -- yes --> dup
-    text1 -- no --> ai[With an AI: it reads both books<br/>for edition, year, publisher]
+    compare -- "unknown or different" --> text1{Same text?}
+    text1 -- yes --> trash
+    text1 -- "no, unknown" --> ai[With an AI: it reads both books<br/>for edition, year, publisher]
     ai --> again{Compared again}
     again -- same --> dup
     again -- different --> moving
     again -- unknown --> covers{Covers}
     covers -- same --> dup
-    covers -- differ --> late
+    covers -- differ --> check
     covers -- "missing, generic, a page,<br/>or the AI unsure" --> longer{One text 3 times<br/>longer?}
     longer -- no --> dupReview[Duplicate, to review:<br/>no edition data]
-    longer -- yes --> late
-    compare -- different --> years{Only Calibre's<br/>years differ?}
+    longer -- yes --> check
+    text1 -- "no, different" --> years{Only Calibre's<br/>years differ?}
     years -- no --> moving
     years -- yes --> printed{AI: years printed<br/>in both books}
     printed -- same --> dup
@@ -236,9 +237,7 @@ flowchart TD
     printed -- "not found" --> covers2{Covers}
     covers2 -- same --> dup
     covers2 -- differ --> moving
-    covers2 -- unclear --> late
-    late{Same text as<br/>any copy?} -- yes --> dup
-    late -- no --> check[Leave: to check]
+    covers2 -- unclear --> check[Leave: to check]
     dup --> language{Text in another<br/>language?}
     language -- yes --> next[Another book: compare<br/>with the other copies]
     language -- no --> trash[Merge and Trash,<br/>or Trash only]
@@ -604,17 +603,25 @@ similar titles by the same author* and *Same series + same number*.
 In this order; the first rule that decides wins:
 
 1. **The same ISBN** means a duplicate (ISBNs come from the metadata or from the book's
-   pages). So does **the same Amazon ASIN** (the `mobi-asin` or `amazon…` identifiers),
-   which Amazon gives to one edition. Different ISBNs alone decide nothing: an e-book and a
-   print book of the same edition have different ISBNs.
+   pages). Only real ISBNs count: the right checksum, an ISBN-13 starting with 978 or 979 (a
+   magazine's 977 barcode is the same on every issue), no filler ("0000000000"), and not
+   one found on books of 3 or more different titles and authors (a converter's default, as
+   for generic covers: "9780639366388" was on ten unrelated books). So does **the same Amazon ASIN** (the `mobi-asin` or `amazon…` identifiers),
+   which Amazon gives to one edition. Only real ASINs count: "B" and 9 letters or digits, or
+   a valid ISBN-10; converters fill the field with junk shared by thousands of books ("F20",
+   "0000000000", UUIDs). Either one is proof enough, even when the authors matched only by
+   the surname or the AI (74 such pairs in real libraries, every one the same book): not
+   sent to review. Different ISBNs alone decide nothing: an e-book and a print book of the
+   same edition have different ISBNs.
 2. **Edition and publisher.** The edition is the edition number when both books have one,
    otherwise the publication year. Publishers are compared loosely: "O'Reilly Media, Inc." =
    "O'Reilly", "Arnoldo Mondadori Editore" = "A. Mondadori", "DeAgostini Periodici S.r.l." =
    "De Agostini periodici".
-   - Both the same: duplicate. Either one different: a different book.
-   - Either one unknown: if both books have **the same text** (below), they are duplicates,
-     without AI. Otherwise the AI reads both books for the missing fields, and they are
-     compared again.
+   - Both the same: duplicate.
+   - Otherwise, if both books have **the same text** (below), they are duplicates, without AI
+     and whatever else differs.
+   - Either one different: a different book. Either one unknown: the AI reads both books for
+     the missing fields, and they are compared again.
    - **Only the years differ**: Calibre's date is often the original publication, not this
      edition's. With *Re-check year differences* (on by default) the AI reads both books and
      the years printed in them decide; if it can't find a year in both, the covers decide
@@ -666,9 +673,10 @@ are added to the kept copy first; otherwise it is **Trash only**.
 
 **The same text.** Two books whose text is the same are the same book, whatever their files,
 formats and metadata: the same book converted twice, a TXT and an EPUB of one edition. It is
-checked when edition or publisher can't be compared (before any AI call), and again for a
-pair still undecided at the end (e.g. only Calibre's years differ, or the covers differ);
-never to overrule a real difference in the metadata. One format of each book is read, whole:
+checked whenever the ISBN, edition and publisher don't already make a duplicate, before any AI
+call, and it overrules everything else: a difference in edition, publisher or year (then
+*Trash only*: nothing is added to the other copy), the language check, and authors matched
+only by the surname or the AI (not sent to review). One format of each book is read, whole:
 the first of EPUB, MOBI, AZW3, AZW, PDF, then any other with text (MOBI and the others are
 converted with Calibre's `ebook-convert`; without an AI selected, only EPUB and TXT are
 read). The texts are the same when **95% or more** of each one's 5-word runs are in the
@@ -909,7 +917,9 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   taken when the AI reads the book, and kept with its answer). A wrong value in an empty
   field is no better than none: it would be taken for real metadata, also by Merge and Dedup.
   The others are **left out**: shown struck through, with the reason on mouse-over, and never
-  written unless you turn them on (right-click → *Change … again*):
+  written unless you turn them on (right-click → *Change … again*, or *Change everything
+  again* for every field at once; with several books selected, each entry acts on those it
+  applies to, the others are left as they are):
   - *Calibre's value is printed in the book* ("Polluce Quinto" is in the book: not replaced by
     the title of the magazine issue that holds it);
   - *the new value is not in the book's text* (e.g. read from the cover only);
@@ -940,7 +950,7 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   (the next analysis shows it again).
   - The **Change:** boxes turn a field on or off for all books (e.g. never change the
     publisher).
-  - Right-click turns one field off for the selected books ("Don't change publisher", shown
+  - Right-click turns one field off for the selected books (*Don't change → Publisher*, shown
     struck through), or sets the action: *Update metadata*, *Keep as it is* (untouched: tick it
     for its cleanup), *Move to the trash library*; and, for unreadable formats, *Move the
     unreadable formats to the trash library* / *Keep the unreadable formats*.

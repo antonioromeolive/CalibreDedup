@@ -151,6 +151,7 @@ class Decision:
     verdict: Verdict
     reason: str
     match_index: int | None = None  # index into the candidate list
+    proof: bool = False  # a duplicate by an identifier (Comparison.proof)
 
 
 def decide(src: Identity, candidates: list[Identity]) -> Decision:
@@ -164,7 +165,7 @@ def decide(src: Identity, candidates: list[Identity]) -> Decision:
     for i, cand in enumerate(candidates):
         c = compare(src, cand)
         if c.verdict is Verdict.DUPLICATE:
-            return Decision(Verdict.DUPLICATE, c.reason, i)
+            return Decision(Verdict.DUPLICATE, c.reason, i, proof=c.proof)
         (unknown if c.verdict is Verdict.UNKNOWN else distinct).append(c.reason)
     if unknown:
         return Decision(Verdict.UNKNOWN, "; ".join(dict.fromkeys(unknown)))

@@ -23,7 +23,7 @@
 import pytest
 
 from calibre_dedup.normalize import (
-    authors_key, is_unknown, normalize_isbn, parse_edition_number, same_publisher,
+    authors_key, is_unknown, normalize_asin, normalize_isbn, parse_edition_number, same_publisher,
     similar_author_key, similar_authors_keys, title_key,
 )
 
@@ -93,6 +93,18 @@ def test_normalize_isbn():
     assert normalize_isbn("978-0-306-40615-7") == "9780306406157"
     assert normalize_isbn("978-0-306-40615-8") is None
     assert normalize_isbn("garbage") is None
+    # right checksum, but no book's ISBN: filler, a magazine's barcode (ISSN, the same on every issue)
+    for junk in ("0000000000", "0000000000000", "9999999999999", "9771123076005"):
+        assert normalize_isbn(junk) is None
+
+
+def test_normalize_asin():
+    assert normalize_asin(" b01blyjwma ") == "B01BLYJWMA"
+    assert normalize_asin("8817042641") == "8817042641"  # a printed book's: its ISBN-10
+    # converters' junk, shared by thousands of books
+    for junk in ("F20", "0000000000", "XXXXXXXXXX", "8817042642", "URN:UUID:F20", "",
+                 "CD4B0B0F-BA5A-46C9-AD42-7EAADBF059B3", None):
+        assert normalize_asin(junk) is None
 
 
 def test_is_unknown():

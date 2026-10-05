@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .models import Book
-from .normalize import is_unknown, normalize_isbn
+from .normalize import is_unknown, normalize_asin, normalize_isbn
 
 
 class LibraryError(Exception):
@@ -94,8 +94,10 @@ def read_books(library: str | Path) -> list[Book]:
                 isbn = normalize_isbn(val)
                 if isbn:
                     isbns[book].add(isbn)
-            elif (kind == "mobi-asin" or kind.startswith("amazon")) and val and val.strip():
-                asins[book].add(val.strip().upper())
+            elif kind == "mobi-asin" or kind.startswith("amazon"):
+                asin = normalize_asin(val)
+                if asin:
+                    asins[book].add(asin)
 
         columns = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
         optional = []

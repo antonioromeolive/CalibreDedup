@@ -239,7 +239,8 @@ class ReviewModel(QAbstractTableModel):
                         f"{REVIEWED_TAG}: the next analysis shows it again.")
             if name in it.doubts and name in it.excluded:
                 return (f"{self.text(it, col)}\n\nLeft out: {it.doubts[name]}.\nRight-click → Change "
-                        f"{FIELD_LABELS[name].lower()} again, to write it anyway.")
+                        f"{FIELD_LABELS[name] if name == 'isbn' else FIELD_LABELS[name].lower()} again (or "
+                        f"Change everything again), to write it anyway.")
             return self.text(it, col) or None
         if role == CELL_ROLE and col in self.FIELD_COLS:
             return self.cell(it, self.FIELD_COLS[col])
@@ -1065,15 +1066,26 @@ class ReviewWindow(QMainWindow):
             menu.addSeparator()
             add_mark_reviewed(menu, items, lambda i: i.needs_review_for(self.fields_on), self._mark_reviewed)
             menu.addSeparator()
+            # each entry acts on the selected books it applies to, the others are left as they are
             for name in FIELDS:
-                having = [i for i in items if name in i.changes]
-                if not having:
-                    continue
-                excluded = all(name in i.excluded for i in having)
-                label = (f"Change {FIELD_LABELS[name].lower()} again" if excluded
-                         else f"Don't change {FIELD_LABELS[name].lower()}")
-                act = menu.addAction(f"{label} ({len(having)})" if len(items) > 1 else label)
-                act.triggered.connect(lambda _=False, n=name, h=having, e=excluded: self._exclude(h, n, not e))
+                left_out = [i for i in items if name in i.changes and name in i.excluded]
+                label = f"Change {FIELD_LABELS[name] if name == 'isbn' else FIELD_LABELS[name].lower()} again"
+                act = menu.addAction(f"{label} ({len(left_out)})" if len(items) > 1 else label)
+                act.setEnabled(bool(left_out))
+                act.triggered.connect(lambda _=False, n=name, f=left_out: self._exclude(f, n, False))
+            left_out = [i for i in items if set(i.changes) & i.excluded]
+            label = "Change everything again"
+            act = menu.addAction(f"{label} ({len(left_out)})" if len(items) > 1 else label)
+            act.setEnabled(bool(left_out))
+            act.triggered.connect(lambda _=False, f=left_out: self._include_all(f))
+            dont = menu.addMenu("Don't change")
+            for name in FIELDS:
+                written = [i for i in items if name in i.changes and name not in i.excluded]
+                label = FIELD_LABELS[name]
+                act = dont.addAction(f"{label} ({len(written)})" if len(items) > 1 else label)
+                act.setEnabled(bool(written))
+                act.triggered.connect(lambda _=False, n=name, f=written: self._exclude(f, n, True))
+            dont.setEnabled(any(a.isEnabled() for a in dont.actions()))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _set_action(self, items: list[ReviewItem], action: ReviewAction):
@@ -1103,10 +1115,21 @@ class ReviewWindow(QMainWindow):
                 it.excluded.add(name)
             else:
                 it.excluded.discard(name)
-            it.reviewed = True
-            if it.action is ReviewAction.UPDATE and not it.manual:
-                it.selected = bool(it.to_write(FIELDS)) or it.cleanup
+            self._fields_changed(it)
         self.model.refresh()
+
+    def _include_all(self, items: list[ReviewItem]):
+        """Change everything again: every change left out of these books is written."""
+        for it in items:
+            it.excluded -= set(it.changes)
+            self._fields_changed(it)
+        self.model.refresh()
+
+    @staticmethod
+    def _fields_changed(it: ReviewItem):
+        it.reviewed = True
+        if it.action is ReviewAction.UPDATE and not it.manual:
+            it.selected = bool(it.to_write(FIELDS)) or it.cleanup
 
     def _mark_reviewed(self, items: list[ReviewItem]):
         for it in items:

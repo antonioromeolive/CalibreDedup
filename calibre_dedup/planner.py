@@ -600,6 +600,16 @@ def _placeholder(books: list[Book]) -> bool:
             and len({authors_key(b.authors) for b in books}) >= GENERIC_COVER_BOOKS)
 
 
+def placeholder_isbns(books: list[Book]) -> set[str]:
+    """ISBNs on books of GENERIC_COVER_BOOKS or more titles and authors: a converter's
+    default or a wrong copy-paste ("9780639366388" on ten unrelated books), never proof."""
+    by_isbn: dict[str, list[Book]] = defaultdict(list)
+    for b in books:
+        for i in b.isbns:
+            by_isbn[i].append(b)
+    return {i for i, bs in by_isbn.items() if len(bs) >= GENERIC_COVER_BOOKS and _placeholder(bs)}
+
+
 class _FileIndex:
     """The books' files by format and size (from metadata.db: nothing is opened), to find
     the same file in two books whatever their titles and authors: the same book. Only
@@ -658,7 +668,7 @@ class _Outcome:
     decision: Decision
     content: bool = False  # the same text: in the same language, whatever it is
     by_cover: bool = False
-    override: bool = False  # the same cover overruled the metadata
+    override: bool = False  # the same cover or text overruled the metadata
     no_edition: bool = False  # PlanItem.no_edition
     called: bool = False  # the AI was asked
 
@@ -685,13 +695,10 @@ def _text_share(ctx: _Context, a: Book, b: Book) -> float | None:
     return share(mine, theirs) if theirs else None
 
 
-def _same_text(ctx: _Context, sb: Book, ident: Identity, candidates: list[_Candidate],
-               undecided_only: bool = True) -> Decision | None:
+def _same_text(ctx: _Context, sb: Book, candidates: list[_Candidate]) -> Decision | None:
     """A candidate with the same text (SAME_TEXT): the same book, whatever the files,
-    formats and metadata. `undecided_only`: only those the metadata can't tell apart."""
+    formats and metadata."""
     for i, c in enumerate(candidates):
-        if undecided_only and compare(ident, c.identity).verdict is not Verdict.UNKNOWN:
-            continue
         found = _text_share(ctx, sb, c.book)
         if found is None and ctx.prints is not None and ctx.prints.get(sb) is None:
             return None  # no text of its own to compare: no need to read the others
@@ -856,6 +863,13 @@ def build_plan(
     unpack = ask_once(chosen, unpack) if resolver is not None else None
     same_library = str(Path(source).resolve()).casefold() == str(Path(target).resolve()).casefold()
     target_books = read_books(target) if Path(target, "metadata.db").is_file() else []
+    junk = placeholder_isbns(source_books + target_books)
+    if junk:
+        log.info("ISBNs on many different books, not proof: %s", ", ".join(sorted(junk)))
+        source_books, target_books = ([replace(b, isbns=b.isbns - junk) if b.isbns & junk else b for b in books]
+                                      for books in (source_books, target_books))
+        by_id = {b.id: b for b in source_books}
+        chosen = [by_id[b.id] for b in chosen]
     plan = Plan(source, target, trash, total_books=len(chosen), same_library=same_library,
                 tag=tag, tag_exclude=tag_exclude)
     if tag:
@@ -1393,10 +1407,14 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
         books; the years printed in them; then the covers (see _by_covers)."""
         nonlocal ident, ai_used, rechecked
         decision = decide(ident, [c.identity for c in cands])
-        if decision.verdict is Verdict.UNKNOWN:
-            same = _same_text(ctx, sb, ident, cands)
+        if decision.verdict is not Verdict.DUPLICATE:
+            # The same text is the same book, whatever else differs: no AI, nothing to review.
+            same = _same_text(ctx, sb, cands)
             if same is not None:
-                return _Outcome(same, content=True)
+                comp = compare(ident, cands[same.match_index].identity)
+                if comp.verdict is Verdict.DISTINCT:  # overruled, as by a cover: nothing added (Trash only)
+                    same = replace(same, reason=f"{same.reason}; metadata differs: {comp.reason}")
+                return _Outcome(same, content=True, override=comp.verdict is Verdict.DISTINCT)
         if decision.verdict is Verdict.UNKNOWN and resolver:
             if _needs_edition_publisher(ident):
                 ident, n = enrich(sb, ident, _needs_edition_publisher)
@@ -1447,7 +1465,8 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
         other = "" if outcome.content else _other_language(ctx, sb, c.book)
         if not other:
             return _duplicate_item(sb, ident, c, outcome.decision.reason, notes, ai_used, outcome.by_cover,
-                                   outcome.override, outcome.no_edition, weak.get(id(c), ""))
+                                   outcome.override, outcome.no_edition,
+                                   "" if outcome.content or outcome.decision.proof else weak.get(id(c), ""))
         notes.append(f"{c.book.label()!r} is {other}: another book")
         ctx.stats["other_language"] += 1
         other_language.append(c)
@@ -1465,10 +1484,6 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
                   else f"different from target copies: {decision.reason}")
         return _logged(PlanItem(sb, action, _join(reason, notes), ident, match=candidates[0].book,
                                 match_planned=candidates[0].planned, different=True, ai_used=ai_used))
-    # Still undecided: the same text makes the same book, whatever else differs.
-    same = _same_text(ctx, sb, ident, candidates, undecided_only=False)
-    if same is not None:
-        return _duplicate_item(sb, ident, candidates[same.match_index], same.reason, notes, ai_used)
     return _logged(PlanItem(
         sb, Action.LEAVE,
         _join(f"same title/authors as {candidates[0].book.label()!r} but {decision.reason}", notes),
@@ -1541,11 +1556,11 @@ def _duplicate_item(sb: Book, ident: Identity, cand: _Candidate, why: str, notes
                     by_cover: bool = False, override: bool = False, no_edition: bool = False,
                     person: str = "") -> PlanItem:
     """`sb` is a duplicate of `cand`: to trash, adding the formats the kept copy lacks.
-    `override`: a cover overruling the metadata; the same book, but its files may be
+    `override`: a cover or the text overruling the metadata; the same book, but its files may be
     another edition's, so nothing is added to the other copy (Trash only).
     `no_edition`: see PlanItem.no_edition. `person`: how the authors matched, when that is
-    no proof (the surname only, the AI). An unproven duplicate (no edition data, the
-    covers, such authors) starts unticked: nothing happens to it, nor is anything added to
+    no proof (the surname only, the AI) and neither is the rest (not ISBN, ASIN or text).
+    An unproven duplicate (no edition data, the covers, such authors) starts unticked: nothing happens to it, nor is anything added to
     the target copy, until the user checks and ticks it."""
     missing = [] if override else [f for f in sb.formats if f not in cand.formats and f != "PDF"]
     cand.formats.update(missing)  # later duplicates must not add the same format again

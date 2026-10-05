@@ -84,8 +84,25 @@ def test_a_different_text_leaves_the_pair_undecided(libs):
     assert item.action is Action.LEAVE and "same text" not in item.reason
 
 
-def test_metadata_that_differs_is_not_overruled(libs):
-    # Not undecided: another publisher makes another book, as before.
-    src, tgt, trash = libs(source=[{"title": "Dune", "publisher": "Ace", "prose": "Dune"}],
+def test_the_same_text_overrules_metadata_that_differs(libs):
+    # Another publisher, the same text: the same book. Its files are the "other edition's": Trash only.
+    src, tgt, trash = libs(source=[{"title": "Dune", "publisher": "Ace", "prose": "Dune", "formats": ["EPUB", "MOBI"]}],
                            target=[{"title": "Dune", "publisher": "Gollancz", "prose": "Dune"}])
+    item = build_plan(src, tgt, trash).items[0]
+    assert item.action is Action.TRASH and item.selected and not item.review and item.add_formats == []
+    assert "same text (100%); metadata differs:" in item.reason
+
+
+def test_metadata_that_differs_with_another_text_is_another_book(libs):
+    src, tgt, trash = libs(source=[{"title": "Dune", "publisher": "Ace", "prose": "one"}],
+                           target=[{"title": "Dune", "publisher": "Gollancz", "prose": "two"}])
     assert build_plan(src, tgt, trash).items[0].action is Action.MOVE
+
+
+def test_the_same_text_needs_no_review_of_the_authors(libs):
+    # "Giunti & Giunti Editore" / "Giunti Demetra": matched by the surname only, but the text is the same.
+    src, tgt, trash = libs(source=[{"title": "Dune", "authors": ["Herbert"], "prose": "Dune"}],
+                           target=[{"title": "Dune", "authors": ["Frank Herbert"], "prose": "Dune"}])
+    item = build_plan(src, tgt, trash, author_variants=True).items[0]
+    assert item.action is Action.TRASH and "same text (100%)" in item.reason and "(surname only)" in item.reason
+    assert item.selected and not item.review

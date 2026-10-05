@@ -169,3 +169,17 @@ def test_review_books_to_review_follow_the_fields_on(app):
     w._mark_reviewed([doubt])
     w.proxy.update()
     assert shown(w) == [] and doubt.reviewed
+
+
+def test_review_change_everything_again_writes_every_change_left_out(app):
+    w = review.ReviewWindow(Settings(), dedup.QtLogHandler())
+    both = ReviewItem(book(1), ReviewMetadata(title="Other", authors=["B"]))  # nothing checked: both left out
+    assert both.excluded == {"title", "authors"} and not both.selected
+    same = ReviewItem(book(2), ReviewMetadata(title="T2", authors=["A"]))  # nothing to change
+    w.model.reset([both, same])
+    w._exclude([both], "title", False)  # Change title again
+    assert both.excluded == {"authors"} and both.selected and both.reviewed
+    w._include_all([both])
+    assert both.excluded == set() and both.to_write(review.FIELDS) == {"title": "Other", "authors": ["B"]}
+    w._exclude([both], "authors", True)  # Don't change → Authors
+    assert both.excluded == {"authors"} and both.selected
