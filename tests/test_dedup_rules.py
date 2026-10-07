@@ -24,6 +24,8 @@
 covers differ; identical files; a text in another language or far longer is another
 book; titles made from file names; the best copy first, between two libraries too."""
 
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -224,20 +226,126 @@ def test_a_file_name_title_is_never_moved_nor_read_by_the_ai(libs):
     # an identical file still proves it a duplicate (test_the_same_file_is_the_same_book_whatever_the_titles)
 
 
-def test_a_target_book_with_a_file_name_title_holds_back_the_books_by_its_author(libs):
+def epub_titled(title: str) -> bytes:
+    """An EPUB whose package says `title`."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("META-INF/container.xml", '<container><rootfiles><rootfile full-path="content.opf"/>'
+                                             '</rootfiles></container>')
+        z.writestr("content.opf", '<package xmlns="http://www.idpf.org/2007/opf" '
+                                  'xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata>'
+                                  f'<dc:title>{title}</dc:title></metadata></package>')
+    return buf.getvalue()
+
+
+def test_a_target_book_with_a_file_name_title_holds_back_the_book_its_file_names(libs):
     src, tgt, trash = libs(
         source=[{"title": "Il vecchio e il mare", "authors": ["Ernest Hemingway"], "isbn": ISBN},
                 {"title": "Fiesta", "authors": ["Ernest Hemingway"]},
                 {"title": "Emma", "authors": ["Jane Austen"]}],
-        target=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"], "isbn": ISBN}])
+        target=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"], "isbn": ISBN,
+                 "files": {"EPUB": epub_titled("Il vecchio e il mare")}}])
     resolver = FakeResolver({"ITABOOK 0052 - Hemingway": AIMetadata(title="Il vecchio e il mare")})
     plan = build_plan(src, tgt, trash, resolver)
-    assert actions(plan) == [("Il vecchio e il mare", Action.LEAVE), ("Fiesta", Action.LEAVE), ("Emma", Action.MOVE)]
+    assert actions(plan) == [("Il vecchio e il mare", Action.LEAVE), ("Fiesta", Action.MOVE), ("Emma", Action.MOVE)]
     held = plan.items[0]
-    assert held.reason.startswith("not moved: the target's 'ITABOOK 0052 - Hemingway — Ernest Hemingway', by the "
-                                  "same author, has a file name for title: it may be this book; fix that title with "
-                                  "the Metadata Review first")
+    assert held.reason.startswith("not moved: the target's 'ITABOOK 0052 - Hemingway — Ernest Hemingway' (inside its "
+                                  "file: 'Il vecchio e il mare'), by the same author, has a file name for title: it "
+                                  "may be this book; fix that title with the Metadata Review first")
     assert held.match.title == "ITABOOK 0052 - Hemingway" and resolver.calls == []
+
+
+def test_a_file_name_title_that_reads_as_no_title_holds_nothing_back(libs):
+    # nothing in Calibre's title nor in the file's: another book, whose title is fixed in the target
+    src, tgt, trash = libs(
+        source=[{"title": "Il vecchio e il mare", "authors": ["Ernest Hemingway"]}],
+        target=[{"title": "ITABOOK 0052 - Hemingway", "authors": ["Ernest Hemingway"],
+                 "files": {"EPUB": epub_titled("ITABOOK 0052")}},
+                {"title": "ITABOOK 0053 - Hemingway", "authors": ["Ernest Hemingway"]}])  # no file to read
+    plan = build_plan(src, tgt, trash)
+    assert actions(plan) == [("Il vecchio e il mare", Action.MOVE)] and plan.items[0].match is None
+
+
+def test_a_title_calibre_cut_short_is_read_in_the_file(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Perry Mason e il pugno nell'occhio", "authors": ["Erle Stanley Gardner"]},
+                {"title": "Perry Mason e il siero della verità", "authors": ["Erle Stanley Gardner"]},
+                {"title": "Settore generale", "authors": ["James White"]},
+                {"title": "Stazione ospedale", "authors": ["James White"]},
+                {"title": "Ritorno nell'universo", "authors": ["Robert Sheckley"]},
+                {"title": "AAA Asso decontaminazioni interplanetarie", "authors": ["Robert Sheckley"]}],
+        target=[{"title": "Classici del giallo 0024 - Per", "authors": ["Erle Stanley Gardner"],
+                 "files": {"EPUB": epub_titled("Classici del giallo 0024 - Perry Mason e il siero della verità")}},
+                {"title": "Galassia 034 - White James - S", "authors": ["James White"],
+                 "files": {"EPUB": epub_titled("Galassia 034 - White James - Settore Generale (eq)")}},
+                # nothing readable before the collection's number: the file's title, whatever it is
+                {"title": "AAA ASSO DECONTAMINAZIONI INTERPLANETARIE Urania Millemondi s2 0065",
+                 "authors": ["Sheckley Robert"],
+                 "files": {"EPUB": epub_titled("Sheckley Robert - (antologia) - AAA ASSO DECONTAMINAZIONI "
+                                               "INTERPLANETARIE")}}])
+    plan = build_plan(src, tgt, trash)
+    assert actions(plan) == [("Perry Mason e il pugno nell'occhio", Action.MOVE),
+                             ("Perry Mason e il siero della verità", Action.LEAVE),
+                             ("Settore generale", Action.LEAVE), ("Stazione ospedale", Action.MOVE),
+                             ("Ritorno nell'universo", Action.MOVE),
+                             ("AAA Asso decontaminazioni interplanetarie", Action.LEAVE)]
+    assert plan.items[1].match.title == "Classici del giallo 0024 - Per"
+    assert "(inside its file: 'Classici del giallo 0024 - Perry Mason e il siero della verità')" in plan.items[1].reason
+
+
+def test_a_file_name_title_that_reads_as_another_book_holds_nothing_back(libs):
+    src, tgt, trash = libs(
+        source=[{"title": "Il caso Styles", "authors": ["Agatha Christie"]},
+                {"title": "Verso l'ora zero", "authors": ["Agatha Christie"]},
+                {"title": "Il Centurione", "authors": ["Arthur Conan Doyle"]},
+                {"title": "Profezia", "authors": ["Sandro Veronesi"]}],
+        target=[{"title": "Capolavori Gialli Mondadori N 0180 Verso l'ora zero", "authors": ["Agatha Christie"]},
+                {"title": "Il mastino dei Baskerville.doc", "authors": ["Arthur Conan Doyle"]},
+                {"title": "Inediti d'autore 003 - Sandro Veronesi - Profezia", "authors": ["Sandro Veronesi"]}])
+    plan = build_plan(src, tgt, trash)
+    assert actions(plan) == [("Il caso Styles", Action.MOVE), ("Verso l'ora zero", Action.LEAVE),
+                             ("Il Centurione", Action.MOVE), ("Profezia", Action.LEAVE)]
+    assert plan.items[0].match is None and plan.items[2].match is None
+    assert plan.items[3].match.title == "Inediti d'autore 003 - Sandro Veronesi - Profezia"
+
+
+# --- volumes: "X 1", "X 2" and "X" are different books ---------------------------------
+ALL_MATCHING = dict(similar_matching=True, similar_titles=True, author_variants=True, cover_check=True)
+
+
+@pytest.mark.parametrize("mine,theirs", [
+    ("Il trono di spade 1", "Il trono di spade 2"), ("Il trono di spade 1", "Il trono di spade"),
+    ("Il trono di spade", "Il trono di spade 2"), ("Il trono di spade - 2", "Il trono di spade 3"),
+    ("Il trono di spade (2)", "Il trono di spade"), ("Il trono di spade vol. 2", "Il trono di spade vol. 3"),
+    ("Il trono di spade II", "Il trono di spade"), ("Dune 1 parte1", "Dune 1 parte2")])
+@pytest.mark.parametrize("ignore_subtitle", [False, True])
+def test_different_volumes_are_never_the_same_book(libs, mine, theirs, ignore_subtitle):
+    # volumes of one novel often share the cover, and an ISBN of the whole printed work
+    src, tgt, trash = libs(source=[{"title": mine, "cover": True, "isbn": ISBN}],
+                           target=[{"title": theirs, "cover": True, "isbn": ISBN}])
+    item = build_plan(src, tgt, trash, CoverResolver(True), ignore_subtitle=ignore_subtitle, generic_check=False,
+                      **ALL_MATCHING).items[0]
+    assert item.action is not Action.TRASH and "not in target" in item.reason, item.reason
+
+
+def test_the_same_volume_is_compared(libs):
+    src, tgt, trash = libs(source=[{"title": "Il trono di spade - 2", "cover": True}],
+                           target=[{"title": "Il trono di spade (2)", "cover": True}])
+    item = build_plan(src, tgt, trash, CoverResolver(True), generic_check=False, **ALL_MATCHING).items[0]
+    assert item.action is Action.TRASH and "same cover" in item.reason
+
+
+def test_volumes_with_the_same_series_number_are_not_proof(libs):
+    src, tgt, trash = libs(source=[{"title": "Il trono di spade 1", "series": "Cronache", "series_index": 3}],
+                           target=[{"title": "Il trono di spade 2", "series": "Cronache", "series_index": 3}])
+    item = build_plan(src, tgt, trash, same_series=True).items[0]
+    assert item.action is Action.MOVE and "another title" in item.reason
+
+
+def test_an_identical_file_is_the_same_book_whatever_the_volume(libs):
+    src, tgt, trash = libs(source=[{"title": "Il trono di spade 1", "files": {"EPUB": EPUB}}],
+                           target=[{"title": "Il trono di spade 2", "files": {"EPUB": EPUB}}])
+    assert build_plan(src, tgt, trash).items[0].action is Action.TRASH
 
 
 # --- unproven duplicates: unticked, to review -------------------------------------------

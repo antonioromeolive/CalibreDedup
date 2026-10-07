@@ -218,7 +218,8 @@ def test_initials_match(a, b, same):
 
 @pytest.mark.parametrize("text,name", [
     ("F. Max Müller", True), ("Kingston", True), ("Rousseau, Jean-Jacques", True), ("A. B. Ellis", True),
-    ("Ursula K. Le Guin", True), ("De Kock, Paul", True),
+    ("Ursula K. Le Guin", True), ("De Kock, Paul", True), ("Miguel de Unamuno", True), ("Luce d'Eramo", True),
+    ("Jean de La Fontaine", True), ("Kerangal, Maylis de", True), ("Pel di Carota", False), ("de Gaulle", False),
     ("Chasing the Sun", False), ("Volume 02", False), ("Il Nome Della Rosa", False),
     ("The Antiquary", False), ("Kate Aylesford SCAN", False), ("uploader", False), ("", False),
 ])
@@ -248,7 +249,47 @@ def test_titles_made_from_file_names(title):
 
 
 @pytest.mark.parametrize("title", ["1984", "Fahrenheit 451", "1Q84", "2001: Odissea nello spazio", "Catch-22",
-                                   "Le 120 giornate di Sodoma", "Il conte di Montecristo (Vol. 2)", "Urania 1234"])
+                                   "Le 120 giornate di Sodoma", "Il conte di Montecristo (Vol. 2)", "Urania 1234",
+                                   "20.000 leghe sotto i mari", "100.000 dollari", "Lettere [1926_1940]"])
 def test_titles_with_numbers_are_titles(title):
     from calibre_dedup.normalize import looks_like_file_name
     assert not looks_like_file_name(title)
+
+
+@pytest.mark.parametrize("title,authors,core", [
+    ("ITABOOK 0052 - Hemingway", ["Ernest Hemingway"], ""),
+    ("scan0012", ["Ernest Hemingway"], ""),
+    ("ENG_ITA", ["Joseph Conrad"], ""),
+    ("Urania 0602", ["Jack Vance"], ""),
+    ("CRE61242 (Italian Edition)", ["Riccardo Rossi"], ""),
+    ("il_vecchio_e_il_mare", ["Ernest Hemingway"], "il vecchio e il mare"),
+    ("Il mastino dei Baskerville.doc", ["Arthur Conan Doyle"], "il mastino dei baskerville"),
+    ("Inediti d'autore 001 - Roberto Saviano - Super Santos", ["Roberto Saviano"], "super santos"),
+    ("Capolavori Gialli Mondadori N 0180 Verso l'ora zero", ["Agatha Christie"], "verso l ora zero"),
+    ("Quando due mondi si incontrano - Urania 0602", ["Jack Vance"], "quando due mondi si incontrano"),
+    ("Cosmo Oro 064 Dominic Flandry2", ["Poul Anderson"], "dominic flandry"),
+    ("fidanzata in affitto2", ["Massimo"], "fidanzata in affitto"),
+    ("Sheckley Robert - (antologia) - AAA ASSO DECONTAMINAZIONI INTERPLANETARIE", ["Robert Sheckley"],
+     "aaa asso decontaminazioni interplanetarie"),
+    ("Classici del giallo 0024 - Per", ["Erle Stanley Gardner"], ""),  # a title Calibre cut short
+])
+def test_the_title_a_file_name_reads_as(title, authors, core):
+    from calibre_dedup.normalize import file_name_core
+    assert file_name_core(title, authors) == core
+
+
+@pytest.mark.parametrize("a,b,differ", [
+    ("Il trono di spade 1", "Il trono di spade 2", True),
+    ("Il trono di spade", "Il trono di spade - 2", True),
+    ("Il trono di spade - 2", "Il trono di spade (2)", False),
+    ("Il trono di spade vol. 2", "Il trono di spade vol. 3", True),
+    ("Enrico VI", "Enrico VI-I", True),
+    ("Dune 1 parte1", "Dune 1 parte2", True),
+    ("Il trono di spade 2 - Il grande inverno", "Il trono di spade 2", False),
+    ("(Gutenberg - 0411- Brother Jacob - George Eliot)", "Brother Jacob", False),
+    ("Fahrenheit 451", "Fahrenheit 451 - Ray Bradbury", False),
+    ("Mussolini il duce. Gli anni del consenso", "Mussolini il duce: Gli anni del consenso, 1929-1936", False),
+])
+def test_different_volumes(a, b, differ):
+    from calibre_dedup.normalize import volumes_differ
+    assert volumes_differ(a, b) is differ and volumes_differ(b, a) is differ

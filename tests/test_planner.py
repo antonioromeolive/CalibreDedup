@@ -1116,6 +1116,16 @@ def test_a_book_named_after_a_person_is_not_swapped(libs):
     assert [i.swapped for i in plan.items] == [False, False, False]
 
 
+def test_a_surname_with_a_particle_is_a_name(libs):
+    # "Nebbia" is a surname too (Daniela Nebbia), but "Miguel de Unamuno" is a person, not a title
+    src, tgt, trash = libs(
+        source=[{"title": "Nebbia", "authors": ["Miguel de Unamuno"]},
+                {"title": "Ignazio Silone", "authors": ["Luce d'Eramo"]}],  # a biography
+        target=[{"title": f"Book {n}", "authors": ["Daniela Nebbia"]} for n in range(3)]
+        + [{"title": t, "authors": ["Ignazio Silone"]} for t in ("Fontamara", "Vino e pane")])
+    assert [i.swapped for i in build_plan(src, tgt, trash, fix_swapped=True).items] == [False, False]
+
+
 @pytest.mark.parametrize("others,swapped", [(1, False), (2, True)])
 def test_a_single_word_author_needs_a_well_known_person(libs, others, swapped):
     # "Underwoods" could be a name: put right only for a person with at least two other books

@@ -547,6 +547,58 @@ def test_a_title_that_loses_its_issue_number_is_left_out_unless_it_is_the_series
     assert "title" in it.changes and "title" not in it.doubts
 
 
+@pytest.mark.parametrize("calibre,authors,found,pages,ticked", [
+    # titles Calibre took from file names, put right: what Merge and Dedup waits for
+    ("Classici del giallo 0024 - Per", ["Erle Stanley Gardner"], "Perry Mason e il siero della verità",
+     "I CLASSICI DEL GIALLO MONDADORI Erle Stanley Gardner Perry Mason e il siero della verità", True),
+    ("Galassia 038 - Budrys Algis - ", ["Algis Budrys"], "La torcia cadente", "GALASSIA Algis Budrys La torcia cadente",
+     True),
+    ("ITABOOK 0052 - Hemingway", ["Ernest Hemingway"], "Il vecchio e il mare", "Ernest Hemingway Il vecchio e il mare",
+     True),
+    ("Inediti d'autore 003 - Sandro Veronesi - Profezia", ["Sandro Veronesi"], "Profezia",
+     "Sandro Veronesi Profezia Inediti d'autore", True),
+    ("Segretissimo 0011 - OS 117 Ne", ["Jean Bruce"], "OS 117: New York-Odessa", "SEGRETISSIMO Jean Bruce OS 117: "
+     "New York-Odessa", True),
+    # fewer words than the file name: an extension, a collection and its number after the title
+    ("La Dittatura Europea.htm", ["Ida Magli"], "La dittatura europea", "Ida Magli La dittatura europea", True),
+    ("AAA ASSO DECONTAMINAZIONI INTERPLANETARIE Urania Millemondi s2 0065", ["Robert Sheckley"],
+     "AAA Asso decontaminazioni interplanetarie", "URANIA MILLEMONDI Robert Sheckley AAA Asso decontaminazioni "
+     "interplanetarie", True),
+    # the same words: still a file name
+    ("il_vecchio_e_il_mare", ["Ernest Hemingway"], "Il vecchio e il mare", "Ernest Hemingway Il vecchio e il mare",
+     True),
+    # Calibre's file name printed in the book (the collection's page) is no title
+    ("Urania 0602", ["Jack Vance"], "Quando due mondi si incontrano", "URANIA 0602 Jack Vance Quando due mondi si "
+     "incontrano", True),
+    # a collection's number dropped: to check, unless the AI read it as the series number
+    ("Capolavori Gialli Mondadori N 0180 Verso l'ora zero", ["Agatha Christie"], "Verso l'ora zero",
+     "Agatha Christie Verso l'ora zero", False),
+    # a volume dropped: to check
+    ("Il Conte di Montecristo_2", ["Alexandre Dumas"], "Il conte di Montecristo",
+     "Alexandre Dumas Il conte di Montecristo", False),
+    ("Il Conte di Montecristo 2.epub", ["Alexandre Dumas"], "Il conte di Montecristo",
+     "Alexandre Dumas Il conte di Montecristo", False),
+])
+def test_a_file_name_title_is_replaced_by_the_title_read(calibre, authors, found, pages, ticked):
+    b = book(title=calibre, authors=authors, publisher=None, pub_year=None)
+    it = ReviewItem(b, read(b, meta(title=found, authors=authors, publisher=None, year=None), pages))
+    assert it.changes["title"] == found
+    assert ("title" not in it.doubts) == ticked and it.selected == ticked, it.doubts
+    if not ticked:
+        assert it.doubts["title"] in ("the issue or volume number would be lost", "the volume number would change")
+
+
+def test_a_title_that_is_not_a_file_name_keeps_its_volume():
+    b = book(title="Il Conte di Montecristo - 2", authors=["Alexandre Dumas"])
+    it = ReviewItem(b, read(b, meta(title="Il conte di Montecristo", authors=["Alexandre Dumas"]),
+                            "Alexandre Dumas Il conte di Montecristo"))
+    assert "title" not in it.changes  # only drops the volume: not proposed (_drops_part)
+    b = book(title="Il trono di spade", authors=["George R. R. Martin"])
+    it = ReviewItem(b, read(b, meta(title="Il trono di spade 2", authors=["George R. R. Martin"]),
+                            "George R. R. Martin Il trono di spade 2"))
+    assert it.doubts["title"] == "the volume number would change" and not it.selected
+
+
 def test_a_series_name_is_not_a_publisher():
     b = book(publisher="La Tribuna")
     it = ReviewItem(b, read(b, meta(publisher="Galassia", series="Galassia", series_index=134), "GALASSIA"))

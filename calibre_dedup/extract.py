@@ -56,6 +56,8 @@ ARCHIVE_TOOL = Path(archive_tool.__file__)
 
 # Formats whose own cover can be read, best first.
 EMBEDDED_COVER_FORMATS = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "FB2"]
+# Formats whose own title can be read, best first (see TextExtractor.file_title).
+FILE_TITLE_FORMATS = EMBEDDED_COVER_FORMATS + ["PDF"]
 # Preferred formats for extraction, best first.
 FORMAT_PRIORITY = ["EPUB", "KEPUB", "AZW3", "MOBI", "AZW", "PDF", "FB2", "DOCX", "RTF", "HTMLZ", "TXT", "DJVU"]
 # The one format of a book whose whole text is compared with another book's (same_text.py), best first:
@@ -274,6 +276,27 @@ class TextExtractor:
                     self._covers[path] = None
             if self._covers[path]:
                 return path, self._covers[path]
+        return None
+
+    def file_title(self, formats: dict[str, str]) -> str | None:
+        """The title written inside the book's file (not Calibre's): EPUB is read directly
+        (see epub_title); MOBI, AZW3, FB2 and PDF with Calibre's ebook-meta."""
+        for fmt in FILE_TITLE_FORMATS:
+            path = formats.get(fmt)
+            if not path or not Path(path).is_file():
+                continue
+            try:
+                if fmt in ("EPUB", "KEPUB"):
+                    title = epub_title(path)
+                else:
+                    out = self._run("ebook-meta", [path]).decode("utf-8", "replace")
+                    m = re.search(r"^Title\s*:\s*(.+?)\s*$", out, re.M)
+                    title = m.group(1) if m else None
+            except Exception as e:  # corrupt, DRM, unsupported...
+                log.info("Cannot read the title inside %s: %s", path, _error_line(str(e)))
+                continue
+            if title:
+                return title
         return None
 
     def _ebook_meta_cover(self, path: str) -> bytes | None:
@@ -506,6 +529,16 @@ def _epub_sample(path: str, chars: int) -> tuple[str, int]:
             if count >= chars:
                 break
     return "\n\n".join(texts[i] for i in sorted(texts))[:chars], total
+
+
+def epub_title(path: str) -> str | None:
+    """The title in an EPUB's package (its first <dc:title>), or None."""
+    with zipfile.ZipFile(path) as z:
+        container = ElementTree.fromstring(z.read("META-INF/container.xml"))
+        opf_path = next(el.get("full-path") for el in container.iter() if el.tag.endswith("rootfile"))
+        opf = ElementTree.fromstring(z.read(opf_path))
+    title = next((el.text for el in opf.iter() if el.tag.endswith("}title") and (el.text or "").strip()), None)
+    return " ".join(title.split()) if title else None
 
 
 def _epub_cover(path: str) -> bytes | None:

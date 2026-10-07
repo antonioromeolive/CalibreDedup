@@ -133,7 +133,9 @@ decides it. Each step links to where it is explained in full.
    … without asking* is on), else it stays in the source (a DOC, an RTF Word opens). Some
    usable: the book is decided on those.
 3. **Title and author swapped** ("Kingston" by "The Log House by the Lake"): analyzed put right;
-   such a book may be trashed, never moved.
+   such a book may be trashed, never moved. An author field that reads as a person's name,
+   with the particles of a surname ("Nebbia" by "Miguel de Unamuno", "Ignazio Silone" by
+   "Luce d'Eramo"), is a name: such a record is left as it is.
 4. **An identical file** in another book (same format and size, then the same content) →
    duplicate, whatever the titles. A file shared by books of 3 or more titles and authors is a
    placeholder and proves nothing.
@@ -147,6 +149,9 @@ decides it. Each step links to where it is explained in full.
    - still none, *Match similar titles by the same author*: a similar title by the same author,
      a duplicate only with proof (ISBN, ASIN, series number, the same text, the same cover);
    - still none → **Move** (within one library: *Leave: no duplicate*).
+
+   **Different volumes are never compared** ("Il trono di spade 1", "Il trono di spade 2",
+   "Il trono di spade"): see [volumes](#volumes).
 8. **Compared with each copy** ([how two books are compared](#how-two-books-are-compared)); a
    duplicate of any copy wins:
    1. the same ISBN or ASIN, or (option) the same series and number → duplicate;
@@ -168,8 +173,14 @@ decides it. Each step links to where it is explained in full.
       *Leave: to check*.
 9. **After the decision**:
    - a *Move* is held back (stays in the source) when the title looks like a file name, when a
-     target book by the same author has a file-name title (it may be this book), or when title
-     and author were swapped;
+     target book by the same author has a file-name title that may be this book, or when title
+     and author were swapped. A file-name title may be this book when it reads as this one
+     ("Inediti d'autore 003 - Sandro Veronesi - Profezia" for "Profezia"). When Calibre cut the
+     title short ("Classici del giallo 0024 - Per") or nothing in it reads as a title, the title
+     inside the book's file is read instead. One that reads as another title ("Il mastino dei
+     Baskerville.doc", "Urania 0602 - Quando due mondi si incontrano"), or as none even in its
+     file ("ITABOOK 0052 - Hemingway"), holds back no other book: fix its title in the target with
+     the Metadata Review;
    - a duplicate that isn't proven (no edition data, decided by the covers, authors matched
      only by the surname or the AI) starts **unticked, to review**; never one with the same
      ISBN, ASIN or text;
@@ -344,11 +355,13 @@ sequenceDiagram
 3. **What the pages show, without AI**: whether Calibre's value and the AI's are printed in
    them, the language of the text, the ISBNs printed.
 4. **The changes**: the fields where the AI read something different. Never: erasing a value,
-   a title that only drops the current one's subtitle or volume, an ISBN for a book that
-   already has one (or when the pages print none, or several).
+   a title that only drops the current one's subtitle or volume (but a file name is replaced
+   by any real title), an ISBN for a book that already has one (or when the pages print
+   none, or several).
 5. **Each change is checked** ([which changes are ticked](#step-2-review-the-list-1)): left out
-   when the new value isn't printed in the pages, when Calibre's is, when an author or the
-   issue number would be lost, or when a series or an author is proposed as the publisher.
+   when the new value isn't printed in the pages, when Calibre's is (not for a file name),
+   when an author or the issue number would be lost, when the volume number would change, or
+   when a series or an author is proposed as the publisher.
 6. **The cover**: generic, a page of the book, or one the AI calls not real → tagged
    `BadCover` on Execute.
 7. Ticked when it has changes the book supports; **to review** when changes were left out, an
@@ -566,12 +579,28 @@ read to tell, and a file shared by books of 3 or more titles *and* authors is a 
 
 **A title made from a file name** ("ITABOOK 0052 - Hemingway", "il_vecchio_e_il_mare",
 "Moby Dick.epub", "scan0012": a number padded with zeros, words joined by underscores, a
-file extension, a code of letters and digits) is no title for the target: the book is matched
-as it is (the same file, the same file name), but **never moved**: it stays in the source until
-the Metadata Review reads its real title. And a **target** book by the same author with such a
-title may be any of that author's books: a source book by that author that would be moved
-stays in the source too ("the target's 'ITABOOK 0052 - Hemingway' … may be this book: fix that
-title with the Metadata Review first"), and the target book is shown as its match.
+file extension, a code of letters and digits; not "20.000 leghe sotto i mari" or "Lettere
+[1926_1940]") is no title for the target: the book is matched as it is (the same file, the same
+file name), but **never moved**: it stays in the source until the Metadata Review reads its real
+title. And a **target** book by the same author with such a title may be one of that author's
+books: the one it still reads as once the file name's parts are dropped (the extension, the
+collection and its number, a copy number, a note in brackets, the author). A source book by
+that author that would be moved stays in the source too when it may be that book ("the
+target's 'ITABOOK 0052 - Hemingway' (inside its file: 'Il vecchio e il mare') … may be this
+book: fix that title with the Metadata Review first"), and the target book is shown as its
+match. "Capolavori Gialli Mondadori N 0180 Verso l'ora zero" holds back "Verso l'ora zero",
+not "Il caso Styles".
+
+Calibre often cuts a title taken from a file name ("Classici del giallo 0024 - Per"), and
+some read as nothing ("ITABOOK 0052 - Hemingway"). Then the **title written inside the book's
+file** is read: an EPUB's own metadata (its package file), read directly; MOBI, AZW3, FB2 and
+PDF with Calibre's `ebook-meta` (only with an AI selected). It is used when Calibre's title
+reads as nothing, or when it goes on from Calibre's ("Classici del giallo 0024 - Perry Mason e
+il siero della verità"): that target book then holds back "Perry Mason e il siero della
+verità", not "Perry Mason e il pugno nell'occhio". A target book whose title reads as nothing,
+even in its file, is taken for another book and holds back none: put its title right in the
+target with the Metadata Review. What was read is kept with the other facts about the books'
+files.
 
 Otherwise only books with the **same title and authors** are compared, after normalization:
 
@@ -588,6 +617,17 @@ Otherwise only books with the **same title and authors** are compared, after nor
   completa)", "(Antologia)", "(versione ridotta)") or a language ("(Em Portuguese Do
   Brasil)");
 - subtitles count, unless *Ignore subtitles* is on.
+
+<a id="volumes"></a>**Volumes.** A number right after the title is a volume: "Il trono di
+spade 1", "Il trono di spade - 2", "Il trono di spade (3)", "vol. 2", "parte 2", "tomo II",
+a roman numeral at the end ("Il trono di spade II"). Two titles whose volumes differ, or of
+which only one has a volume ("Il trono di spade" and "Il trono di spade 2"), are **never the
+same book**, as they may be successive parts of one novel: not with *Ignore subtitles* ("Il
+trono di spade - 2" / "- 3"), not as similar titles, not by the same series and number, and
+not by the same ISBN or cover (split volumes often carry the printed work's ISBN and cover).
+Only an identical file still makes them one. A number before the title is no volume
+("Gutenberg 0411 - Brother Jacob", "1 Haunted London"), nor is a year ("I racconti
+1927-1951").
 
 With *Similar author matching* (on by default), authors are compared more loosely, like the
 "similar" algorithm of Calibre's *Find Duplicates* plugin: initials and the words von, van,
@@ -726,7 +766,8 @@ dropping the author, bare numbers and a collection name followed by a number. So
 - "(Gutenberg Classics 2x033 2001 Dicembre - SHIFTING WINDS)" and "SHIFTING WINDS
   Inverno 2001".
 
-But "Dune Messiah" and "Dune" don't: "Messiah" is part of the title. Alike titles are weaker
+But "Dune Messiah" and "Dune" don't: "Messiah" is part of the title; nor do "Il trono di
+spade 2" and "Il trono di spade": a number right after the title is a [volume](#volumes). Alike titles are weaker
 than the same title, so **only proof makes a duplicate**: the same ISBN, ASIN or series
 number, the same text, or the same cover. A real difference in edition or publisher
 (not only the year), a different cover, or a text in another language rules the book out: it
@@ -902,7 +943,11 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   subtitle or volume part ("Fantozzi: la trilogia" → "Fantozzi", "Dune parte 2" → "Dune"): it
   says less. A shorter title that only drops noise is proposed: an edition note ("(Italian
   Edition)"), a collection ("(Everyman)"), the author's name, or a number that becomes the
-  series number. The cover of the selected book is shown on the right.
+  series number. A **title made from a file name** ("il_vecchio_e_il_mare", "La Dittatura
+  Europea.htm", "Classici del giallo 0024 - Per", "AAA ASSO DECONTAMINAZIONI INTERPLANETARIE
+  Urania Millemondi s2 0065") is replaced by the real title the AI read, even with the same
+  words or fewer: Merge and Dedup never moves such a book, and in the target it holds back
+  no other book until it is put right. The cover of the selected book is shown on the right.
 - **Filters:** the search box and three drop-down lists, combined as in the Duplicate
   Remover (any ticked entry within a list, all lists together):
   - **Actions:** *Update*, *Keep*, *Trash*.
@@ -921,11 +966,14 @@ Choose the **library to review** and the **trash library**, then **1. Analyze (d
   again* for every field at once; with several books selected, each entry acts on those it
   applies to, the others are left as they are):
   - *Calibre's value is printed in the book* ("Polluce Quinto" is in the book: not replaced by
-    the title of the magazine issue that holds it);
+    the title of the magazine issue that holds it); a file name printed ("URANIA 0602" on the
+    collection's page) is no title and doesn't count;
   - *the new value is not in the book's text* (e.g. read from the cover only);
   - *an author would be lost* ("Heinlein, Bradbury, Amis" or "F. Brown e altri" cut to one name);
   - *the issue or volume number would be lost* ("Galaxy N 04" → "Galaxy Fantascienza"), unless
     it becomes the series number;
+  - *the volume number would change* ("Il Conte di Montecristo_2" → "Il conte di Montecristo",
+    "Il trono di spade" → "Il trono di spade 2": see [volumes](#volumes));
   - *a series name, not a publisher* ("Galassia", "Urania": any series of the library or read
     by the AI), *an author's name, not a publisher*;
   - *not checked against the book*: no text to check (a scanned book: nothing is ticked), or
@@ -1193,7 +1241,7 @@ there automatically.
 | `selections.json` | Merge and Dedup | remembered ticks and changes (and *Mark reviewed*), per source/target pair |
 | `snapshots\<library>_<id>\metadata_<date>.db` | both | a copy of each library's `metadata.db` taken before each Execute that writes it (not the trash library), the last 3 per library; `library.txt` says which library. To undo an Execute's metadata changes: close Calibre and copy it back over the library's `metadata.db` (the files moved or trashed since are in the target, the trash library or Calibre's recycle bin) |
 | `journal\dedup_<date>.csv`, `journal\review_<date>.csv` | each | one per Execute: each book acted on, what was done, why (the analysis' reason), the copy it duplicated, and for the review the values before and after; e.g. why a book is in the trash library |
-| `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text, its text's fingerprint (the same text) |
+| `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text, its text's fingerprint (the same text), the title inside its file (file-name titles) |
 | `calibre_dedup.log` / `calibre_review.log` | each | what happened, including every AI request and reply |
 | `calibre_dedup_perf.log` / `calibre_review_perf.log` | each | AI performance (below) |
 

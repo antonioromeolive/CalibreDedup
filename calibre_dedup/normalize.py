@@ -171,18 +171,51 @@ def _strip_trailing_groups(title: str) -> str:
 # A title Calibre took from a file name: a file extension ("Moby Dick.epub"), words joined by
 # underscores ("il_vecchio_e_il_mare"), a number padded with zeros ("ITABOOK 0052 - Hemingway",
 # "scan0012") or a code of letters and digits ("B00ABC1234"). "1984", "Fahrenheit 451" and
-# "1Q84" are titles.
+# "1Q84" are titles, and so are "20.000 leghe sotto i mari" (a thousands separator) and
+# "Lettere [1926_1940]" (only digits around the underscore).
+_EXTENSION_RE = re.compile(r"\.(?:epub|kepub|pdf|mobi|azw3?|txt|rtf|docx?|odt|lit|djvu|fb2|html?|htmlz|prc|pdb|lrf|"
+                           r"cb[rz7]|zip|rar|7z)\b", re.I)
+_PADDED_NUMBER_RE = re.compile(r"(?<!\d)(?<!\d[.,])0\d{2,}(?!\d)")
+_CODE_RE = re.compile(r"\b(?=[^\W\d_]*\d)(?=\d*[^\W\d_])[^\W_]{6,}\b")
 _FILE_NAME_RES = [
-    re.compile(r"\.(?:epub|kepub|pdf|mobi|azw3?|txt|rtf|docx?|odt|lit|djvu|fb2|html?|htmlz|prc|pdb|lrf|"
-               r"cb[rz7]|zip|rar|7z)\b", re.I),
-    re.compile(r"[^\W_]_+[^\W_]"),
-    re.compile(r"(?<!\d)0\d{2,}(?!\d)"),
-    re.compile(r"\b(?=[^\W\d_]*\d)(?=\d*[^\W\d_])[^\W_]{6,}\b"),
+    _EXTENSION_RE,
+    re.compile(r"[^\W\d_]_+[^\W_]|[^\W_]_+[^\W\d_]"),
+    _PADDED_NUMBER_RE,
+    _CODE_RE,
 ]
 
 
 def looks_like_file_name(title: str) -> bool:
     return any(r.search(title) for r in _FILE_NAME_RES)
+
+
+def file_name_core(title: str, authors: list[str]) -> str:
+    """The title a file-name title still reads as, as a title key, or '' when nothing in it
+    does. The file name's parts are dropped: the extension, underscores, a collection and
+    its number ("Inediti d'autore 001 - Roberto Saviano - Super Santos" is "super santos",
+    "Urania 0602"), a copy number ("fidanzata in affitto2"), codes ("scan0012"), a note in
+    brackets between dashes ("Sheckley Robert - (antologia) - AAA Asso...") and the author
+    ("ITABOOK 0052 - Hemingway" is '')."""
+    names = [set(_tokens(a)) for a in authors if not is_unknown(a)]
+
+    def clean(part: str) -> str:
+        if re.fullmatch(r"\s*(?:\([^()]*\)|\[[^\[\]]*\])\s*", part):
+            return ""
+        numbers = list(_PADDED_NUMBER_RE.finditer(part))
+        if numbers:
+            part = part[numbers[-1].end():]  # what comes before is the collection
+        part = _CODE_RE.sub(lambda m: re.sub(r"\d{1,2}$", "", m.group())
+                            if re.fullmatch(r"[^\W\d_]+\d{1,2}", m.group()) else " ", part)
+        words = set(_tokens(part))
+        return "" if not words or any(words <= n for n in names) else part
+
+    text = _EXTENSION_RE.sub(" ", title).replace("_", " ")
+    parts = [p for p in (clean(p) for p in _SEGMENT_SPLIT_RE.split(text)) if p.strip()]
+    if not parts:
+        return ""
+    core = next(iter(title_variants(" - ".join(parts), authors)), "")  # none: "(Italian Edition)" only
+    readable = any(len(w) >= 4 and w.isalpha() and w not in _DATE_WORDS for w in core.split())
+    return core if readable else ""
 
 
 def series_key(name: str) -> str:
@@ -270,6 +303,63 @@ def noise_words(*texts: str | None) -> set[str]:
 
 def _is_noise(word: str, noise: set[str]) -> bool:
     return len(word) == 1 or any(c.isdigit() for c in word) or word in noise
+
+
+# Words before a volume's number ("vol. 2", "parte 2", "tomo II", "parte1").
+_VOLUME_WORDS = {"vol", "volume", "parte", "part", "tomo", "libro", "book", "n", "nr", "no", "num", "numero",
+                 "episodio", "episode"}
+_GLUED_VOLUME_RE = re.compile(rf"(?:{'|'.join(sorted(_VOLUME_WORDS, key=len, reverse=True))})(\d+)")
+_ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10,
+          "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15, "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19,
+          "xx": 20}
+
+
+def _volume(words: list[str], at: int) -> int | None:
+    """The volume number the title's words give at `at`: "2", "parte1", "vol 2", "tomo ii",
+    or a roman numeral ending the title ("ii"); None: no volume there, nor a year ("I
+    racconti 1927-1951")."""
+    if at >= len(words):
+        return None
+    w = words[at]
+    if w.isdigit():
+        return None if len(w) == 4 and 1400 <= int(w) <= 2100 else int(w)
+    glued = _GLUED_VOLUME_RE.fullmatch(w)
+    if glued:
+        return int(glued.group(1))
+    if w in _ROMAN and at == len(words) - 1:
+        return _ROMAN[w]
+    if w in _VOLUME_WORDS and at + 1 < len(words):
+        n = words[at + 1]
+        return int(n) if n.isdigit() else _ROMAN.get(n)
+    return None
+
+
+def _find_words(words: list[str], part: list[str]) -> int:
+    """Where `part` starts in `words` as whole words, or -1."""
+    return next((i for i in range(len(words) - len(part) + 1) if words[i:i + len(part)] == part), -1)
+
+
+def volumes_differ(a: str, b: str, shared: str = "") -> bool:
+    """Whether two titles are different volumes of one work, never the same book: the
+    number right after the title they share differs, or only one has one ("Il trono di
+    spade 1", "Il trono di spade - 2", "Il trono di spade (3)", "Il trono di spade";
+    "vol. 2", "parte 2", "II" too). `shared`: that title (a title key, as similar titles
+    find it); by default the words both titles start with. A number before it is no volume
+    ("Gutenberg 0411 - Brother Jacob", "1 haunted london")."""
+    wa, wb = title_key(a).split(), title_key(b).split()
+    if shared:
+        part = shared.split()
+    else:
+        n = 0
+        while n < min(len(wa), len(wb)) and wa[n] == wb[n]:
+            n += 1
+        part = wa[:n]
+    if not part:
+        return False
+    at_a, at_b = _find_words(wa, part), _find_words(wb, part)
+    if at_a < 0 or at_b < 0:
+        return False
+    return _volume(wa, at_a + len(part)) != _volume(wb, at_b + len(part))
 
 
 def contains_title(big: str, small: str, noise: set[str]) -> bool:
@@ -394,14 +484,22 @@ _TITLE_WORDS = set(
     "nella per con su tra fra che non come the of and an to on for with de du des et der die das und "
     "el los las y en".split())
 _ARTICLES = set("il lo la i gli le l un uno una the a an el los las der die das".split())
+# Lowercase particles of surnames ("Miguel de Unamuno", "Luce d'Eramo", "Ludwig van Beethoven").
+# Not "di", "da", "del": Italian titles written in capitals have them ("Pel di Carota").
+_NAME_PARTICLES = {"de", "d", "van", "von", "der", "den", "du", "des", "dos", "ten", "ter", "zu"}
 
 
 def looks_like_name(text: str) -> bool:
     """Whether `text` could be a person's name as a library writes it: one to four
     capitalized words, initials allowed ("F. Max Müller", "Rousseau, Jean-Jacques",
     "A. B. Ellis", "Kingston"), with no digits, no article in front and no lowercase
-    word such as "di", "the" ("Chasing the Sun", "Volume 02" are not)."""
+    word such as "di", "the" ("Chasing the Sun", "Volume 02" are not), but for
+    the particles of a surname between two of them ("Miguel de Unamuno", "Kerangal,
+    Maylis de")."""
     words = re.findall(r"[^\W\d_]+|\d+", text)
+    names = [w for w in words if w not in _NAME_PARTICLES]
+    if len(names) >= 2 and len(names) < len(words) and (words[-1] not in _NAME_PARTICLES or "," in text):
+        words = names
     if not words or len(words) > 4 or any(w.isdigit() for w in words):
         return False
     initial = re.match(r"\s*[^\W\d_]\.", text)  # "A. B. Ellis": "A" is an initial, not an article

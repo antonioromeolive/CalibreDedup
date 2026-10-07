@@ -62,15 +62,16 @@ from .ai import (
 from .covers import GENERIC_COVER_BOOKS, PAGE_NOTE, generic_covers, generic_note, page_cover
 from .extract import CALIBRE_INPUT_FORMATS, TextExtractor, cover_png, openable_elsewhere, unreadable_formats
 from .language import language_name
-from .library_cache import FileChecks, FileHashes, TextFacts, TextPrints
+from .library_cache import FileChecks, FileHashes, FileTitles, TextFacts, TextPrints
 from .library import read_books, tag_filter_text, tag_selects
 from .matcher import Decision, Verdict, compare, decide
 from .models import Action, Book, Identity, Plan, PlanItem
 from .pause import Pause, wait_if_paused
 from .normalize import (
-    MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, initials_match, is_unknown,
-    looks_like_file_name, looks_like_name, names_nearly_equal, noise_words, normalize_isbn, parse_edition_number,
-    related_titles, series_key, similar_authors_keys, surname_match, title_key, title_variants,
+    MIN_SURNAME_LENGTH, VARIOUS_AUTHORS_KEY, author_key, authors_key, contains_title, file_name_core,
+    initials_match, is_unknown, looks_like_file_name, looks_like_name, names_nearly_equal, noise_words,
+    normalize_isbn, parse_edition_number, related_titles, series_key, similar_authors_keys, surname_match, title_key,
+    title_variants, volumes_differ,
 )
 from .same_text import SAME_TEXT, percent, share
 from .selection import action_label, has_cleanup
@@ -460,7 +461,10 @@ def _series_key(ident: Identity) -> tuple:
 def _series_agrees(a: Identity, b: Identity) -> bool:
     """Same series and number is proof only when the titles or the authors agree too:
     libraries file a publisher's sub-series (Millemondi, Classici) and wrong numbers
-    under one series name, so the number alone pairs unrelated books."""
+    under one series name, so the number alone pairs unrelated books. Titles of different
+    volumes ("Il trono di spade 1", "Il trono di spade 2") never agree."""
+    if a.title and b.title and volumes_differ(a.title, b.title):
+        return False
     if a.title and b.title and related_titles(a.title, b.title, noise_words(a.series[0])):
         return True
     people = [(x, y) for x in a.authors for y in b.authors
@@ -581,7 +585,8 @@ def _similar_title(sb: Book, ident: Identity, c: _Candidate, collections: set[st
     core_mine, core_theirs = mine[0], c.variants[0]
     for title in dict.fromkeys(mine + c.variants):
         if contains_title(core_mine, title, noise) and contains_title(core_theirs, title, noise):
-            return repr(title)
+            # "Il trono di spade 1" and "Il trono di spade": numbers are noise, but not a volume's
+            return "" if volumes_differ(ident.title or "", c.identity.title or "", title) else repr(title)
     return ""
 
 
@@ -657,9 +662,12 @@ class _Context:
     files: _FileIndex | None = None
     texts: TextFacts | None = None  # language and length of the books' text; None: not read
     prints: TextPrints | None = None  # fingerprints of the books' text (same_text.py)
-    # Books that stay as they are (the target's) whose title is a file name, by author key:
-    # one may be any book by that author, which is then not moved (see _plan_one).
+    # Books that stay as they are (the target's) whose title is a file name, by author key: one
+    # may be a book by that author, which is then not moved (see _plan_one).
     named: dict[tuple, list[_Candidate]] = field(default_factory=dict)
+    titles: FileTitles | None = None  # the titles inside the books' files
+    # id(book) -> (the title such a book reads as, the title inside its file when that is the one)
+    read_as: dict[int, tuple[str, str | None]] = field(default_factory=dict)
 
 
 @dataclass
@@ -883,6 +891,8 @@ def build_plan(
     texts = TextFacts(library_cache, extractor) if hasattr(extractor, "text_profile") else None
     # Without the AI's extractor, only EPUB and TXT texts are compared.
     prints = TextPrints(library_cache, extractor if hasattr(extractor, "whole_text") else None)
+    # Without it, only the titles inside EPUBs are read.
+    titles = FileTitles(library_cache, extractor if hasattr(extractor, "file_title") else None)
     generic: dict[str, int] = {}
     if cover_check or always_cover:
         if generic_check:
@@ -983,7 +993,8 @@ def build_plan(
     ctx = _Context(index, resolver, stats, ignore_subtitle=ignore_subtitle, same_library=same_library,
                    similar_matching=similar_matching, cover_check=cover_check, recheck_years=recheck_years,
                    same_series=same_series, always_cover=always_cover, similar=similar, by_title=by_title,
-                   persons=swaps, generic=generic, files=files, texts=texts, prints=prints, named=named)
+                   persons=swaps, generic=generic, files=files, texts=texts, prints=prints, named=named,
+                   titles=titles)
 
     perf.run_start("dedup", total, getattr(resolver, "provider", None), getattr(resolver, "vision", None))
     for n, sb in enumerate(analysis_books, 1):
@@ -1092,6 +1103,7 @@ def build_plan(
     if texts is not None:
         texts.save()
     prints.save()
+    titles.save()
     if resolver:
         resolver.cache.save()
         stats.update(resolver.stats)
@@ -1306,7 +1318,7 @@ def _metadata_richness(book: Book) -> int:
 def _plan_one(sb: Book, ctx: _Context) -> PlanItem:
     """A book whose title is a file name is matched as it is (an identical file, the same
     file name), but never moved. Nor is one that may be a target book by the same author
-    whose title is a file name: the Metadata Review fixes such titles first."""
+    whose title is a file name (see _may_hide): the Metadata Review fixes such titles first."""
     skipped: list[str] = []
     item = _decide_one(sb, ctx, skipped)
     file_name = not is_unknown(sb.title) and looks_like_file_name(sb.title)
@@ -1314,10 +1326,12 @@ def _plan_one(sb: Book, ctx: _Context) -> PlanItem:
         item = _hold(item, "the title looks like a file name", ctx.stats)
     elif item.action is Action.MOVE:
         named = next((c for k in _author_keys(item.identity, ctx.similar_matching) for c in ctx.named.get(k, [])
-                      if c.book is not sb), None)
+                      if c.book is not sb and _may_hide(_read_as(c, ctx)[0], c, item.identity)), None)
         if named is not None:
-            item = _hold(item, f"the target's {named.book.label()!r}, by the same author, has a file name for "
-                               "title: it may be this book", ctx.stats)
+            inside = _read_as(named, ctx)[1]
+            inside = f" (inside its file: {inside!r})" if inside else ""
+            item = _hold(item, f"the target's {named.book.label()!r}{inside}, by the same author, has a file name "
+                               "for title: it may be this book", ctx.stats)
             item.match, item.different = named.book, True
             item.reason = item.planned_reason = item.reason.replace(FIX_FIRST, "fix that title with the Metadata "
                                                                               "Review first")
@@ -1325,6 +1339,44 @@ def _plan_one(sb: Book, ctx: _Context) -> PlanItem:
         item.file_name_title = sb.title
     item.skipped = list(dict.fromkeys(skipped))
     return item
+
+
+# Words around a title that make a part of the book, not another book ("DUNE 1 parte1").
+_PART_WORDS = {"parte", "part", "vol", "volume", "tomo", "libro", "book"}
+
+
+def _read_as(c: _Candidate, ctx: _Context) -> tuple[str, str | None]:
+    """The title a book whose title is a file name reads as (normalize.file_name_core), or
+    '' when it reads as none, and the title inside its file when that is the one read.
+    Calibre's title is often a file name cut short ("Classici del giallo 0024 - Per"): the
+    title inside the file is read when Calibre's reads as nothing, or when the file's goes
+    on from it ("Classici del giallo 0024 - Perry Mason e il siero della verità")."""
+    key = id(c.book)
+    if key not in ctx.read_as:
+        title, authors = c.identity.title or "", c.identity.authors
+        found = file_name_core(title, authors), None
+        inside = ctx.titles.get(c.book) if ctx.titles is not None else None
+        if inside:
+            short, full = (series_key(t).replace(" ", "") for t in (title, inside))
+            core = file_name_core(inside, authors)
+            if core and (not found[0] or (full.startswith(short) and len(full) > len(short))):
+                found = core, inside
+                log.info("%s: the title inside its file is %r", c.book.label(), inside)
+        ctx.read_as[key] = found
+    return ctx.read_as[key]
+
+
+def _may_hide(core: str, c: _Candidate, ident: Identity) -> bool:
+    """Whether a book by the same author whose title is a file name may be this book: the
+    title it reads as (see _read_as) is this one with only noise around ("Inediti d'autore
+    003 - Sandro Veronesi - Profezia" for "Profezia"). One that reads as another title ("Il
+    mastino dei Baskerville.doc"), or as none ("ITABOOK 0052 - Hemingway" with no title in its
+    file), is another book: its title is put right in the target with the Metadata Review."""
+    if not core:
+        return False
+    mine = title_key(ident.title or "")
+    noise = noise_words(*ident.authors, *c.identity.authors, ident.series, c.book.series) | _PART_WORDS
+    return contains_title(core, mine, noise) or contains_title(mine, core, noise)
 
 
 def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
@@ -1387,6 +1439,11 @@ def _decide_one(sb: Book, ctx: _Context, skipped: list[str]) -> PlanItem:
                                                                  ctx.ignore_subtitle, ctx.persons)
         notes += n
         ai_used = ai_used or called
+    # Titles cut at a dash ("ignore subtitle") or authors written differently may pair
+    # different volumes of one work ("Il trono di spade - 2", "Il trono di spade - 3"): never the same book.
+    for c in [c for c in candidates if volumes_differ(ident.title, c.identity.title)]:
+        notes.append(f"{c.book.label()!r} is another volume")
+        candidates.remove(c)
 
     if not candidates:
         if ctx.similar is not None:

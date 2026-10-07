@@ -57,8 +57,9 @@ from .library import LibraryError, read_books, tag_filter_text, tag_selects
 from .models import Book
 from .pause import Pause, wait_if_paused
 from .normalize import (
-    author_key, authors_key, is_unknown, looks_like_name, names_nearly_equal, noise_words, normalize_isbn,
-    publisher_tokens, same_publisher, series_key, strip_accents, title_key, word_tokens,
+    author_key, authors_key, is_unknown, looks_like_file_name, looks_like_name, names_nearly_equal, noise_words,
+    normalize_isbn, publisher_tokens, same_publisher, series_key, strip_accents, title_key, volumes_differ,
+    word_tokens,
 )
 from .planner import MAX_LIBRARY_PATH, AIResolver
 
@@ -267,14 +268,27 @@ def read_value(found: ReviewMetadata, name: str):
     return getattr(found, name)
 
 
+def _file_name_title(book: Book, found: ReviewMetadata) -> bool:
+    """Whether the book's title is a file name (normalize.looks_like_file_name) and the
+    title the AI read is not: "il_vecchio_e_il_mare", "La Dittatura Europea.htm", "AAA
+    ASSO DECONTAMINAZIONI INTERPLANETARIE Urania Millemondi s2 0065" -> a real title."""
+    current = current_value(book, "title")
+    return bool(current and found.title and looks_like_file_name(current) and not looks_like_file_name(found.title))
+
+
 def find_changes(book: Book, found: ReviewMetadata) -> dict:
     """The fields where the AI read something different from the metadata. A field
     the AI did not find is never a change: nothing is ever erased. Nor is a title that
-    only drops the current one's subtitle or volume part (_drops_part). An ISBN only for a
-    book without one, and only one printed in its pages; the language is the text's own
-    when it can be told (language.detect_language), else the AI's."""
+    only drops the current one's subtitle or volume part (_drops_part), but for a file
+    name, which any real title replaces, even with the same words ("il_vecchio_e_il_mare")
+    or fewer (an extension, a collection and its number). An ISBN only for a book without
+    one, and only one printed in its pages; the language is the text's own when it can be
+    told (language.detect_language), else the AI's."""
     changes: dict = {}
-    if (found.title and _loose(found.title) != _loose(current_value(book, "title"))
+    if _file_name_title(book, found):
+        if found.title.strip() != current_value(book, "title").strip():
+            changes["title"] = found.title
+    elif (found.title and _loose(found.title) != _loose(current_value(book, "title"))
             and not _drops_part(book, found)):
         changes["title"] = found.title
     if found.authors and authors_key(found.authors) != authors_key(book.authors):
@@ -424,13 +438,17 @@ def doubtful_changes(book: Book, found: ReviewMetadata, changes: dict) -> dict[s
                 if number not in {int(n) for n in re.findall(r"\d+", new)} and found.series_index != number:
                     doubts[name] = "the issue or volume number would be lost"
                     continue
+            # "Il Conte di Montecristo_2" -> "Il conte di Montecristo": another volume (normalize.volumes_differ)
+            if name == "title" and volumes_differ(current.replace("_", " "), new):
+                doubts[name] = "the volume number would change"
+                continue
             if _swapped(name, book, found):
                 continue
         e = evidence.get(name)
         if not e or e.get("current") != format_value(name, current):
             doubts[name] = "not checked against the book"  # no text, or Calibre's value changed since
-        elif current and e.get("current_printed"):
-            doubts[name] = "Calibre's value is printed in the book"
+        elif current and e.get("current_printed") and not (name == "title" and _file_name_title(book, found)):
+            doubts[name] = "Calibre's value is printed in the book"  # a file name ("URANIA 0602") is no title
         elif not e.get("read_printed"):
             doubts[name] = "the new value is not in the book's text"
     return doubts

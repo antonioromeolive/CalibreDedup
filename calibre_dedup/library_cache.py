@@ -37,7 +37,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .extract import same_text_format, unreadable_formats, whole_text
+from .extract import epub_title, same_text_format, unreadable_formats, whole_text
 from .library_use import library_hash
 from .models import Book
 from .same_text import fingerprint
@@ -198,6 +198,44 @@ class TextFacts:
                 self.cache.put(b, {"formats": names, "language": language, "chars": chars})
                 self._read[key] = (language, chars)
         return self._read[key]
+
+    def save(self) -> None:
+        self.cache.save()
+
+
+class FileTitles:
+    """The title written inside each book's file (extract.TextExtractor.file_title), kept:
+    read again when the book's formats change. `extractor`: a TextExtractor, for the formats
+    Calibre's ebook-meta reads; None: EPUB only. A file that can't be read has none."""
+
+    def __init__(self, folder: Path | None, extractor=None):
+        self.cache = LibraryCache(folder, "titles")
+        self.extractor = extractor
+        self._read: dict[tuple, str | None] = {}  # this run
+
+    def get(self, b: Book) -> str | None:
+        names = {fmt: Path(path).name for fmt, path in b.formats.items()}
+        key = (b.library, b.path, tuple(sorted(b.formats.items())))
+        if key not in self._read:
+            known = self.cache.get(b)
+            if isinstance(known, dict) and known.get("formats") == names:
+                self._read[key] = known.get("title")
+            else:
+                self._read[key] = self._title(b)
+                self.cache.put(b, {"formats": names, "title": self._read[key]})
+        return self._read[key]
+
+    def _title(self, b: Book) -> str | None:
+        if self.extractor is not None:
+            return self.extractor.file_title(b.formats)
+        for fmt in ("EPUB", "KEPUB"):
+            path = b.formats.get(fmt)
+            if path and Path(path).is_file():
+                try:
+                    return epub_title(path)
+                except Exception as e:  # corrupt, not an EPUB...
+                    log.info("Cannot read the title inside %s: %s", path, e)
+        return None
 
     def save(self) -> None:
         self.cache.save()
