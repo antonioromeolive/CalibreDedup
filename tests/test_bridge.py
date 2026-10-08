@@ -54,7 +54,7 @@ class FakeDB:
     def field_for(self, name, book_id):
         return self.tags[book_id]
 
-    def set_field(self, name, values):
+    def set_field(self, name, values, allow_case_change=True):
         self.tags.update(values)
 
 
@@ -76,7 +76,7 @@ class FieldsDB:
     def field_for(self, name, book_id):
         return self.fields[name][book_id]
 
-    def set_field(self, name, values):
+    def set_field(self, name, values, allow_case_change=True):
         self.fields.setdefault(name, {}).update(values)
 
 
@@ -162,3 +162,49 @@ def test_review_writes_an_isbn_only_where_there_is_none_and_the_language(bridge)
     db = BookDB(identifiers={"isbn": "9780000000002"}, path="a/b")  # has one: kept
     assert bridge.set_metadata(db, 1, {"isbn": "9788845207266"})[0] == []
     assert db.fields["identifiers"][1] == {"isbn": "9780000000002"}
+
+
+class NamesDB(BookDB):
+    """Calibre's authors, publishers and series: one item per name whatever its case. Writing a
+    name in another case renames the item for every book that has it, unless allow_case_change=False."""
+
+    def __init__(self, **fields):
+        super().__init__(path="a/b", **fields)
+        self.renamed = []
+
+    def set_field(self, name, values, allow_case_change=True):
+        for book_id, value in values.items():
+            if name in ("authors", "publisher", "series", "tags"):
+                many = isinstance(value, (list, tuple))
+                spelled = []
+                for v in (value if many else [value]):
+                    known = {x.casefold(): x for b in self.fields.get(name, {}).values()
+                             for x in (b if isinstance(b, (list, tuple)) else [b]) if x}
+                    old = known.get(v.casefold())
+                    if old is not None and old != v and allow_case_change:
+                        self.renamed.append((old, v))  # every book with `old` now has `v`
+                        for b, have in self.fields[name].items():
+                            self.fields[name][b] = (tuple(v if x == old else x for x in have) if many
+                                                    else v if have == old else have)
+                    spelled.append(old if old is not None and not allow_case_change else v)
+                value = tuple(spelled) if many else spelled[0]
+            self.fields.setdefault(name, {})[book_id] = value
+
+
+def test_review_writes_a_name_as_the_library_spells_it(bridge):
+    db = NamesDB(publisher="Feltrinelli Editore", authors=("Mario Rossi",), series="Classici Italiani")
+    db.fields["publisher"][2], db.fields["path"][2] = "Adelphi", "c/d"
+    changed, _, _ = bridge.set_metadata(db, 2, {"publisher": "FELTRINELLI EDITORE", "authors": ["MARIO ROSSI"],
+                                                "series": "Oscar Gialli"})
+    assert db.renamed == []  # book 1 keeps its names: no rename for every book
+    assert db.fields["publisher"] == {1: "Feltrinelli Editore", 2: "Feltrinelli Editore"}
+    assert db.fields["authors"][2] == ("Mario Rossi",) and db.fields["series"][2] == "Oscar Gialli"
+    assert changed == ["authors (as the library's 'Mario Rossi')", "publisher (as the library's 'Feltrinelli Editore')",
+                       "series"]
+
+
+def test_the_reviewed_tag_keeps_the_library_spelling(bridge):
+    db = NamesDB(tags=("Fantasy",))
+    db.fields["tags"][2] = ("aireviewed",)
+    bridge.add_tag(db, [1], "AIReviewed")
+    assert db.renamed == [] and db.fields["tags"] == {1: ("Fantasy", "aireviewed"), 2: ("aireviewed",)}

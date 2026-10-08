@@ -196,13 +196,17 @@ def cleanup_empty_dirs(root, folders, attempts=3):
 def set_metadata(db, book_id, values):
     """Overwrite fields with the reviewed values (calibre-review). The year keeps
     the date's month and day; an ISBN is added only to a book that has none; the
-    language replaces the book's languages. Returns the changed fields, the book's
-    folder and its formats' paths (a new title or author renames them)."""
+    language replaces the book's languages. An author, publisher or series that the
+    library already has in another case is written as the library spells it: Calibre
+    would otherwise rename it for every book that has it (and change their
+    last_modified, so that the rest of the plan fails as "changed since the analysis").
+    Returns the changed fields (with the library's spelling, where it was kept), the
+    book's folder and its formats' paths (a new title or author renames them)."""
     changed = []
     for name in ("title", "authors", "publisher", "series", "series_index"):
         if name in values:
-            db.set_field(name, {book_id: values[name]})
-            changed.append(name)
+            db.set_field(name, {book_id: values[name]}, allow_case_change=False)
+            changed.append(name + _library_spelling(db, book_id, name, values[name]))
     if values.get("isbn"):
         ids = dict(db.field_for("identifiers", book_id) or {})
         if "isbn" not in ids:
@@ -231,6 +235,18 @@ def set_metadata(db, book_id, values):
     return changed, db.field_for("path", book_id), formats
 
 
+def _library_spelling(db, book_id, name, asked):
+    """" (as the library's 'X')" when Calibre wrote the library's spelling of a name
+    asked in another case; "" when it wrote the value as asked."""
+    if name not in ("authors", "publisher", "series"):
+        return ""
+    written = db.field_for(name, book_id)
+    if name == "authors":
+        written, asked = " & ".join(written or ()), " & ".join(asked or ())
+    written, asked = written or "", asked or ""
+    return f" (as the library's {written!r})" if written != asked and written.casefold() == asked.casefold() else ""
+
+
 def tag_updated(db, book_id, changed, action):
     """The action's "updated_tag" on a book whose metadata was just written: "; tagged …"
     for the result message, "" when nothing changed (or no tag asked)."""
@@ -249,7 +265,7 @@ def add_tag(db, book_ids, tag):
         if tag.casefold() not in {t.casefold() for t in tags}:
             values[book_id] = tags + (tag,)
     if values:
-        db.set_field("tags", values)
+        db.set_field("tags", values, allow_case_change=False)  # an "aireviewed" tag stays as it is
 
 
 def book_facts(db, book_id, library):
