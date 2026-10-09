@@ -33,4 +33,6 @@ include = ["calibre_dedup*"]
 calibre_dedup = ["bridge_script.py"]
 
 [tool.pytest.ini_options]
-addopts = "-p no:cacheprovider"  # keep the project folder free of generated data
+# The cache (for --last-failed) goes to %TEMP%, keeping the project folder free of generated
+# data; not inside %TEMP%/CalibreDedup, which the programs clean up (tempdirs.py).
+cache_dir = "$TEMP/calibre_dedup_pytest"
