@@ -27,7 +27,7 @@ import json
 import pytest
 
 from calibre_dedup.ai import AICache, AIError, Provider, ReviewMetadata
-from calibre_dedup.config import ProviderProfile
+from calibre_dedup.config import ProviderProfile, Settings
 from calibre_dedup.extract import Excerpt
 from calibre_dedup.models import Book
 from calibre_dedup.review import (
@@ -408,17 +408,35 @@ def test_trash_library_must_differ_from_the_reviewed_one(tmp_path):
 
 
 # --- the AIReviewed tag ---------------------------------------------------------------------
-def test_books_tagged_reviewed_are_skipped_unless_asked(tmp_path):
-    lib = make_library(tmp_path / "lib", [{"title": "Dune", "text": "x", "tags": ["SF", "aireviewed"]},
-                                          {"title": "Emma", "text": "x", "tags": ["Classic"]}])
-    text = FakeProvider(REPLY)
-    reviewer = Reviewer(text, FakeExtractor(), AICache(tmp_path / "cache.json"))
-    result = scan_library(lib, "", reviewer)
-    assert [i.book.title for i in result.items] == ["Emma"]
-    assert (result.skipped, result.total_books) == (1, 1)
-    assert "1 already AIReviewed" in summary(result)
-    everything = scan_library(lib, "", reviewer, skip_reviewed=False)
-    assert len(everything.items) == 2 and everything.skipped == 0
+def test_the_review_skips_the_books_updated_or_reviewed_by_default(tmp_path):
+    lib = make_library(tmp_path / "lib", [{"title": "Dune", "text": "x", "tags": ["SF", "aiupdated"]},
+                                          {"title": "Emma", "text": "x", "tags": ["AIReviewed"]},
+                                          {"title": "Ulysses", "text": "x", "tags": ["Classic"]}])
+    reviewer = Reviewer(FakeProvider(REPLY), FakeExtractor(), AICache(tmp_path / "cache.json"))
+    settings = Settings()
+    assert settings.tag_filter(review=True) == ("AIUpdated, AIReviewed", True)
+    tag, exclude = settings.tag_filter(review=True)
+    result = scan_library(lib, "", reviewer, tag=tag, tag_exclude=exclude)
+    assert [i.book.title for i in result.items] == ["Ulysses"]
+    assert (result.skipped, result.total_books) == (2, 1)
+    assert "2 tagged any of 'AIUpdated', 'AIReviewed', left out" in summary(result)
+    everything = scan_library(lib, "", reviewer)
+    assert len(everything.items) == 3 and everything.skipped == 0
+
+
+@pytest.mark.parametrize("mode, tags, titles", [
+    ("all", "AIReviewed", ["Dune", "Emma", "Ulysses"]),  # the tags are kept, not used
+    ("skip", " aiupdated,AIReviewed, , AIUpdated ", ["Ulysses"]),  # each tag once, any case
+    ("only", "Classic, SF", ["Dune", "Ulysses"]),
+    ("only", " , ", ["Dune", "Emma", "Ulysses"]),  # no tag: every book
+])
+def test_the_tag_filter_modes(tmp_path, mode, tags, titles):
+    lib = make_library(tmp_path / "lib", [{"title": "Dune", "text": "x", "tags": ["SF", "AIUpdated"]},
+                                          {"title": "Emma", "text": "x", "tags": ["AIReviewed"]},
+                                          {"title": "Ulysses", "text": "x", "tags": ["Classic"]}])
+    reviewer = Reviewer(FakeProvider(REPLY), FakeExtractor(), AICache(tmp_path / "cache.json"))
+    tag, exclude = Settings(review_tag_mode=mode, review_tag=tags).tag_filter(review=True)
+    assert [i.book.title for i in scan_library(lib, "", reviewer, tag=tag, tag_exclude=exclude).items] == titles
 
 
 def test_the_books_done_with_get_the_tag():

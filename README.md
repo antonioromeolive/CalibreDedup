@@ -111,8 +111,8 @@ decides it. Each step links to where it is explained in full.
    folder; every path is shorter than 89 characters (Calibre's limit). A library that another
    window is analyzing, or uses as its trash library, can't be analyzed.
 2. **The metadata of both libraries** is read; no book file is opened yet. With a tag filter
-   only the source books with the tag (or without it) are analyzed; the target is always read
-   whole.
+   only the source books with one of its tags (or with none of them) are analyzed; the target
+   is always read whole.
 3. **Archives** (with an AI selected): if source books are stored as clear RAR/ZIP/7Z archives,
    you are asked once whether to unpack them ([archives](#books-stored-as-an-archive-rar-zip-7z)).
 4. **Generic covers** (with a cover check on): every cover of both libraries is looked at, to
@@ -269,13 +269,14 @@ suggestion ([Step 2](#step-2-review-the-list)).
 1. Calibre (and calibre-server) must be closed.
 2. The trash library chosen now is checked (it may differ from the analysis'), and no other
    execution may be writing one of these libraries.
-3. You confirm, with the counts of what will happen (skipped by *Continue* after *Pause*).
+3. You confirm, with the counts of what will happen (not asked again by *Continue executing*
+   after a *Stop*, while the books left are the same).
 4. Only **ticked** rows run. A duplicate of a book that isn't being moved, or whose kept copy is
    being trashed too, is **blocked**.
 5. The `metadata.db` of the source and the target is copied (the last 3 are kept); if it can't
    be, nothing is done. A journal of the run is started.
 
-**For each ticked book** (*Pause* and *Stop* act between two books)
+**For each ticked book** (*Stop* acts between two books)
 
 1. The book is still in the source, with the same title, and **unchanged** since the analysis
    (Calibre's *last modified*, to the second; or since the Execute that last wrote it). Else it
@@ -313,7 +314,7 @@ sequenceDiagram
     E->>S: copy metadata.db (snapshot)
     E->>T: copy metadata.db (snapshot)
     E->>C: plan of actions
-    loop each ticked book (Pause or Stop: after the current one)
+    loop each ticked book (Stop: after the current one)
         C->>S: still there, same title, unchanged since the analysis?
         opt unreadable formats or an archive
             C->>X: copy the whole record first
@@ -341,8 +342,8 @@ sequenceDiagram
 1. The library to review and the trash library are checked as above; a library that another
    window is analyzing can't be reviewed.
 2. Every cover of the library is looked at for generic covers.
-3. The tag filter is applied, and books tagged `AIReviewed` are skipped (*Skip books tagged
-   AIReviewed*).
+3. The tag filter is applied: by default the books tagged `AIUpdated` or `AIReviewed` are
+   left out (*Skip books tagged*).
 4. Clear archives: you are asked once whether to unpack them.
 
 **For each book** (*Pause* and *Stop* act between two books)
@@ -399,19 +400,22 @@ sequenceDiagram
   in the source. A duplicate whose target copy lacks one of its formats stays too, since
   trashing it would lose that format from both libraries: right-click → *Merge & Trash* to
   add the format to the target copy first, or leave it.
-- **Tag filter** (under the libraries; it applies to the **source** library only): choose
-  *Only source books tagged* or *All source books except tagged*, then type a tag or pick one
-  of the source library's (any case; empty = all books). The target is always read whole.
-  The books the filter keeps are still compared with every other book:
+- **Tag filter** (under the libraries; it applies to the **source** library only): *All
+  source books* (the default), *Skip source books tagged* (all but those with one of the
+  tags) or *Only source books tagged* (only those with one of them). Type the tags separated
+  by commas, or pick them one by one from the source library's (each one picked is added; any
+  case). With *All*, or no tag, every book is analyzed; the tags typed are kept for the next
+  time. The target is always read whole. The books the filter keeps are still compared with
+  every other book:
   - between two libraries, with the whole target;
   - within one library, with the books the filter leaves out, which are never moved or
     trashed. A kept book is trashed into a left-out copy only when the left-out one is the
     copy to keep (better format, then richer metadata); when the kept book is the better
     one, both are left, and the row says so (right-click → *Trash* to trash it anyway).
 
-  Each filter (*only* or *except*, per tag) remembers its ticks apart from the whole
-  library's and from the other filters, so none replaces another. Changing the tag or the
-  mode after an analysis shows the *Settings changed* warning. AI answers are cached per
+  Each filter (*skip* or *only*, with its tags in any order) remembers its ticks apart from
+  the whole library's and from the other filters, so none replaces another. Changing the tags
+  or the mode after an analysis shows the *Settings changed* warning. AI answers are cached per
   book file, so they are shared between runs with and without a filter.
 
 ### Step 1: Analyze
@@ -564,8 +568,33 @@ tick more books (e.g. those you left unticked to review) and execute again. What
 Execute did is known to the list: a duplicate of a book it moved is trashed into that book's
 new copy in the target, and a copy it changed (formats merged into it, unreadable formats
 taken out) is checked against its new state, not against the analysis. A book that failed
-keeps its action, unticked: tick it to try again. **Pause** while executing stops after the
-current book; **Continue** then executes the remaining ticked books (no new question).
+keeps its action, unticked: tick it to try again.
+
+**Stop** while executing stops after the current book: what is done stays done, the rest can
+always be executed. The Execute button then reads **Continue executing (N left)**,
+highlighted: it executes the remaining ticked books without asking again, unless you changed
+the ticks since (then it asks, with the new counts). The same after closing the program: the
+saved plan comes back with the button ready to continue (see below). There is no *Pause*
+while executing, since a Stop loses nothing; *Pause* is for the analysis, which a Stop
+ends.
+
+### Continue another day
+
+The plan shown is saved in the data folder (`plans\`): after the analysis, a few seconds after
+each change you make to it, after each Execute (also paused, stopped or failed), and when the
+program closes. Next time, with the same source, target and tag filter, the program offers to
+**continue the plan** (at startup, and again on *Analyze*) instead of analyzing again: the same
+rows, ticks and changes, without the books already executed. Nothing is written to the
+libraries for this.
+
+A plan is offered only while its libraries are exactly as it left them. Each book's *last
+modified* in the source and the target (read from `metadata.db` alone: a tenth of a second for
+80,000 books) is compared with what the analysis read, brought up to date by each Execute,
+which writes them itself. Anything else that changed them (a book added, or edited in
+Calibre, between two days or during the analysis) and the plan is dropped, saying why: analyze
+again (quick: the AI answers are cached). A plan made with other settings shows the *Settings
+changed* warning, as during a session. The plans of the last 10 pairs of libraries are kept; a
+new analysis replaces the plan of its pair, and a plan with no books left is deleted.
 
 ### How duplicates are found
 
@@ -900,7 +929,7 @@ python -m calibre_dedup --cli ... --execute        # perform the plan (default: 
 python -m calibre_dedup --cli ... --text-profile "Azure gpt-4o" --image-profile ""
 python -m calibre_dedup --cli ... --no-ai          # metadata only
 python -m calibre_dedup --cli ... --cleanup-only   # nothing copied to the target
-python -m calibre_dedup --cli ... --tag New        # only the source books tagged New; --tag "" for all
+python -m calibre_dedup --cli ... --tag "New, SF"  # only the source books tagged New or SF; --tag "" for all
 python -m calibre_dedup --cli ... --except-tag Done  # all source books except those tagged Done
 python -m calibre_dedup --cli ... --unpack         # unpack every clear RAR/ZIP/7Z archive
 python -m calibre_dedup --cli ... --clear-cache    # ask the AI again
@@ -1045,14 +1074,14 @@ reviewed library when trashing*). Updated and trashed books leave the list. As i
 Dedup, the library's `metadata.db` is copied first, each book acted on gets a line in the
 journal with its values before and after, and a book changed in Calibre since the analysis is
 not touched. The list can be executed again (e.g. after changing more rows): the books updated
-by the first Execute are checked against their new state. **Pause** and **Continue** work as in
-Merge and Dedup, for the analysis and for Execute.
+by the first Execute are checked against their new state. **Pause** works as in Merge and
+Dedup during the analysis; during Execute, **Stop**, then **Continue executing**, as there.
 
 ### Continue another day, on any computer
 
 On Execute, **every book done with** gets the tag **`AIReviewed`**: updated, with nothing to
 change, kept (*Keep as it is*) or marked reviewed. The next analysis skips books with that tag
-(*Skip books tagged AIReviewed*, on by default). So you can stop an analysis anywhere, execute
+(the tag filter's default, see below). So you can stop an analysis anywhere, execute
 what you have, and continue later, even from another computer: the mark is in the library
 itself, not in the cache. Not tagged, so that the next analysis shows them again (from the
 cache: quick): the books to review, the unticked books that propose something, and the books
@@ -1061,6 +1090,13 @@ tag in Calibre.
 
 The books whose metadata was actually written also get the tag **`AIUpdated`**: search
 `tags:AIUpdated` in Calibre to check what the AI changed (Merge and Dedup writes no metadata).
+
+The **tag filter** (under the libraries) works as in Merge and Dedup: *All books*, *Skip
+books tagged* or *Only books tagged*, with tags separated by commas. Its default is *Skip
+books tagged* `AIUpdated, AIReviewed`: the books reviewed, and those updated but not yet
+marked reviewed; choosing *Skip* with no tag typed fills these in again. Add your own (e.g. a
+tag you give the books you have checked by hand), choose *Only* to review some books only
+(the reviewed ones among them too), or *All* to analyze every book.
 
 ### Settings
 
@@ -1080,13 +1116,13 @@ book's files.
 python -m calibre_dedup.review_app --cli --library D:\Books\Main                  # dry run: prints the differences
 python -m calibre_dedup.review_app --cli ... --fields title,authors --execute    # write only these fields
 python -m calibre_dedup.review_app --cli ... --execute --all-changes             # also the changes left out
-python -m calibre_dedup.review_app --cli ... --include-reviewed                  # also books tagged AIReviewed
-python -m calibre_dedup.review_app --cli ... --tag New                           # only the books tagged New
+python -m calibre_dedup.review_app --cli ... --all-books                         # every book, whatever its tags
+python -m calibre_dedup.review_app --cli ... --tag "New, SF"                     # only the books tagged New or SF
 python -m calibre_dedup.review_app --cli ... --except-tag Checked                # all books except those tagged Checked
 ```
 
-The **tag filter** (under the libraries) works as in Merge and Dedup: *Only books tagged* or
-*All books except tagged*; *Skip books tagged AIReviewed* still applies on top.
+Without `--all-books`, `--tag` or `--except-tag`, the tag filter set in the window applies
+(by default: all books except those tagged `AIUpdated` or `AIReviewed`).
 
 The dry run marks each change left out, with the reason; `--execute` does what the window
 ticks at the start (the supported changes, the trash of records with no file that opens), and
@@ -1239,6 +1275,7 @@ there automatically.
 | `ai_cache.json` / `review_cache.json` | each | the AI's answers |
 | `review_runs\review_<library>_<date>.csv` | Review | each analysis run with *No AI cache*: Calibre's values, what the AI read, the proposed changes, those left out and why, the cover type |
 | `selections.json` | Merge and Dedup | remembered ticks and changes (and *Mark reviewed*), per source/target pair |
+| `plans\<id>.json.gz` | Merge and Dedup | the plan shown, to continue it another day (see [Continue another day](#continue-another-day)), per source/target pair and tag filter; about 0.3 MB per 1,000 books |
 | `snapshots\<library>_<id>\metadata_<date>.db` | both | a copy of each library's `metadata.db` taken before each Execute that writes it (not the trash library), the last 3 per library; `library.txt` says which library. To undo an Execute's metadata changes: close Calibre and copy it back over the library's `metadata.db` (the files moved or trashed since are in the target, the trash library or Calibre's recycle bin) |
 | `journal\dedup_<date>.csv`, `journal\review_<date>.csv` | each | one per Execute: each book acted on, what was done, why (the analysis' reason), the copy it duplicated, and for the review the values before and after; e.g. why a book is in the trash library |
 | `library_cache\` | both | what was found in each library's files, so it is not read again: cover sizes and hashes (generic covers), files Calibre can't open, file hashes (identical files), the language and length of each book's text, its text's fingerprint (the same text), the title inside its file (file-name titles) |
@@ -1444,12 +1481,12 @@ answer with Calibre's metadata.
   scanned PDFs are skipped).
 - **What is read:** the **start** of the book, and the cover (Image AI only; a generic cover
   is not sent).
-- **Sent when:** for every book analyzed, except books tagged `AIReviewed` while **Skip books
-  tagged AIReviewed** is on (the default), and books with nothing readable. If the AI's
+- **Sent when:** for every book the tag filter keeps (by default all but those tagged
+  `AIUpdated` or `AIReviewed`), except books with nothing readable. If the AI's
   content filter refuses a book (e.g. a violent novel), the same prompt is sent again with
   less: the first 3,000 characters, then the text without images, then the cover alone.
-- **Always on:** it already covers every book. Untick *Skip books tagged AIReviewed* (or
-  `--include-reviewed`) to include the reviewed ones.
+- **Always on:** it already covers every book. Choose *All books* in the tag filter (or
+  `--all-books`) to include the books tagged `AIUpdated` or `AIReviewed`.
 
 `REVIEW_PROMPT`:
 

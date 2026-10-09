@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ from .ai import AICache, make_provider
 from .calibre_env import find_calibre_dir
 from .config import OLLAMA, ProviderProfile, Settings
 from .extract import TextExtractor
+from .library import tag_list
 from .planner import AIResolver
 
 log = logging.getLogger(__name__)
@@ -156,7 +158,7 @@ ANALYSIS_SETTINGS = {
     "fix_swapped": "title and author swapped",
     "trash_unreadable": "move unreadable files to the trash library",
     "cleanup_only": "cleanup source only",
-    "only_tag": "tag filter",  # the tag and its mode (only / all except)
+    "only_tag": "tag filter",  # the tags and their mode (only / skip)
 }
 
 
@@ -167,13 +169,17 @@ def analysis_signature(settings: Settings) -> dict:
         sig[k] = (sig[k], p.kind, p.model, p.base_url, p.vision) if p else sig[k]
     for k in ("source_library", "target_library"):
         sig[k] = str(sig[k]).strip().replace("\\", "/").rstrip("/").casefold()
-    tag = sig["only_tag"].strip().casefold()
-    sig["only_tag"] = (tag, settings.only_tag_exclude) if tag else ""
+    tag, exclude = settings.tag_filter()
+    tags = sorted(t.casefold() for t in tag_list(tag))
+    sig["only_tag"] = (tags, exclude) if tags else ""
     return sig
 
 
 def tag_option(args, tag: str, exclude: bool) -> tuple[str, bool]:
-    """(tag, exclude) from a command line's --tag / --except-tag; neither: as set in the GUI."""
+    """(tags, exclude) from a command line's --tag / --except-tag (comma-separated) or
+    --all-books (the review's: every book); none of them: as set in the GUI."""
+    if getattr(args, "all_books", False):
+        return "", False
     if args.tag is not None:
         return args.tag, False
     if args.except_tag is not None:
@@ -182,4 +188,6 @@ def tag_option(args, tag: str, exclude: bool) -> tuple[str, bool]:
 
 
 def changed_settings(before: dict, after: dict) -> list[str]:
-    return [label for k, label in ANALYSIS_SETTINGS.items() if before.get(k) != after.get(k)]
+    """`before` may come from a saved plan (plan_store), read back from JSON: its tuples are lists."""
+    return [label for k, label in ANALYSIS_SETTINGS.items()
+            if json.dumps(before.get(k), default=str) != json.dumps(after.get(k), default=str)]

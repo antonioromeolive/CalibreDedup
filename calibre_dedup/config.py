@@ -48,6 +48,11 @@ ANTHROPIC = "anthropic"
 DATA_DIR_NAME = ".CalibreDedup"
 # The fields calibre-review can change (review.FIELDS), for its "Change:" boxes.
 REVIEW_FIELD_NAMES = ("title", "authors", "publisher", "year", "series", "isbn", "language")
+# The tag filters' modes (Settings.tag_mode): every book, all but those with one of the tags,
+# only those with one of them.
+TAG_ALL, TAG_SKIP, TAG_ONLY = "all", "skip", "only"
+# The books the review leaves out by default: review.REVIEWED_TAG, executor.AI_UPDATED_TAG.
+REVIEW_SKIP_TAGS = "AIUpdated, AIReviewed"
 SETTINGS_FILE = "settings.json"  # Merge and Dedup
 REVIEW_SETTINGS_FILE = "review_settings.json"  # calibre-review: its own copy, see load_review_settings
 PROFILES_FILE = "ai_profiles.json"  # the AI providers, shared by both programs
@@ -138,8 +143,10 @@ class Settings:
     # Cleanup of the source: nothing is copied to the target; only the source books already
     # in the target go to the trash library (not those whose target copy lacks a format).
     cleanup_only: bool = False
-    only_tag: str = ""  # analyze only the source books with this tag; "" = all
-    only_tag_exclude: bool = False  # ... all the source books except those with it, instead
+    # The tag filter of the source books (see tag_filter): TAG_ALL, TAG_SKIP or TAG_ONLY the
+    # books with one of the tags in only_tag (comma-separated; kept while the mode is All).
+    tag_mode: str = TAG_ALL
+    only_tag: str = ""
     delete_permanently: bool = False  # else removed books go to Calibre's own recycle bin
     calibre_dir: str = ""
     source_library: str = ""
@@ -153,9 +160,14 @@ class Settings:
     # The fields there were when review_fields was saved: one added since starts on.
     review_fields_known: list[str] = field(default_factory=list)
     review_window_geometry: str = ""
-    review_skip_reviewed: bool = True  # skip books tagged AIReviewed (review.REVIEWED_TAG)
-    review_tag: str = ""  # review only the books with this tag; "" = all
-    review_tag_exclude: bool = False  # ... all the books except those with it, instead
+    review_tag_mode: str = TAG_SKIP  # the review's tag filter, as tag_mode
+    review_tag: str = REVIEW_SKIP_TAGS
+
+    def tag_filter(self, review: bool = False) -> tuple[str, bool]:
+        """(tags, exclude) for the analysis (planner.build_plan, review.scan_library) of Merge
+        and Dedup, or of the review: ("", False) for every book."""
+        mode, tags = (self.review_tag_mode, self.review_tag) if review else (self.tag_mode, self.only_tag)
+        return ("", False) if mode not in (TAG_SKIP, TAG_ONLY) or not tags.strip() else (tags, mode == TAG_SKIP)
 
     def profile(self, name: str | None = None) -> ProviderProfile | None:
         name = self.text_profile if name is None else name
@@ -230,6 +242,7 @@ class Settings:
         settings = cls(**{k: v for k, v in data.items() if k in known and k != "profiles"})
         if "profiles" in data:  # saved before ai_profiles.json
             settings.profiles = _profiles_from(data["profiles"])
+        _read_tag_filters(settings, data)
         if "text_profile" not in data:  # settings saved before text/image profiles
             settings.text_profile = data.get("active_profile", settings.text_profile) if data.get("use_ai", True) else ""
             settings.image_profile = data.get("vision_profile", "")
@@ -244,6 +257,22 @@ class Settings:
         if (path.parent / PROFILES_FILE).is_file():
             del data["profiles"]
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _read_tag_filters(settings: "Settings", data: dict) -> None:
+    """Settings saved before the tag filters had a mode: one tag, only or all except it, and
+    for the review a box skipping the books tagged AIReviewed (lost with a tag of its own)."""
+    if "tag_mode" not in data:
+        if settings.only_tag.strip():
+            settings.tag_mode = TAG_SKIP if data.get("only_tag_exclude") else TAG_ONLY
+        else:
+            settings.tag_mode = TAG_ALL
+    if "review_tag_mode" not in data:
+        if (data.get("review_tag") or "").strip():
+            settings.review_tag_mode = TAG_SKIP if data.get("review_tag_exclude") else TAG_ONLY
+        else:
+            settings.review_tag_mode = TAG_SKIP if data.get("review_skip_reviewed", True) else TAG_ALL
+            settings.review_tag = REVIEW_SKIP_TAGS
 
 
 def _profiles_from(items: list) -> list[ProviderProfile]:

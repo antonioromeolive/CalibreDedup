@@ -182,15 +182,29 @@ def has_tag(book: Book, tag: str) -> bool:
     return not tag or tag in {t.casefold() for t in book.tags}
 
 
+def tag_list(text: str) -> list[str]:
+    """The tags of a tag filter, typed separated by commas: each once (any case), in their order."""
+    tags: dict[str, str] = {}
+    for t in text.split(","):
+        if t.strip():
+            tags.setdefault(t.strip().casefold(), t.strip())
+    return list(tags.values())
+
+
 def tag_selects(book: Book, tag: str, exclude: bool = False) -> bool:
-    """The tag filter keeps the book: it has `tag` (with `exclude`, it hasn't); no tag keeps all."""
-    return not tag.strip() or has_tag(book, tag) != exclude
+    """The tag filter keeps the book: it has one of the tags in `tag` (comma-separated; with
+    `exclude`, none of them); no tag keeps all."""
+    tags = tag_list(tag)
+    return not tags or any(has_tag(book, t) for t in tags) != exclude
 
 
 def tag_filter_text(tag: str, exclude: bool = False) -> str:
-    """The filter as shown to the user: "tagged 'New'", "not tagged 'New'"; "" for none."""
-    tag = tag.strip()
-    return f"{'not ' if exclude else ''}tagged {tag!r}" if tag else ""
+    """The filter as shown to the user: "tagged 'New'", "not tagged 'New'", "tagged any of
+    'A', 'B'", "tagged none of 'A', 'B'"; "" for none."""
+    tags = tag_list(tag)
+    if len(tags) > 1:
+        return f"tagged {'none' if exclude else 'any'} of {', '.join(repr(t) for t in tags)}"
+    return f"{'not ' if exclude else ''}tagged {tags[0]!r}" if tags else ""
 
 
 def _year(pubdate: str | None) -> int | None:

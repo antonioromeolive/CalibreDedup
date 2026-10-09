@@ -642,9 +642,9 @@ class ReviewResult:
     trash_library: str
     items: list[ReviewItem] = field(default_factory=list)
     total_books: int = 0  # books to review (not counting the skipped ones)
-    skipped: int = 0  # books already tagged REVIEWED_TAG, not read again
-    tag: str = ""  # only the books with this tag were reviewed; "" = all
-    tag_exclude: bool = False  # ... without this tag, instead
+    skipped: int = 0  # books left out by the tag filter
+    tag: str = ""  # only the books with one of these tags (comma-separated) were reviewed; "" = all
+    tag_exclude: bool = False  # ... without any of them, instead
     stopped: bool = False
     stats: dict[str, int] = field(default_factory=dict)
     ai_down: list[str] = field(default_factory=list)
@@ -675,14 +675,13 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
                  progress: Callable[[int, int, str], None] | None = None,
                  cancel: threading.Event | None = None,
                  on_item: Callable[[ReviewItem], None] | None = None,
-                 skip_reviewed: bool = True,
                  unpack: Callable[[int], bool] | None = None,
                  tag: str = "", tag_exclude: bool = False,
                  library_cache: Path | None = None, pause: Pause | None = None) -> ReviewResult:
-    """`skip_reviewed`: leave out the books tagged REVIEWED_TAG (reviewed on an earlier day).
-    `unpack(n)`: asked once, before the first book, whether to unpack the clear archives
+    """`unpack(n)`: asked once, before the first book, whether to unpack the clear archives
     of the n books that have one (see archives.ask_once); None: archives are read as they are.
-    `tag`: review only the books with this tag (with `tag_exclude`, without it); "" = all.
+    `tag`: review only the books with one of these tags, comma-separated (with `tag_exclude`,
+    without any of them, e.g. REVIEWED_TAG: reviewed on an earlier day); "" = all.
     `library_cache`: where generic_covers keeps what it found (see library_cache).
     `pause`: the user may pause the run between two books (see pause.py)."""
     check_libraries(library, trash)
@@ -694,15 +693,13 @@ def scan_library(library: str, trash: str, reviewer: Reviewer,
     reviewer.generic = generic
     tag = tag.strip()
     tag_exclude = tag_exclude and bool(tag)
-    books = [b for b in books if tag_selects(b, tag, tag_exclude)]
-    skipped = sum(1 for b in books if is_reviewed(b)) if skip_reviewed else 0
-    if skipped:
-        books = [b for b in books if not is_reviewed(b)]
+    kept = [b for b in books if tag_selects(b, tag, tag_exclude)]
+    skipped, books = len(books) - len(kept), kept
     result = ReviewResult(library, trash, total_books=len(books), skipped=skipped, tag=tag,
                           tag_exclude=tag_exclude)
     filtered = tag_filter_text(tag, tag_exclude)
     log.info("Reviewing %d books of %s%s%s", len(books), library, f" {filtered}" if filtered else "",
-             f" ({skipped} tagged {REVIEWED_TAG} skipped)" if skipped else "")
+             f" ({skipped} {tag_filter_text(tag, not tag_exclude)} left out)" if skipped else "")
     unpack = ask_once(books, unpack)
     perf.run_start("review", len(books), reviewer.provider, reviewer.vision)
     for n, book in enumerate(books):
@@ -873,7 +870,8 @@ def summary(result: ReviewResult) -> str:
     head = (f"Stopped after {len(result.items)} of {result.total_books} books" if result.stopped
             else f"{len(result.items)} books reviewed") + (
         f" ({tag_filter_text(result.tag, result.tag_exclude)})" if result.tag else "")
-    skipped = f" · {result.skipped} already {REVIEWED_TAG}, skipped" if result.skipped else ""
+    skipped = (f" · {result.skipped} {tag_filter_text(result.tag, not result.tag_exclude)}, left out"
+               if result.skipped else "")
     doubts = f" ({left_out} changes left out: not supported by the book)" if left_out else ""
     return (f"{head}: {changed} with differences{doubts}, {failed} not read{skipped} · AI: {read} read, "
             f"{cached} from cache" + "".join(f" · {r}" for r in result.ai_down))

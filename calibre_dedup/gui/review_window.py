@@ -28,6 +28,7 @@ current value on the first line, the proposed one ("→ …") on the second.
 
 from __future__ import annotations
 
+import json
 import html
 import logging
 import sys
@@ -49,19 +50,20 @@ from PySide6.QtWidgets import (
 
 from ..awake import keep_awake
 from ..calibre_env import calibre_is_running, known_libraries
-from ..config import OLLAMA, Settings, config_dir, library_cache_dir, load_review_settings
+from ..config import OLLAMA, REVIEW_SKIP_TAGS, TAG_ALL, TAG_SKIP, Settings, config_dir, library_cache_dir, load_review_settings
 from ..covers import BAD_COVER_TAG
 from ..eta import Eta
 from ..executor import AI_UPDATED_TAG
 from ..extract import TextExtractor
-from ..library import LibraryError
+from ..library import LibraryError, tag_filter_text, tag_list
 from ..library_use import LibraryInUse, LibraryUse, execution_conflicts, same_library
 from ..normalize import strip_accents
 from ..pause import Pause
 from ..review import (
     ACTION_LABELS, FIELD_LABELS, FIELDS, ReviewAction, ReviewItem, ReviewResult, Reviewer, book_cover_file,
     REVIEW_CACHE_FILE, REVIEWED_TAG, ask_ai, check_libraries, current_value, execute_review, format_value,
-    is_reviewed, judge_ai, review_actions, review_cache, scan_library, series_names, summary, write_run_csv,
+    is_reviewed, judge_ai, review_actions, review_cache, scan_library, series_names,
+    summary, write_run_csv,
 )
 from ..judge import START_CHARS as JUDGE_START_CHARS
 from ..session import _ollama_problem, make_resolver, require_calibre_dir
@@ -73,7 +75,7 @@ from .main_window import (
     AI_LOG_COLOR, OPERATION_NAMES, PlanTable, QtLogHandler, UnpackQuestion, _compact, _elastic, _is_checked,
     add_mark_reviewed,
     add_unpack_actions, archive_texts, ask_ai_down, ask_other_trash, ask_unpack, configure_logging, fill_tags,
-    no_cache_box, open_file, tag_box, tag_mode_box, with_eta,
+    no_cache_box, open_file, tag_box, tag_mode_box, tag_mode_of, with_eta,
 )
 from ..planner import AI_OFF
 from .cover_preview import CoverPreview
@@ -415,6 +417,7 @@ class ScanWorker(QThread, UnpackQuestion):
     def __init__(self, settings: Settings, library: str, trash: str, no_cache: bool = False):
         super().__init__()
         self.settings, self.library, self.trash = settings, library, trash
+        self.tag, self.tag_exclude = settings.tag_filter(review=True)
         self.no_cache = no_cache
         self.cancel = threading.Event()
         self.pause = Pause(on_wait=self.pause_waiting.emit)
@@ -459,8 +462,7 @@ class ScanWorker(QThread, UnpackQuestion):
                     sent = time.monotonic()
 
             result = scan_library(self.library, self.trash, reviewer, self.progress.emit, self.cancel, on_item,
-                                  skip_reviewed=self.settings.review_skip_reviewed, unpack=self.ask_unpack,
-                                  tag=self.settings.review_tag, tag_exclude=self.settings.review_tag_exclude,
+                                  unpack=self.ask_unpack, tag=self.tag, tag_exclude=self.tag_exclude,
                                   library_cache=library_cache_dir(), pause=self.pause)
             if batch:
                 self.items_ready.emit(batch.copy())
@@ -565,8 +567,10 @@ class ReviewWindow(QMainWindow):
         self._ask_msg, self._ask_stopping = "", False
         self._stopping = self._close_pending = False
         self._paused = False  # the analysis waits (Pause), see pause.py
-        self._exec_pausing = False  # Pause pressed while executing: it stops after the current book
-        self._exec_paused = False  # an execution paused: Continue executes the remaining checked books
+        # An Execute stopped with work left: the Execute button continues it. `_exec_left`: that
+        # work (_work_key), continued without asking again while it is the same.
+        self._exec_stopped = False
+        self._exec_left: str | None = None
         self._library_use: LibraryUse | None = None  # the libraries of the review shown (see library_use)
         self._busy = False
         self._done_count = self._exec_total = 0
@@ -599,8 +603,13 @@ class ReviewWindow(QMainWindow):
             grid.addWidget(box, r, 1)
             grid.addWidget(browse, r, 2)
             self.lib_boxes[key] = box
-        tip = "Review only the books with this tag, or all of them except those with it (empty: all of them)."
-        self.tag_mode = tag_mode_box(settings.review_tag_exclude, "books", tip)
+        tip = (f"Review every book, all of them but those with one of these tags, or only those (tags\n"
+               f"separated by commas; pick one from the list to add it). On Execute, every book done with is\n"
+               f"tagged {REVIEWED_TAG} (updated or not), and those whose metadata was written {AI_UPDATED_TAG}\n"
+               f"too: skipping them ({REVIEW_SKIP_TAGS}, the default), the next analysis leaves them out,\n"
+               "also on another computer. To review a book again, remove the tag in Calibre.")
+        self.tag_mode = tag_mode_box(settings.review_tag_mode, "books", tip)
+        self.tag_mode.currentIndexChanged.connect(self._tag_mode_changed)
         self.tag_box = tag_box(settings.review_tag, tip)
         library_box = self.lib_boxes["library"]
         library_box.editTextChanged.connect(lambda text: fill_tags(self.tag_box, text))
@@ -654,14 +663,6 @@ class ReviewWindow(QMainWindow):
             btn_row.addWidget(w)
         btn_row.addSpacing(12)
         btn_row.addWidget(self.shutdown.box)
-        self.skip_reviewed = QCheckBox(f"Skip books tagged {REVIEWED_TAG}")
-        self.skip_reviewed.setChecked(settings.review_skip_reviewed)
-        self.skip_reviewed.setToolTip(
-            f"On Execute, every book of the analysis is tagged {REVIEWED_TAG} (updated or not):\n"
-            "the next analysis leaves them out, also on another computer.\n"
-            "To review a book again, remove the tag in Calibre.")
-        btn_row.addSpacing(16)
-        btn_row.addWidget(self.skip_reviewed)
         btn_row.addSpacing(16)
         btn_row.addWidget(QLabel("Change:"))
         self.field_boxes: dict[str, QCheckBox] = {}
@@ -829,15 +830,21 @@ class ReviewWindow(QMainWindow):
     def _library(self, key: str) -> str:
         return self.lib_boxes[key].currentText().strip()
 
+    def _tag_mode_changed(self, *_):
+        """Skip chosen with no tags typed: the usual ones (AIUpdated, AIReviewed)."""
+        if tag_mode_of(self.tag_mode) == TAG_SKIP and not tag_list(self.tag_box.currentText()):
+            self.tag_box.setEditText(REVIEW_SKIP_TAGS)
+            self.tag_box.setProperty("typed", REVIEW_SKIP_TAGS)
+        self._set_busy(self._busy)
+
     def _sync_settings(self):
         s = self.settings
         s.review_library, s.trash_library = self._library("library"), self._library("trash")
         s.text_profile = self.text_box.currentData() or ""
         s.image_profile = self.image_box.currentData() or ""
         s.review_fields = [f for f in FIELDS if f in self.fields_on]
-        s.review_skip_reviewed = self.skip_reviewed.isChecked()
-        s.review_tag = self.tag_box.currentText().strip()
-        s.review_tag_exclude = bool(self.tag_mode.currentData())
+        s.review_tag_mode = tag_mode_of(self.tag_mode)
+        s.review_tag = ", ".join(tag_list(self.tag_box.currentText()))
         s.save()
 
     def _refresh_profiles(self):
@@ -913,8 +920,7 @@ class ReviewWindow(QMainWindow):
         self.table.setSortingEnabled(not busy and not asking)
         for box in self.lib_boxes.values():
             box.setEnabled(not busy and not asking)
-        self.skip_reviewed.setEnabled(not busy)
-        self.tag_box.setEnabled(not busy)
+        self.tag_box.setEnabled(not busy and tag_mode_of(self.tag_mode) != TAG_ALL)
         self.tag_mode.setEnabled(not busy)
         for btn in (self.check_btn, self.uncheck_btn):
             btn.setEnabled(self._can_edit())
@@ -952,7 +958,8 @@ class ReviewWindow(QMainWindow):
         self.summary_label.setText(
             f"<b style='color:{ACTION_COLORS[ReviewAction.UPDATE]}'>{changed} with differences</b> · "
             f"<b style='color:#e65100'>{unread} not read</b> · {len(items)} books"
-            + (f" · {skipped} already {REVIEWED_TAG}" if skipped else ""))
+            + (f" · {skipped} {tag_filter_text(self.result.tag, not self.result.tag_exclude)}, left out"
+               if skipped else ""))
         updates, trashes, tags, formats, unpacks, covers = self._counts()
         self.checked_label.setText(f"{updates} to update · {trashes} to trash · "
                                    + (f"{formats} losing unreadable formats · " if formats else "")
@@ -960,9 +967,14 @@ class ReviewWindow(QMainWindow):
                                    + f"{self._tagged_updates + tags} to tag {REVIEWED_TAG}"
                                    + (f" · {covers} {BAD_COVER_TAG}" if covers else ""))
         executing = self.worker is not None and self._operation == "execute"
+        work = updates + trashes + tags + formats + unpacks + covers
+        continuing = self._exec_stopped and bool(work) and not executing
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})" if executing
+                                 else f"2. Continue executing ({updates + trashes + tags} left)" if continuing
                                  else f"2. Execute and mark reviewed ({updates + trashes + tags})")
-        set_running(self.execute_btn, executing)
+        self.execute_btn.setToolTip("The last execution was stopped: execute the checked books it left"
+                                    if continuing else "")
+        set_running(self.execute_btn, executing or continuing)
         self.execute_btn.setEnabled(not self._busy and self.worker is None and self.ask_worker is None
                                     and self.result is not None
                                     and bool(updates + trashes + tags + formats + unpacks + covers))
@@ -1197,7 +1209,7 @@ class ReviewWindow(QMainWindow):
         worker.ai_down.connect(self._on_ai_down)
         worker.unpack_asked.connect(self._on_unpack_asked)
         worker.pause_waiting.connect(self._on_pause_waiting)
-        self._exec_paused = False
+        self._exec_stopped, self._exec_left = False, None
         self._start(worker, "scan")
         log.info("Review started")
 
@@ -1269,7 +1281,7 @@ class ReviewWindow(QMainWindow):
             pause = getattr(self.worker, "pause", None)
             if self._stopping:
                 text = f"Stopping after the current book… · {status}"
-            elif self._exec_pausing or (pause is not None and pause.paused and not self._paused):
+            elif pause is not None and pause.paused and not self._paused:
                 text = f"Pausing after the current book… · {status}"
             elif pause is not None and self._paused:
                 text = f"Paused · {status}"
@@ -1412,8 +1424,9 @@ class ReviewWindow(QMainWindow):
         worker.answer(choice or AI_OFF)
 
     # --- execute ----------------------------------------------------------------------------
-    def _execute(self, continuing: bool = False):
-        """`continuing`: Continue after Pause, the remaining checked books without asking again."""
+    def _execute(self, *_):
+        """Execute the checked books. After a Stop, the same work left is continued without
+        asking again; with other ticks or changes, it asks as usual."""
         if self.result is None:
             return
         if calibre_is_running():
@@ -1432,6 +1445,7 @@ class ReviewWindow(QMainWindow):
         unread = sum(1 for i in self.model.items if i.found is None and not i.manual)
         left_out = sum(1 for i in self.model.items for name in i.doubts if name in i.excluded)
         to_review = sum(1 for i in self.model.items if i.needs_review_for(self.fields_on))
+        continuing = self._exec_stopped and self._exec_left == self._work_key()
         if not continuing and QMessageBox.question(
                 self, "Execute and mark reviewed",
                 f"{updates} books will have their metadata updated (fields: {fields}).\n"
@@ -1457,7 +1471,7 @@ class ReviewWindow(QMainWindow):
                   "folder: snapshots, journal).\n\nContinue?") != QMessageBox.Yes:
             return
         self.model.locked = True
-        self._exec_paused = self._exec_pausing = False
+        self._exec_stopped, self._exec_left = False, None
         # (a book losing its unreadable formats with nothing written reports twice: formats, then tag)
         self._done_count = 0
         self._exec_total = updates + trashes + tags + sum(
@@ -1474,7 +1488,7 @@ class ReviewWindow(QMainWindow):
     def _on_result(self, item: ReviewItem):
         self._done_count += 1
         self.progress.setValue(self._done_count)
-        prefix = "Pausing after the current book… · " if self._exec_pausing else ""
+        prefix = "Stopping after the current book… · " if self._stopping else ""
         self.status_label.setText(f"{prefix}{item.book.label()}: {item.status}")
         self.execute_btn.setText(f"Executing… ({self._done_count} of {self._exec_total})")
         self.model.item_changed(item)
@@ -1490,13 +1504,13 @@ class ReviewWindow(QMainWindow):
         self.model.refresh()
 
     def _execution_done(self, ok: int, failed: int, tagged: int):
-        paused, self._exec_pausing = self._exec_pausing and not self._stopping, False
         self._after_execution()
-        self._exec_paused = paused and self._has_work()
+        self._exec_stopped = self._stopping and self._has_work()
+        self._exec_left = self._work_key() if self._exec_stopped else None
         self._finish()
-        if self._exec_paused:
-            msg = (f"Execution paused: {ok} succeeded, {failed} failed, {tagged} more books tagged {REVIEWED_TAG}. "
-                   "Continue executes the remaining checked books.")
+        if self._exec_stopped:
+            msg = (f"Execution stopped: {ok} succeeded, {failed} failed, {tagged} more books tagged {REVIEWED_TAG}. "
+                   "Continue executing runs the remaining checked books.")
             log.info(msg)
             self.status_label.setText(msg)
             return
@@ -1525,14 +1539,14 @@ class ReviewWindow(QMainWindow):
             self.worker, self._operation = None, ""
         worker.deleteLater()
         self._set_busy(self._busy)
-        if self.worker is None and self.ask_worker is None and not self._exec_paused and not self._close_pending:
+        if self.worker is None and self.ask_worker is None and not self._exec_stopped and not self._close_pending:
             self.shutdown.run_ended()
         if self._close_pending and self.worker is None and self.ask_worker is None:
             QTimer.singleShot(0, self.close)
 
     def _worker_failed(self, message: str):
         if isinstance(self.worker, ExecuteWorker):
-            self._exec_pausing = self._exec_paused = False
+            self._exec_stopped, self._exec_left = False, None
             self._after_execution()
         elif self.result is not None and not self.model.items:
             self.result = None
@@ -1558,6 +1572,10 @@ class ReviewWindow(QMainWindow):
     def _has_work(self) -> bool:
         return self.result is not None and any(self._counts())
 
+    def _work_key(self) -> str:
+        """What Execute would do now (review_actions), to tell whether it changed since a Stop."""
+        return json.dumps(review_actions(self.model.items, self.fields_on), sort_keys=True, default=str)
+
     def _update_pause_button(self):
         """See main_window.MainWindow._update_pause_button."""
         worker = self.worker
@@ -1568,17 +1586,12 @@ class ReviewWindow(QMainWindow):
                                       "Pause the analysis after the current book (Stop still keeps what is done)")
             self.pause_btn.setEnabled(not self._stopping)
             set_running(self.pause_btn, paused)
-        elif isinstance(worker, ExecuteWorker) and self._busy:
-            self.pause_btn.setText("Pausing…" if self._exec_pausing else "Pause")
-            self.pause_btn.setToolTip("Stop after the current book; Continue then executes the remaining checked books")
-            self.pause_btn.setEnabled(not self._exec_pausing and not self._stopping)
-            set_running(self.pause_btn, self._exec_pausing)
-        else:
-            can_continue = self._exec_paused and worker is None and self.ask_worker is None and self._has_work()
-            self.pause_btn.setText("Continue" if can_continue else "Pause")
-            self.pause_btn.setToolTip("Execute the remaining checked books" if can_continue else "")
-            self.pause_btn.setEnabled(can_continue)
-            set_running(self.pause_btn, can_continue)
+        else:  # an Execute is stopped instead: what it leaves is continued by the Execute button
+            self.pause_btn.setText("Pause")
+            self.pause_btn.setToolTip("Pauses an analysis. An execution is ended with Stop: the Execute button\n"
+                                      "then continues it." if isinstance(worker, ExecuteWorker) else "")
+            self.pause_btn.setEnabled(False)
+            set_running(self.pause_btn, False)
 
     def _toggle_pause(self):
         worker = self.worker
@@ -1589,14 +1602,6 @@ class ReviewWindow(QMainWindow):
             else:
                 worker.pause.pause()
                 log.info("Pausing the analysis after the current book")
-        elif isinstance(worker, ExecuteWorker):
-            self._exec_pausing = True
-            worker.cancel.set()  # it stops after the current book; the rest can be executed again
-            log.info("Pausing the execution after the current book")
-            self.status_label.setText("Pausing after the current book…")
-        elif self._exec_paused:
-            self._execute(continuing=True)
-            return
         self._set_busy(self._busy)
         self._show_status()
 

@@ -60,11 +60,13 @@ def _run_cli(argv: list[str]) -> int:
     ap.add_argument("--image-profile", help="profile of the image AI, which reads covers; '' for none")
     ap.add_argument("--fields", default=",".join(settings.review_fields),
                     help=f"fields to change, comma-separated (of {','.join(FIELDS)})")
-    ap.add_argument("--include-reviewed", action="store_true",
-                    help="also read the books tagged AIReviewed (default: as set in the GUI)")
     by_tag = ap.add_mutually_exclusive_group()
-    by_tag.add_argument("--tag", help="review only the books with this tag; '' for all (default: as set in the GUI)")
-    by_tag.add_argument("--except-tag", help="review all the books except those with this tag")
+    by_tag.add_argument("--tag", help="review only the books with one of these tags (comma-separated); '' for all "
+                                      "(default: the tag filter set in the GUI, e.g. skip AIUpdated, AIReviewed)")
+    by_tag.add_argument("--except-tag", help="review all the books except those with one of these tags "
+                                             "(comma-separated)")
+    by_tag.add_argument("--all-books", "--include-reviewed", action="store_true",
+                        help="review every book, whatever its tags")
     ap.add_argument("--execute", action="store_true",
                     help="write the differences and tag every book read AIReviewed (default: dry run)")
     ap.add_argument("--all-changes", action="store_true",
@@ -87,7 +89,7 @@ def _run_cli(argv: list[str]) -> int:
     if args.image_profile is not None:
         settings.image_profile = args.image_profile
     fields = {f.strip() for f in args.fields.split(",") if f.strip() in FIELDS}
-    tag, tag_exclude = tag_option(args, settings.review_tag, settings.review_tag_exclude)
+    tag, tag_exclude = tag_option(args, *settings.tag_filter(review=True))
 
     use = LibraryUse("review")
     try:
@@ -107,7 +109,6 @@ def _run_cli(argv: list[str]) -> int:
         def progress(done, total, msg):
             print(f"\r[{done}/{total}] {msg[:100]:<100}", end="", file=sys.stderr, flush=True)
         result = scan_library(args.library, args.trash, reviewer, progress,
-                              skip_reviewed=settings.review_skip_reviewed and not args.include_reviewed,
                               unpack=(lambda n: True) if args.unpack else None, tag=tag, tag_exclude=tag_exclude,
                               library_cache=library_cache_dir())
         print(file=sys.stderr)

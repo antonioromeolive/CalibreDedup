@@ -31,6 +31,7 @@ from pathlib import Path
 
 from .config import config_dir
 from .models import Action, Plan, PlanItem
+from .library import tag_list
 
 log = logging.getLogger(__name__)
 
@@ -191,6 +192,14 @@ def has_cleanup(i: PlanItem) -> bool:
 
 
 # --- remembering choices --------------------------------------------------------
+def pair_key(source: str, target: str, tag: str = "", exclude: bool = False) -> str:
+    """The libraries of an analysis, and its tag filter: what its remembered choices and
+    its saved plan (plan_store) are kept under."""
+    norm = [str(Path(p).resolve()).casefold() for p in (source, target)]
+    tag = ",".join(sorted(t.casefold() for t in tag_list(tag)))
+    return " -> ".join(norm) + (f" #{'not-' if exclude else ''}tag:{tag}" if tag else "")
+
+
 class SelectionStore:
     """Remembers unchecked items and overrides per (source, target) pair, keyed by book UUID.
     An analysis of only the books with a tag counts as another pair: its choices are
@@ -201,9 +210,7 @@ class SelectionStore:
 
     @staticmethod
     def _key(plan: Plan) -> str:
-        norm = [str(Path(p).resolve()).casefold() for p in (plan.source_library, plan.target_library)]
-        tag = plan.tag.strip().casefold()
-        return " -> ".join(norm) + (f" #{'not-' if plan.tag_exclude else ''}tag:{tag}" if tag else "")
+        return pair_key(plan.source_library, plan.target_library, plan.tag, plan.tag_exclude)
 
     def _read(self) -> dict:
         try:

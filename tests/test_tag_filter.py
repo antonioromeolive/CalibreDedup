@@ -22,6 +22,7 @@
 
 """Analyzing only the books with a tag (Merge and Dedup and calibre-review)."""
 
+import json
 import pytest
 
 from calibre_dedup.config import Settings
@@ -116,14 +117,42 @@ def test_tagged_choices_are_remembered_apart(libs, tmp_path):
     assert store.apply(again_tagged) == 1 and not again_tagged.items[0].selected
 
 
-def test_changing_the_tag_or_its_mode_asks_to_analyze_again():
-    before = analysis_signature(Settings(only_tag="New"))
-    assert changed_settings(before, analysis_signature(Settings(only_tag=" new "))) == []
-    assert changed_settings(before, analysis_signature(Settings(only_tag=""))) == ["tag filter"]
-    assert changed_settings(before, analysis_signature(Settings(only_tag="New", only_tag_exclude=True))) == [
+def test_changing_the_tags_or_their_mode_asks_to_analyze_again():
+    before = analysis_signature(Settings(tag_mode="only", only_tag="New, SF"))
+    assert changed_settings(before, analysis_signature(Settings(tag_mode="only", only_tag=" sf,new "))) == []
+    assert changed_settings(before, analysis_signature(Settings(tag_mode="only", only_tag="New"))) == ["tag filter"]
+    assert changed_settings(before, analysis_signature(Settings(tag_mode="skip", only_tag="New, SF"))) == [
         "tag filter"]
-    no_tag = analysis_signature(Settings())
-    assert changed_settings(no_tag, analysis_signature(Settings(only_tag_exclude=True))) == []  # no tag: no filter
+    assert changed_settings(before, analysis_signature(Settings(tag_mode="all", only_tag="New, SF"))) == [
+        "tag filter"]
+    every = analysis_signature(Settings())
+    assert changed_settings(every, analysis_signature(Settings(tag_mode="skip"))) == []  # no tag: no filter
+    assert changed_settings(every, analysis_signature(Settings(tag_mode="all", only_tag="New"))) == []
+
+
+@pytest.mark.parametrize("saved, mode, tags", [
+    ({"only_tag": "New"}, "only", "New"),
+    ({"only_tag": "New", "only_tag_exclude": True}, "skip", "New"),
+    ({"only_tag": "", "only_tag_exclude": True}, "all", ""),
+])
+def test_a_tag_filter_saved_before_the_modes_is_kept(tmp_path, saved, mode, tags):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    s = Settings._read(path)
+    assert (s.tag_mode, s.only_tag) == (mode, tags)
+
+
+@pytest.mark.parametrize("saved, mode, tags", [
+    ({"review_tag": "", "review_skip_reviewed": True}, "skip", "AIUpdated, AIReviewed"),
+    ({"review_tag": "", "review_skip_reviewed": False}, "all", "AIUpdated, AIReviewed"),
+    ({"review_tag": "SF", "review_tag_exclude": False, "review_skip_reviewed": True}, "only", "SF"),
+    ({}, "skip", "AIUpdated, AIReviewed"),
+])
+def test_the_reviews_old_skip_box_becomes_its_tag_filter(tmp_path, saved, mode, tags):
+    path = tmp_path / "review_settings.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    s = Settings._read(path)
+    assert (s.review_tag_mode, s.review_tag) == (mode, tags)
 
 
 def test_except_tag_analyzes_the_other_source_books(libs):
@@ -198,8 +227,33 @@ def test_review_scans_only_the_tagged_books(tmp_path, monkeypatch):
     reviewer = type("R", (), {"provider": None, "vision": None, "stats": {},
                               "disabled_reason": "", "image_disabled_reason": ""})()
     result = review.scan_library(library, str(tmp_path / "trash"), reviewer, tag="new")
-    assert [i.book.title for i in result.items] == ["A"]
-    assert (result.total_books, result.skipped, result.tag) == (1, 1, "new")
+    assert [i.book.title for i in result.items] == ["A", "C"]  # AIReviewed too: one filter, "only" here
+    assert (result.total_books, result.skipped, result.tag) == (2, 1, "new")
     others = review.scan_library(library, str(tmp_path / "trash"), reviewer, tag="new", tag_exclude=True)
     assert [i.book.title for i in others.items] == ["B"]
     assert "not tagged 'new'" in review.summary(others)
+
+
+def test_several_tags():
+    from calibre_dedup.library import tag_filter_text, tag_list, tag_selects
+    from calibre_dedup.models import Book
+    assert tag_list(" SF, new,, sf ,New ") == ["SF", "new"]
+    book = Book(1, "Dune", [], None, None, set(), {}, "u", "p", "lib", tags={"sf"})
+    assert tag_selects(book, "New, SF") and not tag_selects(book, "New, SF", exclude=True)
+    assert not tag_selects(book, "New, Old") and tag_selects(book, "New, Old", exclude=True)
+    assert tag_filter_text("New, SF") == "tagged any of 'New', 'SF'"
+    assert tag_filter_text("New, SF", exclude=True) == "tagged none of 'New', 'SF'"
+    assert tag_filter_text(" New ", exclude=True) == "not tagged 'New'"
+
+
+def test_the_source_books_with_any_of_the_tags_are_analyzed(libs):
+    src, tgt, trash = libs(source=[{"title": "A", "tags": ["New"]}, {"title": "B", "tags": ["sf"]},
+                                   {"title": "C"}], target=[])
+    assert [t for t, _ in actions(build_plan(src, tgt, trash, tag="new, SF"))] == ["A", "B"]
+    assert [t for t, _ in actions(build_plan(src, tgt, trash, tag="new, SF", tag_exclude=True))] == ["C"]
+
+
+def test_one_tag_keeps_the_choices_remembered_before_several_tags():
+    from calibre_dedup.selection import pair_key
+    assert pair_key("S", "T", " New ", True).endswith(" #not-tag:new")  # as saved before
+    assert pair_key("S", "T", "SF, new") == pair_key("S", "T", "New,sf")

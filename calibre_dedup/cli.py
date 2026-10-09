@@ -62,9 +62,10 @@ def _run(argv: list[str]) -> int:
                     help="only send the source books already in the target to the trash library; "
                          "copy nothing to the target (default: as set in the GUI)")
     by_tag = ap.add_mutually_exclusive_group()
-    by_tag.add_argument("--tag", help="analyze only the source books with this tag; '' for all "
-                                      "(default: as set in the GUI)")
-    by_tag.add_argument("--except-tag", help="analyze all the source books except those with this tag")
+    by_tag.add_argument("--tag", help="analyze only the source books with one of these tags (comma-separated); "
+                                      "'' for all (default: as set in the GUI)")
+    by_tag.add_argument("--except-tag", help="analyze all the source books except those with one of these tags "
+                                             "(comma-separated)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="forget every saved AI answer first (ai_cache.json): the AI is asked again")
     ap.add_argument("--no-cache", action="store_true",
@@ -81,7 +82,7 @@ def _run(argv: list[str]) -> int:
                         format="%(levelname)s %(message)s")
     perf.configure("calibre_dedup_perf.log")
     tempdirs.sweep()
-    tag, tag_exclude = tag_option(args, settings.only_tag, settings.only_tag_exclude)
+    tag, tag_exclude = tag_option(args, *settings.tag_filter())
     if args.text_profile:
         settings.text_profile = args.text_profile
     if args.image_profile is not None:

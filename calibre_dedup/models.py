@@ -199,6 +199,10 @@ class Plan:
     # Books moved by an execution of this plan: source id -> id in the target. A plan can be
     # executed again (the rest of its books) without a new analysis: see executor.apply_result.
     moved: dict[int, int] = field(default_factory=dict)
+    # The source and target as the analysis read them (plan_store.libraries_state), brought up
+    # to date by each Execute; None once something else changed them: the plan saved on disk
+    # can't be continued then.
+    state: dict | None = None
 
     def count(self, action: Action) -> int:
         return sum(1 for i in self.items if i.action is action)
